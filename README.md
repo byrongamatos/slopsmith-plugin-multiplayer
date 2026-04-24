@@ -61,4 +61,4 @@ Web app and desktop app players can be in the same room. The sync protocol is We
 
 ## License
 
-This plugin is licensed under **GPL-3.0-or-later**. See the [LICENSE](LICENSE) file for the full text. Core Slopsmith and other plugins are not covered by this license.
+This repository is licensed under **GPL-3.0-or-later**. See the [LICENSE](LICENSE) file for the full text. Slopsmith core and other plugins are separate projects published under their own licenses; this license statement applies only to the files in this repository.

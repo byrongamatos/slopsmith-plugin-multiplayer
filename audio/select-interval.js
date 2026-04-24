@@ -18,6 +18,11 @@
 // that no <script> tag actually loads today.
 
 var MIN_DURATION_SEC = 1.0;
+// MAX_DURATION_SEC is a soft documentation-only target. selectInterval does NOT
+// enforce it — slow tempos legitimately exceed it (e.g. 60 BPM × 4 beats = 4.0s)
+// and we still return one whole measure because a sub-measure interval is worse
+// musically than a longer one. Kept as an export so UI and docs can reference
+// the shared constant.
 var MAX_DURATION_SEC = 3.0;
 var DEFAULT_BEATS = 4;
 var FAST_TEMPO_BEATS = 8;

@@ -3,7 +3,7 @@
 This document describes the wire protocol used by the Slopsmith Multiplayer plugin. Two WebSocket endpoints are exposed:
 
 - **Highway WS** — `/ws/plugins/multiplayer/{code}` — JSON control plane (already implemented; see `routes.py`).
-- **Audio WS** — `/ws/plugins/multiplayer/{code}/audio` — binary peer-audio relay (introduced for the interval-quantized peer-audio feature, v1.1+).
+- **Audio WS** — `/ws/plugins/multiplayer/{code}/audio` — binary peer-audio relay. Planned for the interval-quantized peer-audio feature; not live in any released plugin version yet. `plugin.json` stays at the current version until the endpoint actually ships.
 
 Both endpoints share the same room registry and authentication: the connecting client must pass `player_id` as a query parameter, the room must exist, and the player must already be a member of the room (joined via the REST API). The audio WS rejects connections that fail this check the same way the highway WS does.
 
@@ -27,7 +27,7 @@ ws://<host>/ws/plugins/multiplayer/{code}/audio?player_id={id}
 
 Carries **binary frames only**. Every frame is one full Ninjam-style interval of Opus-encoded audio.
 
-The server's behavior is intentionally trivial: on receipt of a binary frame from a subscriber, it forwards the frame **byte-for-byte** to every other audio subscriber in the same room. The server never decodes, parses, or rewrites the frame body. Header parsing is the responsibility of the receiving client.
+The server's forwarding path is intentionally trivial: on receipt of a binary frame from a subscriber, it forwards the frame **byte-for-byte** to every other audio subscriber in the same room — no re-encoding, no payload inspection, no rewriting. The server DOES, however, parse the fixed-size 40-byte header before forwarding in order to enforce the safety checks in "Frame size budget and bounds" below (magic, version, frame-length / `opus_size` consistency, and the `MAX_FRAME_BYTES` hard limit). Those are O(1) integrity checks on the header only; the Opus payload is never touched.
 
 JSON / text frames on the audio WS are reserved for future use and are **not part of v1**. Clients **MUST NOT** send them. If the server receives a non-binary frame on the audio WS in v1, it **MUST drop the frame and MUST NOT forward it to any peer**. (Servers MAY additionally close the connection; v1 implementations are not required to.)
 
@@ -119,13 +119,13 @@ Every audio WS binary frame consists of a fixed-size header followed by the Opus
 |   6    |   2  | u16     | `flags`             | Bit field. Bit 0 = `tempo_change_at_end` (this interval ends on a tempo change). Other bits reserved; receivers MUST treat them as 0. |
 |   8    |   8  | u64     | `interval_index`    | Monotonically increasing, scoped per broadcaster per session. Wraps after `2^64 − 1` (rolls over to `0`) — never in practice. JavaScript receivers MUST parse this as `BigInt` (e.g. `DataView.getBigUint64`) rather than `Number`, since `Number` loses precision above `2^53 − 1`. |
 |  16    |   8  | f64     | `chart_time_start`  | Chart playback time (seconds) at which this interval's first sample was captured.            |
-|  24    |   8  | f64     | `chart_time_end`    | Chart playback time at which the last sample was captured. `(end - start)` is the interval's wall-clock duration. |
+|  24    |   8  | f64     | `chart_time_end`    | Chart playback time **immediately after** this interval's last sample (end-exclusive). `chart_time_end - chart_time_start` is the interval's authoritative wall-clock duration in seconds; `chart_time_end` of frame N equals `chart_time_start` of frame N+1 when intervals are contiguous. |
 |  32    |   4  | u32     | `sample_count`      | Number of PCM samples encoded into the Opus payload (per channel). Used by the decoder for AudioBuffer sizing. |
 |  36    |   4  | u32     | `opus_size`         | Size of the Opus payload in bytes. Receiver must verify `frame_length == 40 + opus_size`.    |
 
 ### Payload
 
-Bytes `40 .. 40 + opus_size` are an Opus-encoded chunk produced by the WebCodecs `AudioEncoder` configured as:
+The byte range `[40, 40 + opus_size)` (half-open — offset 40 inclusive, `40 + opus_size` exclusive) is an Opus-encoded chunk produced by the WebCodecs `AudioEncoder` configured as:
 
 ```js
 {
