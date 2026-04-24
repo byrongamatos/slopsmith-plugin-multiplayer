@@ -58,3 +58,7 @@ Restart Slopsmith and the plugin will appear in the Plugins dropdown.
 ## Cross-Platform
 
 Web app and desktop app players can be in the same room. The sync protocol is WebSocket-based and works identically for both. Desktop players record via JUCE (higher quality WAV), web players record via MediaRecorder (webm-opus converted to WAV on upload).
+
+## License
+
+This plugin is licensed under **GPL-3.0-or-later**. See the [LICENSE](LICENSE) file for the full text. Core Slopsmith and other plugins are not covered by this license.
