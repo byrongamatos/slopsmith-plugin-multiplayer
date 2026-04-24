@@ -29,7 +29,7 @@ Carries **binary frames only**. Every frame is one full Ninjam-style interval of
 
 The server's behavior is intentionally trivial: on receipt of a binary frame from a subscriber, it forwards the frame **byte-for-byte** to every other audio subscriber in the same room. The server never decodes, parses, or rewrites the frame body. Header parsing is the responsibility of the receiving client.
 
-JSON / text frames received on the audio WS are reserved for future use; v1 ignores them.
+JSON / text frames on the audio WS are reserved for future use and are **not part of v1**. Clients **MUST NOT** send them. If the server receives a non-binary frame on the audio WS in v1, it **MUST drop the frame and MUST NOT forward it to any peer**. (Servers MAY additionally close the connection; v1 implementations are not required to.)
 
 ---
 
@@ -115,9 +115,9 @@ Every audio WS binary frame consists of a fixed-size header followed by the Opus
 | Offset | Size | Type    | Field               | Description                                                                                  |
 |-------:|-----:|---------|---------------------|----------------------------------------------------------------------------------------------|
 |   0    |   4  | char[4] | `magic`             | ASCII `"SMAU"` (Slopsmith Multiplayer AUdio). Frame is rejected if mismatched.               |
-|   4    |   2  | u16     | `version`           | Protocol version. v1 = `1`. Receivers must ignore unknown versions.                          |
-|   6    |   2  | u16     | `flags`             | Bit field. Bit 0 = `tempo_change_at_end` (this interval ends on a tempo change). Others reserved. |
-|   8    |   8  | u64     | `interval_index`    | Monotonically increasing, scoped per broadcaster per session. Wraps after 2⁶³ — never in practice. |
+|   4    |   2  | u16     | `version`           | Protocol version. v1 = `1`. v1 receivers MUST drop frames where `version != 1`. (Forward-compat handling for specific known-newer versions can be defined in later revisions of this spec.) |
+|   6    |   2  | u16     | `flags`             | Bit field. Bit 0 = `tempo_change_at_end` (this interval ends on a tempo change). Other bits reserved; receivers MUST treat them as 0. |
+|   8    |   8  | u64     | `interval_index`    | Monotonically increasing, scoped per broadcaster per session. Wraps after `2^64 − 1` (rolls over to `0`) — never in practice. JavaScript receivers MUST parse this as `BigInt` (e.g. `DataView.getBigUint64`) rather than `Number`, since `Number` loses precision above `2^53 − 1`. |
 |  16    |   8  | f64     | `chart_time_start`  | Chart playback time (seconds) at which this interval's first sample was captured.            |
 |  24    |   8  | f64     | `chart_time_end`    | Chart playback time at which the last sample was captured. `(end - start)` is the interval's wall-clock duration. |
 |  32    |   4  | u32     | `sample_count`      | Number of PCM samples encoded into the Opus payload (per channel). Used by the decoder for AudioBuffer sizing. |
@@ -139,15 +139,23 @@ Bytes `40 .. 40 + opus_size` are an Opus-encoded chunk produced by the WebCodecs
 
 The chunk is the entire interval (not a sequence of small frames). Encoder is `flush()`ed at each interval boundary so a single `EncodedAudioChunk` represents the whole interval.
 
-### Frame size budget
+### Frame size budget and bounds
 
-A 2-second interval at 96 kbps Opus ≈ 24 KB of audio + 40 bytes of header = ~24 KB per frame. Well under WebSocket's effective binary-frame size limits (browsers handle multi-MB frames without issue, and the slopsmith server uses FastAPI's WebSocket which is limited only by available memory).
+A 2-second interval at 96 kbps Opus ≈ 24 KB of audio + 40 bytes of header = ~24 KB per frame. Even worst-case slow ballads (30 BPM × 4 beats = 8 s interval) cap out around ~96 KB.
+
+**Hard limit (DoS bound): `MAX_FRAME_BYTES = 262144` (256 KB), inclusive of header.** This is roughly 2× the worst-case legitimate frame, so well-behaved clients will never approach it.
+
+- Senders MUST NOT emit a frame larger than `MAX_FRAME_BYTES`.
+- Servers MUST drop any frame larger than `MAX_FRAME_BYTES` (no fan-out) and SHOULD close the offending audio WS with status code `1009` (Message Too Big).
+- Servers MUST also reject frames where `frame_length < 40` (header truncation) or where `40 + opus_size != frame_length` (header/body mismatch), with the same drop-and-close behavior.
+
+This bound is the primary backpressure / abuse defense for the relay, since the server otherwise does no payload inspection.
 
 ---
 
 ## Interval-selection algorithm
 
-Both ends agree on the interval length from the chart's BPM, deterministically. The host advertises its choice in `broadcast_start.interval_beats`; listeners use the broadcasted value (not their own re-calculation) so a chart with mid-song tempo changes does not cause host/listener disagreement.
+The host picks the interval length from the chart's BPM, deterministically, and advertises it in `broadcast_start.interval_beats`. This value is **metadata only** — it tells listeners the broadcaster's chosen unit so the UI can label intervals, but listeners **MUST NOT** use it to compute frame-by-frame playback duration. Each frame's authoritative duration is `chart_time_end − chart_time_start` (see Lifecycle §4 below). This is what survives mid-song tempo changes correctly: a single frame that straddles a tempo change has a duration the broadcaster already measured at capture time, which differs from a naive `interval_beats × 60 / bpm` calculation.
 
 The algorithm only ever returns a **whole-measure** value (4 beats in 4/4) or a **two-measure** value (8 beats). It never returns sub-measure intervals — half-measure boundaries do not align with the natural musical pulse a player feels, which makes the previous-interval recording feel jagged rather than locked-in.
 
@@ -182,7 +190,7 @@ The helper is currently CommonJS-only because slopsmith core's plugin loader ser
 1. **Room join (existing).** Client `POST`s to `/api/plugins/multiplayer/rooms/{code}/join`, then opens the highway WS.
 2. **Audio WS open.** Any time after the highway WS connects, the client opens the audio WS. v1: clients open it eagerly on room join so that broadcasts can start instantly.
 3. **Broadcast.** A user toggles "broadcast my sound." The client sends `broadcast_start` on the highway WS. Server validates, stores `broadcaster_id`, broadcasts `broadcaster_changed` to all peers. The client begins streaming binary frames on the audio WS.
-4. **Listen.** Every other peer's listener pipeline activates on receipt of `broadcaster_changed` (with non-null id). It listens for binary frames on the audio WS, decodes, schedules playback at `chart_time_start + (interval_beats * 60 / bpm)`.
+4. **Listen.** Every other peer's listener pipeline activates on receipt of `broadcaster_changed` (with non-null id). It listens for binary frames on the audio WS, decodes, and schedules playback using the frame's authoritative interval duration: the next-interval start is `chart_time_end` (and the playable duration is `chart_time_end − chart_time_start`). Listeners MUST NOT compute the interval boundary from `interval_beats × 60 / bpm`, because that calculation breaks when a tempo change occurs inside or at the boundary of an interval; the frame header is the single source of truth.
 5. **Stop.** Broadcaster sends `broadcast_stop` (or disconnects audio WS). Server clears `broadcaster_id`, broadcasts `broadcaster_changed` with `null`. Listeners drain pending intervals and tear down their audio graph.
 6. **Pause/seek (existing host control).** Existing playback semantics apply: when the host pauses, all clients pause. Listeners must `.stop()` any in-flight `AudioBufferSourceNode`s when the chart pauses, and rebuild the playback queue against the new chart time when playback resumes (since pending buffers may now schedule into the past or future incorrectly).
 7. **Room teardown.** Existing 60-second grace period applies to both WS endpoints. Audio subscribers are dropped on player disconnect; if the dropped player was the broadcaster, the room is updated and peers notified.
@@ -191,10 +199,10 @@ The helper is currently CommonJS-only because slopsmith core's plugin loader ser
 
 ## Versioning
 
-The header `version` field exists so future revisions (e.g. stereo support, per-frame Opus packets instead of one-chunk-per-interval) can extend the format. Receivers must:
+The header `version` field exists so future revisions (e.g. stereo support, per-frame Opus packets instead of one-chunk-per-interval) can extend the format. v1 receiver requirements:
 
-- Reject frames with `magic != "SMAU"`.
-- Treat `version > 1` frames as opaque-and-droppable in v1 clients.
-- Treat unknown bits in `flags` as 0.
+- MUST reject frames with `magic != "SMAU"`.
+- MUST drop frames where `version != 1`. (Forward-compat handling for specific known-newer versions can be defined in later revisions of this spec; v1 takes the conservative drop-everything-unknown stance.)
+- MUST treat unknown bits in `flags` as 0.
 
 The control-message protocol uses the existing `"type"` discriminator and is forward-compatible: unknown types are logged-and-ignored by both ends.

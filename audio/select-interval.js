@@ -17,37 +17,30 @@
 // too. Keeping the file CommonJS-only here avoids advertising a browser API
 // that no <script> tag actually loads today.
 
-(function (root, factory) {
-    if (typeof module !== 'undefined' && module.exports) {
-        module.exports = factory();
+var MIN_DURATION_SEC = 1.0;
+var MAX_DURATION_SEC = 3.0;
+var DEFAULT_BEATS = 4;
+var FAST_TEMPO_BEATS = 8;
+
+function selectInterval(bpm) {
+    if (!isFinite(bpm) || bpm <= 0) return DEFAULT_BEATS;
+    var secondsPerBeat = 60 / bpm;
+    if (DEFAULT_BEATS * secondsPerBeat < MIN_DURATION_SEC) {
+        return FAST_TEMPO_BEATS;
     }
-})(this, function () {
+    return DEFAULT_BEATS;
+}
 
-    var MIN_DURATION_SEC = 1.0;
-    var MAX_DURATION_SEC = 3.0;
-    var DEFAULT_BEATS = 4;
-    var FAST_TEMPO_BEATS = 8;
+function intervalDuration(bpm, beats) {
+    if (!isFinite(bpm) || bpm <= 0 || !isFinite(beats) || beats <= 0) return 0;
+    return (60 / bpm) * beats;
+}
 
-    function selectInterval(bpm) {
-        if (!isFinite(bpm) || bpm <= 0) return DEFAULT_BEATS;
-        var secondsPerBeat = 60 / bpm;
-        if (DEFAULT_BEATS * secondsPerBeat < MIN_DURATION_SEC) {
-            return FAST_TEMPO_BEATS;
-        }
-        return DEFAULT_BEATS;
-    }
-
-    function intervalDuration(bpm, beats) {
-        if (!isFinite(bpm) || bpm <= 0 || !isFinite(beats) || beats <= 0) return 0;
-        return (60 / bpm) * beats;
-    }
-
-    return {
-        selectInterval: selectInterval,
-        intervalDuration: intervalDuration,
-        MIN_DURATION_SEC: MIN_DURATION_SEC,
-        MAX_DURATION_SEC: MAX_DURATION_SEC,
-        DEFAULT_BEATS: DEFAULT_BEATS,
-        FAST_TEMPO_BEATS: FAST_TEMPO_BEATS,
-    };
-});
+module.exports = {
+    selectInterval: selectInterval,
+    intervalDuration: intervalDuration,
+    MIN_DURATION_SEC: MIN_DURATION_SEC,
+    MAX_DURATION_SEC: MAX_DURATION_SEC,
+    DEFAULT_BEATS: DEFAULT_BEATS,
+    FAST_TEMPO_BEATS: FAST_TEMPO_BEATS,
+};
