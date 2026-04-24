@@ -10,18 +10,16 @@
 //
 // See PROTOCOL.md for the algorithm rationale and the BPM→beats decision table.
 //
-// Exposed as both a CommonJS module (for node-based tests) and a browser global
-// under window.slopsmithMultiplayer.selectInterval.
+// Currently consumed only by the Node test runner (audio/select-interval.test.js).
+// Phase 2 will inline this into screen.js (the only JS file slopsmith core's
+// plugin loader actually serves, /api/plugins/{id}/screen.js — see
+// plugins/__init__.py in core). At that point the helper becomes browser-side
+// too. Keeping the file CommonJS-only here avoids advertising a browser API
+// that no <script> tag actually loads today.
 
 (function (root, factory) {
-    var api = factory();
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports = api;
-    }
-    if (typeof window !== 'undefined') {
-        window.slopsmithMultiplayer = window.slopsmithMultiplayer || {};
-        window.slopsmithMultiplayer.selectInterval = api.selectInterval;
-        window.slopsmithMultiplayer.intervalDuration = api.intervalDuration;
+        module.exports = factory();
     }
 })(this, function () {
 

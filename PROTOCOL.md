@@ -173,6 +173,8 @@ For very slow songs (e.g. 60 BPM → 4.0 s/measure, 30 BPM → 8.0 s/measure) th
 
 The constants `MIN_DURATION_SEC = 1.0`, `DEFAULT_BEATS = 4`, and `FAST_TEMPO_BEATS = 8` live in `audio/select-interval.js`. A pure-Node test file `audio/select-interval.test.js` validates the algorithm with no test-framework dependency: `node audio/select-interval.test.js`.
 
+The helper is currently CommonJS-only because slopsmith core's plugin loader serves only `/api/plugins/{id}/screen.js` (one entry point per plugin) — no generic asset path. Phase 2 will inline the helper into `screen.js` when the broadcast/listen pipelines need it browser-side.
+
 ---
 
 ## Lifecycle
