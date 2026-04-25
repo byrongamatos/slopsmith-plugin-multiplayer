@@ -120,7 +120,7 @@ Every audio WS binary frame consists of a fixed-size header followed by the Opus
 |   8    |   8  | u64     | `interval_index`    | Monotonically increasing, scoped per broadcaster per session. Wraps after `2^64 − 1` (rolls over to `0`) — never in practice. JavaScript receivers MUST parse this as `BigInt` (e.g. `DataView.getBigUint64`) rather than `Number`, since `Number` loses precision above `2^53 − 1`. |
 |  16    |   8  | f64     | `chart_time_start`  | Chart playback time (seconds) at which this interval's first sample was captured.            |
 |  24    |   8  | f64     | `chart_time_end`    | Chart playback time **immediately after** this interval's last sample (end-exclusive). `chart_time_end - chart_time_start` is the interval's authoritative wall-clock duration in seconds; `chart_time_end` of frame N equals `chart_time_start` of frame N+1 when intervals are contiguous. |
-|  32    |   4  | u32     | `sample_count`      | Number of PCM samples encoded into the Opus payload (per channel). Used by the decoder for AudioBuffer sizing. |
+|  32    |   4  | u32     | `sample_count`      | Number of PCM samples encoded into the Opus payload (per channel). **Hint only** — receivers MUST validate against the duration-derived cap (see "Receiver validation" below) before using this value to size any allocation, and SHOULD treat the decoder's actual output as authoritative. |
 |  36    |   4  | u32     | `opus_size`         | Size of the Opus payload in bytes. Receiver must verify `frame_length == 40 + opus_size`.    |
 
 ### Payload
@@ -150,6 +150,34 @@ A 2-second interval at 96 kbps Opus ≈ 24 KB of audio + 40 bytes of header = ~2
 - Servers MUST also reject frames where `frame_length < 40` (header truncation) or where `40 + opus_size != frame_length` (header/body mismatch), with the same drop-and-close behavior.
 
 This bound is the primary backpressure / abuse defense for the relay, since the server otherwise does no payload inspection.
+
+### Receiver validation (defense against malicious peers)
+
+The server forwards binary frames byte-for-byte from one peer to another, so receivers MUST treat header fields — and the broadcaster-asserted parameters in `broadcast_start` — as untrusted input. All checks below are O(1) and MUST be performed before any allocation or decoder call.
+
+**v1 hard limits (constant, not derived from peer-supplied data):**
+- `V1_SAMPLE_RATE = 48000` — the only sample rate v1 supports.
+- `V1_CHANNEL_COUNT = 1` — mono only in v1.
+- `MAX_INTERVAL_SEC = 32` — duration cap. (Generous; even 30 BPM × 8 beats is only 16 seconds.)
+- `MAX_SLACK_SAMPLES = 480` — ~10 ms at 48 kHz, to account for Opus packetization padding when bounding `sample_count`.
+
+**Control-plane validation (`broadcast_start` JSON).** Receivers MUST reject (and SHOULD disconnect the audio WS from) any `broadcast_start` where:
+- `sample_rate != V1_SAMPLE_RATE`, or
+- `channel_count != V1_CHANNEL_COUNT`, or
+- `codec != "opus"`, or
+- `bitrate` is missing, non-finite, or outside `[16_000, 256_000]`.
+
+Future protocol versions may relax these constraints; v1 receivers reject everything else so the allocation bounds below can use trusted constants.
+
+**Per-frame validation (binary header).** Receivers MUST drop frames where any of the following holds:
+- `magic != "SMAU"` or `version != 1` (already covered above).
+- `chart_time_start` is not finite (i.e. `NaN` or `±Infinity`).
+- `chart_time_end` is not finite.
+- `(chart_time_end - chart_time_start)` is not finite, is `≤ 0`, or exceeds `MAX_INTERVAL_SEC`.
+- `sample_count > ceil(V1_SAMPLE_RATE * (chart_time_end - chart_time_start)) + MAX_SLACK_SAMPLES`. This bound uses the v1 constant `V1_SAMPLE_RATE`, not any peer-supplied sample rate, so the limit cannot be enlarged by a malicious broadcaster.
+- `opus_size + 40 != frame_length` (header/body mismatch — should already have been caught by the server, but receivers SHOULD re-validate independently).
+
+**Note:** `sample_count` is a *hint* for pre-allocating the decoder's output `AudioBuffer`. The canonical sample count for actual playback is whatever the decoder produces; receivers SHOULD treat the decoder output as authoritative and reserve `sample_count` purely for buffer pre-sizing.
 
 ---
 
