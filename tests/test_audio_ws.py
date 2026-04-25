@@ -292,12 +292,17 @@ async def test_enqueue_audio_frame_bounded_queue(routes_module):
     )
 
 
-def test_send_queue_does_not_deadlock_under_load(client, routes_module):
-    """Smoke test that the audio relay stays alive when the sender pushes
-    more frames than the queue can hold. Validates the read loop doesn't
-    stall on a slow peer (per the fire-and-forget design); the strict
-    bound assertion lives in test_enqueue_audio_frame_bounded_queue
-    above (a deterministic unit test)."""
+@pytest.mark.timeout(5)
+def test_host_read_loop_alive_under_load(client, routes_module):
+    """Smoke test that HOST's /audio read loop stays alive when overflowing
+    its peer's bounded queue. The previous version drove a marker via Bob's
+    socket, but Bob's marker is forwarded by Bob's loop, so it would still
+    arrive at host even if host's own loop were wedged in fan-out. This
+    version sends a unique FINAL frame from HOST after the burst — bob
+    can only see it if host's read loop is still pulling and dispatching.
+
+    Bounded by @pytest.mark.timeout(5) so a real deadlock fails the test
+    with a TimeoutError instead of hanging the entire pytest run."""
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
@@ -307,18 +312,27 @@ def test_send_queue_does_not_deadlock_under_load(client, routes_module):
         max_frames = routes_module._AUDIO_SEND_QUEUE_MAX
         n_sent = max_frames * 3
 
+        # Burst — most of these will be overflowed and dropped from the queue.
         for i in range(n_sent):
             payload = f"FRAME-{i:04d}".encode().ljust(40, b".")
             host_audio.send_bytes(_build_audio_frame(payload, interval_index=i))
 
-        # Drive a deterministic round-trip through the audio relay: bob
-        # sends a marker frame, server fans out to host. Host receiving
-        # the marker proves the read loop didn't deadlock under the
-        # earlier load.
-        marker = _build_audio_frame(b"MARKER", interval_index=99999)
-        bob_audio.send_bytes(marker)
-        first_host_recv = host_audio.receive_bytes()
-        assert first_host_recv == marker
+        # Final unique frame from HOST. Drop-OLDEST policy means this
+        # newest frame DOES survive even if the queue overflowed.
+        final = _build_audio_frame(b"FINAL!", interval_index=99999)
+        host_audio.send_bytes(final)
+
+        # Drain bob's queue until we see the FINAL frame. If host's read
+        # loop wedged at any point, FINAL was never enqueued and this
+        # blocks; pytest-timeout fires after 5s.
+        for _ in range(n_sent + 5):
+            frame = bob_audio.receive_bytes()
+            if frame == final:
+                return
+        pytest.fail(
+            f"FINAL frame from host never reached bob within {n_sent + 5} "
+            f"reads; host's /audio read loop may be wedged"
+        )
 
 
 def test_two_listeners_both_receive_host_frame(client):
