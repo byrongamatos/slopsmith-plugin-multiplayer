@@ -33,6 +33,24 @@ let _reconnectAttempts = 0;
 let _reconnectTimer = null;
 let _intentionalClose = false;
 
+// Audio WebSocket (Phase 2a — connection lifecycle only; the listener +
+// broadcast pipelines that actually consume / produce audio frames land
+// in Phase 2b). The audio WS runs in parallel to the highway WS, sharing
+// the same session_id, with its own independent reconnect timer because
+// PROTOCOL.md "Per-endpoint grace" treats the two endpoints' liveness
+// independently.
+let _audioWs = null;
+let _audioReconnectAttempts = 0;
+let _audioReconnectTimer = null;
+
+// Idempotency guard for _onSessionEnded: when a 4408 (grace expired) close
+// fires, BOTH endpoint handlers see it. Resetting session_id twice would
+// produce two different new ids, and the two reconnects would then collide
+// (one would arrive as session A, the other as session B → server treats
+// it as a Rule 3 takeover loop). _resetMarker remembers the new id we just
+// minted; the second handler sees _sessionId == _resetMarker and skips.
+let _resetMarker = null;
+
 // Original functions (saved for restore on leave)
 let _origTogglePlay = null;
 let _origSeekBy = null;
@@ -80,6 +98,15 @@ function _getOrMintSessionId() {
 function _resetSessionId() {
     _sessionId = _mintSessionId();
     sessionStorage.setItem(SESSION_STORAGE_KEY, _sessionId);
+}
+
+function _onSessionEnded() {
+    // Idempotent across concurrent handlers — see _resetMarker comment above.
+    if (_resetMarker !== null && _resetMarker === _sessionId) {
+        return;
+    }
+    _resetSessionId();
+    _resetMarker = _sessionId;
 }
 
 // ── Lobby ──────────────────────────────────────────────────────────────
@@ -141,9 +168,11 @@ window.mpCreateRoom = async function () {
         // Fresh join: always start with a new session_id so we can't accidentally
         // collide with a stale session left over from a previous tab.
         _resetSessionId();
+        _resetMarker = null;  // fresh session — clear the 4408 dedupe marker
         sessionStorage.setItem('mp_room', _roomCode);
         sessionStorage.setItem('mp_player', _playerId);
         _connectWS();
+        _connectAudioWs();
         _showRoomView();
     } catch (e) {
         _showError('Failed to create room');
@@ -174,9 +203,11 @@ window.mpJoinRoom = async function () {
         _isHost = false;
         _room = data.room;
         _resetSessionId();
+        _resetMarker = null;
         sessionStorage.setItem('mp_room', _roomCode);
         sessionStorage.setItem('mp_player', _playerId);
         _connectWS();
+        _connectAudioWs();
         _showRoomView();
     } catch (e) {
         _showError('Failed to join room');
@@ -203,18 +234,30 @@ function _cleanup() {
     _stopRecording();
     _stopHeartbeat();
     _restorePlaybackControls();
+    // Set _intentionalClose BEFORE closing either socket so neither close
+    // handler triggers a reconnect during teardown.
+    _intentionalClose = true;
     if (_ws) {
-        _intentionalClose = true;
         try { _ws.close(); } catch (e) { /* ignore */ }
         _ws = null;
     }
+    if (_audioWs) {
+        try { _audioWs.close(); } catch (e) { /* ignore */ }
+        _audioWs = null;
+    }
     if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+    if (_audioReconnectTimer) {
+        clearTimeout(_audioReconnectTimer);
+        _audioReconnectTimer = null;
+    }
     _roomCode = null;
     _playerId = null;
     _sessionId = null;
     _isHost = false;
     _room = null;
     _reconnectAttempts = 0;
+    _audioReconnectAttempts = 0;
+    _resetMarker = null;
     sessionStorage.removeItem('mp_room');
     sessionStorage.removeItem('mp_player');
     sessionStorage.removeItem(SESSION_STORAGE_KEY);
@@ -320,10 +363,15 @@ function _connectWS() {
         }
         if (ev && ev.code === CLOSE_GRACE_EXPIRED) {
             // Grace expired without reattach. The held session is dead; mint a
-            // fresh session_id and let the reconnect path open a new one.
-            _resetSessionId();
+            // fresh session_id (idempotently — _onSessionEnded handles the
+            // race with the audio WS handler that also sees 4408) and let
+            // the reconnect path open a new one.
+            _onSessionEnded();
             if (statusEl) statusEl.textContent = 'Reconnecting…';
-            if (!_intentionalClose && _roomCode) _scheduleReconnect();
+            if (!_intentionalClose && _roomCode) {
+                _scheduleReconnect();
+                _scheduleAudioReconnect();
+            }
             return;
         }
 
@@ -348,6 +396,101 @@ function _scheduleReconnect() {
         _reconnectTimer = null;
         if (_roomCode && _playerId) {
             _connectWS();
+        }
+    }, delay);
+}
+
+// ── Audio WS (Phase 2a) ───────────────────────────────────────────────────
+//
+// Lifecycle parallels _connectWS / _scheduleReconnect on the highway side.
+// Per PROTOCOL.md "Per-endpoint grace", the audio WS has its own grace
+// window and reconnect cadence independent of the highway. Phase 2a wires
+// the connection lifecycle only — frame send / receive land in Phase 2b.
+
+function _connectAudioWs() {
+    // Stale-out the old socket BEFORE closing it so a synchronous onclose
+    // for the OLD ws hits the early-return `if (ws !== _audioWs)` and
+    // doesn't try to reconnect / mutate state we're intentionally
+    // replacing. (Same pattern as _connectWS.)
+    if (_audioWs) {
+        const old = _audioWs;
+        _audioWs = null;
+        try { old.close(); } catch (e) { /* */ }
+    }
+    if (!_roomCode || !_playerId) return;
+    if (!_sessionId) _sessionId = _getOrMintSessionId();
+
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/ws/plugins/multiplayer/${_roomCode}/audio`
+        + `?player_id=${encodeURIComponent(_playerId)}`
+        + `&session_id=${encodeURIComponent(_sessionId)}`;
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    _audioWs = ws;
+
+    ws.onopen = () => {
+        // PROTOCOL.md "Implementation note (client side)": open is NOT proof
+        // of auth on the audio WS. Don't surface "ready" UI here — the
+        // user-visible "audio is live" signal lives in the highway WS
+        // control plane (broadcaster_changed) and the first inbound frame.
+        _audioReconnectAttempts = 0;
+    };
+
+    ws.onmessage = (ev) => {
+        // Phase 2a: no listener pipeline yet. Phase 2b will parse the SMAU
+        // header and feed frames into the decoder. For now, drop binary
+        // frames silently and ignore any text frames the server might
+        // someday send (spec is binary-only in v1).
+        // Intentionally a no-op.
+    };
+
+    ws.onclose = (ev) => {
+        if (ws !== _audioWs) return;
+
+        if (ev && ev.code === CLOSE_REPLACED) {
+            // Same-session reconnect of the audio slot — a new audio ws has
+            // already taken over. Nothing to do here.
+            return;
+        }
+        if (ev && ev.code === CLOSE_SUPERSEDED) {
+            // Different tab took over the whole session. The highway-side
+            // 4409 handler runs the lobby bounce; we just exit here.
+            return;
+        }
+        if (ev && ev.code === CLOSE_GRACE_EXPIRED) {
+            // Grace expired. Reset session_id idempotently (the highway
+            // 4408 handler may have already done it) and reconnect both
+            // endpoints under the new session_id.
+            _onSessionEnded();
+            if (!_intentionalClose && _roomCode) {
+                _scheduleReconnect();
+                _scheduleAudioReconnect();
+            }
+            return;
+        }
+        // 4401 (auth fail), 1009 (frame too big), 1011 (server error), or
+        // a transient drop. For 4401 we don't auto-reconnect — the highway
+        // side rejection is the primary signal and will handle UI cleanup.
+        // For 1009 we also don't auto-reconnect (we sent a bad frame). For
+        // everything else (including 1006 abnormal close), reconnect.
+        if (ev && (ev.code === 4401 || ev.code === 1009)) return;
+        if (!_intentionalClose && _roomCode) _scheduleAudioReconnect();
+    };
+
+    ws.onerror = () => {
+        // Errors that aren't followed by a close event are rare; the close
+        // handler does the recovery work. Don't duplicate it here.
+    };
+}
+
+function _scheduleAudioReconnect() {
+    if (_audioReconnectTimer) return;
+    _audioReconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, _audioReconnectAttempts - 1), 30000);
+    _audioReconnectTimer = setTimeout(() => {
+        _audioReconnectTimer = null;
+        if (_roomCode && _playerId) {
+            _connectAudioWs();
         }
     }, delay);
 }
@@ -1738,10 +1881,14 @@ window.mpMixerExport = async function () {
             if (savedRoom && savedPlayer && _ws && _ws.readyState === WebSocket.OPEN) {
                 _showRoomView();
             } else if (savedRoom && savedPlayer && !_ws) {
-                // Try to reconnect
+                // Try to reconnect both WSs under the same persisted
+                // session_id (sessionStorage carried it over the screen
+                // switch). _connectWS / _connectAudioWs read _sessionId
+                // via _getOrMintSessionId on connect.
                 _roomCode = savedRoom;
                 _playerId = savedPlayer;
                 _connectWS();
+                _connectAudioWs();
                 _showRoomView();
             } else {
                 _showLobbyView();
