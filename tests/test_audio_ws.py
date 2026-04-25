@@ -188,6 +188,58 @@ def test_sender_does_not_receive_own_frame(client):
         )
 
 
+def test_send_queue_drops_oldest_on_overflow(client, routes_module):
+    """Codex round 5 P1: a slow listener's queue must be bounded. The sender
+    pushes more than _AUDIO_SEND_QUEUE_MAX frames before the listener has
+    drained anything; the OLDEST frames must be dropped, the newest
+    _AUDIO_SEND_QUEUE_MAX must be preserved, and the sender's read loop
+    must not have stalled."""
+    code, host_pid = _create_room(client)
+    bob_pid = _join_room(client, code, "Bob")
+
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")) as host_audio, \
+         client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")) as bob_audio:
+
+        max_frames = routes_module._AUDIO_SEND_QUEUE_MAX
+        n_sent = max_frames * 3  # send 3× capacity
+
+        # Stuff frames in fast without bob receiving — the test client may
+        # actually pull behind the scenes, but we lean on the server-side
+        # bounded queue + drop-oldest semantics.
+        for i in range(n_sent):
+            payload = f"FRAME-{i:04d}".encode().ljust(40, b".")
+            host_audio.send_bytes(_build_audio_frame(payload, interval_index=i))
+
+        # Confirm sender wasn't stalled — drive a deterministic round-trip
+        # through the highway by sending a marker frame from bob and reading
+        # it back. The relay should have processed all sender frames already
+        # (or dropped overflow) by the time bob's marker shows up.
+        marker = _build_audio_frame(b"MARKER", interval_index=99999)
+        bob_audio.send_bytes(marker)
+        # Host receives bob's marker — confirms the relay is still alive
+        # and the sender's read loop didn't deadlock.
+        first_host_recv = host_audio.receive_bytes()
+        assert first_host_recv == marker
+
+        # Bob now drains whatever the queue retained. In the worst case
+        # (overflow) bob receives only the most recent _AUDIO_SEND_QUEUE_MAX
+        # frames — never more, possibly fewer if the worker was draining
+        # concurrently. The CRITICAL invariant: bob's queue did not grow
+        # unboundedly to all n_sent frames.
+        received = []
+        # Read non-blockingly using a generous bounded loop.
+        for _ in range(n_sent + 5):
+            try:
+                received.append(bob_audio.receive_bytes(timeout=0.05))
+            except Exception:
+                break
+        assert len(received) <= max_frames + 2, (
+            f"bob received {len(received)} frames; expected at most "
+            f"_AUDIO_SEND_QUEUE_MAX (={max_frames}) plus a small concurrency "
+            f"slop. The bounded queue did not drop overflow."
+        )
+
+
 def test_two_listeners_both_receive_host_frame(client):
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")

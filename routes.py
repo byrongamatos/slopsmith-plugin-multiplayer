@@ -41,6 +41,11 @@ _AUDIO_FRAME_MAGIC = b"SMAU"
 _AUDIO_FRAME_VERSION = 1
 _AUDIO_FRAME_HEADER_LEN = 40
 _AUDIO_FRAME_MAX_BYTES = 262144  # 256 KB hard limit (header + payload)
+# Maximum pending audio frames per listener. New frames overwrite the oldest
+# when full, so a chronically slow listener stays bounded in memory and a
+# resumed listener can only fall a fixed number of frames behind. At a
+# typical interval of ~2 s and 96 kbps Opus, 8 frames ≈ 16 s of headroom.
+_AUDIO_SEND_QUEUE_MAX = 8
 
 
 def _gen_code():
@@ -143,11 +148,17 @@ def _new_session_record(session_id, highway_ws=None, audio_ws=None):
         # temporarily None during a grace window).
         "highway_ever_opened": highway_ws is not None,
         "audio_ever_opened": audio_ws is not None,
-        # Per-peer async lock that serializes audio_ws.send_bytes() calls so
-        # ASGI's "one sender at a time" rule isn't violated when a sender's
-        # read loop fan-outs to many peers via fire-and-forget tasks. Lazily
-        # created in the audio handler the first time the slot is filled.
-        "audio_send_lock": None,
+        # Per-peer audio relay state. The queue is bounded
+        # (_AUDIO_SEND_QUEUE_MAX) so a slow listener can't accumulate
+        # unbounded memory. The worker is a single asyncio.Task that drains
+        # the queue and serializes send_bytes (ASGI's "one sender at a time"
+        # rule). Both are bound to a specific audio_ws — same-session
+        # reconnects cancel the prior worker + drop the prior queue and
+        # spawn a fresh pair, so stale sends never block a new attached
+        # socket. Both are None whenever audio_ws is None (no slot, or
+        # currently in per-endpoint grace).
+        "audio_send_queue": None,
+        "audio_send_worker": None,
     }
 
 
@@ -202,6 +213,8 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
         rec[slot] = websocket
         rec[f"{endpoint}_ever_opened"] = True
         sessions[player_id] = rec
+        if endpoint == _AUDIO:
+            _setup_audio_worker(rec)
         return "new_session"
 
     if existing["session_id"] == session_id:
@@ -223,6 +236,11 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
         if t and not t.done():
             t.cancel()
         existing[grace] = None
+        # Audio reconnect/first_attach gets a fresh worker + queue bound to
+        # the new ws so any tasks left over from the old ws can't block the
+        # newly-attached socket.
+        if endpoint == _AUDIO:
+            _setup_audio_worker(existing)
         if not ever_opened_before:
             return "first_attach"
         if old_ws is not None and old_ws is not websocket:
@@ -238,12 +256,20 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
     # new record and they early-return instead of scheduling a grace task on
     # the orphaned `existing` dict.
     _cancel_grace_tasks(existing)
+    # Cancel the prior session's audio worker too — the new session's
+    # _setup_audio_worker (if endpoint is audio) installs a fresh one bound
+    # to the new ws.
+    prev_worker = existing.get("audio_send_worker")
+    if prev_worker is not None and not prev_worker.done():
+        prev_worker.cancel()
     old_highway_ws = existing.get("highway_ws")
     old_audio_ws = existing.get("audio_ws")
     rec = _new_session_record(session_id)
     rec[slot] = websocket
     rec[f"{endpoint}_ever_opened"] = True
     sessions[player_id] = rec
+    if endpoint == _AUDIO:
+        _setup_audio_worker(rec)
     # Clear the player's stale highway-WS reference. After rule 3 the new
     # session's highway_ws is None until the new tab's highway WS connects;
     # leaving player["ws"] pointing at the just-closed old highway makes
@@ -275,11 +301,20 @@ async def _on_endpoint_disconnect(websocket, room, player_id, endpoint):
     sess[_slot_key(endpoint)] = None
     # If the highway slot just emptied, also clear the player's WS reference so
     # _broadcast skips the dead socket during the grace window. The audio slot
-    # has no equivalent on the player object, so nothing to clear there.
+    # has no equivalent on the player object, so nothing to clear there — but
+    # the audio send worker IS bound to the now-closed ws, so cancel it and
+    # drop the queue. A future reattach of the same session will spawn a
+    # fresh worker + queue via _setup_audio_worker.
     if endpoint == _HIGHWAY:
         player = room["players"].get(player_id)
         if player is not None:
             player["ws"] = None
+    elif endpoint == _AUDIO:
+        worker = sess.get("audio_send_worker")
+        if worker is not None and not worker.done():
+            worker.cancel()
+        sess["audio_send_worker"] = None
+        sess["audio_send_queue"] = None
     # Schedule per-endpoint grace expiry. Either endpoint expiring ends the
     # whole session per PROTOCOL.md "Per-endpoint grace".
     sess[_grace_key(endpoint)] = asyncio.create_task(
@@ -293,19 +328,65 @@ async def _on_highway_disconnect(websocket, room, player_id):
     await _on_endpoint_disconnect(websocket, room, player_id, _HIGHWAY)
 
 
-async def _send_audio_to_peer(ws, lock, payload):
-    """Fire-and-forget audio send guarded by a per-peer lock.
+async def _audio_send_worker(ws, queue):
+    """Drain a per-peer audio send queue, calling ws.send_bytes for each frame.
 
-    The lock serializes concurrent send_bytes calls to the same WebSocket
-    (ASGI requires one sender at a time), but does NOT couple peers — sends
-    to different peers run concurrently. Failures are silently dropped;
-    the peer's own handler tears down a broken connection.
+    Exits cleanly on:
+      - asyncio.CancelledError (e.g. socket replaced via 4410, or session
+        teardown), or
+      - any send_bytes exception (broken socket; the peer's own handler
+        cleans up the rest).
+    Each worker is bound to the exact ws passed in here, so a same-session
+    reconnect that spawns a fresh worker + queue pair never has the old
+    worker contending with the new socket.
     """
-    async with lock:
+    try:
+        while True:
+            payload = await queue.get()
+            try:
+                await ws.send_bytes(payload)
+            except Exception:
+                return
+    except asyncio.CancelledError:
+        return
+
+
+def _setup_audio_worker(sess):
+    """Spawn a fresh queue + worker bound to sess['audio_ws']. Cancels and
+    drops any prior worker/queue so stale sends on a replaced socket can't
+    block the new socket.
+
+    Caller must have already set sess['audio_ws'] to the new WebSocket.
+    """
+    prev_worker = sess.get("audio_send_worker")
+    if prev_worker is not None and not prev_worker.done():
+        prev_worker.cancel()
+    queue = asyncio.Queue(maxsize=_AUDIO_SEND_QUEUE_MAX)
+    sess["audio_send_queue"] = queue
+    sess["audio_send_worker"] = asyncio.create_task(
+        _audio_send_worker(sess["audio_ws"], queue)
+    )
+
+
+def _enqueue_audio_frame(sess, payload):
+    """Push a frame onto a peer's bounded send queue. On overflow the OLDEST
+    frame is dropped — newer audio is more useful to a recovering listener
+    than stale audio. Caller must have already verified audio_ws is non-None.
+    """
+    queue = sess.get("audio_send_queue")
+    if queue is None:
+        return
+    while True:
         try:
-            await ws.send_bytes(payload)
-        except Exception:
-            pass
+            queue.put_nowait(payload)
+            return
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()  # drop oldest
+            except asyncio.QueueEmpty:
+                # Race with a worker that drained between full and get_nowait.
+                # Retry put.
+                continue
 
 
 def _classify_audio_frame(data):
@@ -1127,15 +1208,13 @@ def setup(app, context):
             return
 
         # Apply rules 1/2/3 for the audio slot. Same close-code semantics as
-        # the highway slot (4410 / 4409 on takeover/replace).
+        # the highway slot (4410 / 4409 on takeover/replace). The bounded
+        # send queue + worker for THIS audio_ws is set up inside
+        # _take_session_slot before the rule returns, so by the time other
+        # peers' read loops can see this audio_ws on the room's session map,
+        # its queue/worker are already in place — no race window where a
+        # new attach drops the first frames.
         await _take_session_slot(websocket, room, player_id, session_id, _AUDIO)
-
-        # Ensure a per-peer send lock exists for this audio_ws. The lock is
-        # used by the fire-and-forget fan-out path below to serialize
-        # concurrent send_bytes calls without coupling peers.
-        sess = room["sessions"].get(player_id)
-        if sess is not None and sess.get("audio_send_lock") is None:
-            sess["audio_send_lock"] = asyncio.Lock()
 
         # An audio attach keeps the room alive even when no highway WS is
         # currently open — for example during a recovery where /audio reconnects
@@ -1189,30 +1268,20 @@ def setup(app, context):
                 # subscriber in the same room. The Opus payload is never
                 # touched — only header validation happened above.
                 #
-                # Each peer gets its own fire-and-forget task guarded by that
-                # peer's `audio_send_lock`. The read loop never awaits any
-                # send, so a slow peer cannot head-of-line-block forwarding
-                # to other listeners OR stall ingestion of the next inbound
-                # frame. Per-peer locks preserve send order for each peer
-                # (ASGI requires one sender at a time on a given WS) without
-                # coupling peers to each other.
-                #
-                # Bounded-queue / drop-on-overflow semantics for chronically
-                # slow peers are deferred to v2 — for v1, the per-peer lock
-                # is enough to keep one slow listener from breaking the rest
-                # of the room. A consistently-stuck peer would accumulate
-                # waiting tasks, but the SESSION_GRACE_SEC window will close
-                # them out within a few seconds of any real network failure.
+                # Each peer has its own bounded send queue drained by a single
+                # worker bound to that peer's audio_ws. _enqueue_audio_frame
+                # is non-blocking: on overflow it drops the OLDEST queued
+                # frame so a slow peer stays bounded in memory and a recovering
+                # peer falls at most _AUDIO_SEND_QUEUE_MAX frames behind. The
+                # sender's read loop never awaits any send, so a slow peer
+                # cannot head-of-line-block forwarding to others OR stall the
+                # next inbound frame.
                 for pid, peer_sess in list(room.get("sessions", {}).items()):
                     if pid == player_id:
                         continue
-                    other_audio = peer_sess.get("audio_ws")
-                    other_lock = peer_sess.get("audio_send_lock")
-                    if other_audio is None or other_lock is None:
+                    if peer_sess.get("audio_ws") is None:
                         continue
-                    asyncio.create_task(
-                        _send_audio_to_peer(other_audio, other_lock, payload)
-                    )
+                    _enqueue_audio_frame(peer_sess, payload)
         except WebSocketDisconnect:
             pass
         except Exception as e:
