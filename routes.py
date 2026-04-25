@@ -397,7 +397,19 @@ async def _restart_audio_worker_after_old(room, player_id, expected_sess, old_wo
             pass
     if room.get("sessions", {}).get(player_id) is not expected_sess:
         return
-    if expected_sess.get("audio_ws") is not None and expected_sess.get("audio_send_worker") is None:
+    if expected_sess.get("audio_ws") is None:
+        return
+    # _cleanup_audio_worker's cancel-propagation branch deliberately
+    # leaves audio_send_worker pointing at the cancelled-but-now-exited
+    # old_worker so concurrent rule-2 audio reconnects could snapshot it
+    # for their deferred close. By the time we get here that snapshot
+    # window is over (we just awaited the worker to completion), so it
+    # is safe — and necessary — to replace the slot with a fresh worker.
+    # If a concurrent reattach via _setup_audio_worker has already
+    # installed a different worker, leave it alone (the new worker is
+    # already running on the same audio_ws).
+    current_worker = expected_sess.get("audio_send_worker")
+    if current_worker is None or current_worker is old_worker:
         _setup_audio_worker(expected_sess)
 
 
