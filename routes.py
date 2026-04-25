@@ -481,83 +481,69 @@ async def _cleanup_audio_worker(sess, room=None, player_id=None):
             sess["audio_send_queue"] = None
         return
     worker.cancel()
+    # Distinguish "worker cancelled" from "caller cancelled" cleanly:
+    # asyncio.gather(worker, return_exceptions=True) captures the worker's
+    # CancelledError as a return value rather than re-raising it. The
+    # only way `await asyncio.gather(...)` itself raises CancelledError
+    # is if OUR task is being cancelled externally — at which point we
+    # MUST propagate. This avoids the Py-version-specific
+    # Task.cancelling() check entirely and works correctly on Python
+    # 3.8+. (Suggested by Copilot during PR #3 round 12 review.)
     try:
-        await worker
+        await asyncio.gather(worker, return_exceptions=True)
     except asyncio.CancelledError:
-        # Distinguishing "caller cancelled" from "worker cancelled" via
-        # `worker.cancelled()` alone is unreliable: when our task is
-        # cancelled while awaiting the worker, asyncio raises
-        # CancelledError due to OUR task's cancellation regardless, and
-        # worker.cancelled() is also True (we called worker.cancel()
-        # ourselves). Task.cancelling() (Python 3.11+) gives us a
-        # reliable signal; on older Python we fall back to the
-        # best-effort `not worker.cancelled()` check, which misses the
-        # simultaneous-cancel edge case but matches the behavior we had
-        # before this fix. When running on Python 3.11+ the reliable
-        # Task.cancelling() path is used; older runtimes use the fallback.
-        current = asyncio.current_task()
-        if current is not None and hasattr(current, "cancelling"):
-            current_is_cancelling = current.cancelling() > 0
-        else:
-            current_is_cancelling = False  # pre-3.11 best-effort fallback
-        if current_is_cancelling or not worker.cancelled():
-            # Our caller was cancelled, not the worker we cancelled. We MUST
-            # NOT restart the worker here even if audio_ws is still alive:
-            # the old worker may not have fully exited from ws.send_bytes
-            # yet (we abandoned the await), and starting a fresh worker on
-            # the same ws would have two concurrent senders, violating
-            # ASGI's one-sender-at-a-time rule and corrupting the relay.
-            #
-            # Synchronously clear the queue so fan-out immediately skips
-            # this peer, but leave the existing /audio WebSocket open in
-            # this cancellation path. If the cancelled worker is still
-            # the active one, we only schedule a deferred worker restart
-            # that waits for that worker to actually exit before replacing
-            # it; we do not close the same ws here. Closing would emit a
-            # misleading close code (the session is typically still alive
-            # — our cleanup was interrupted by an external cancel, not
-            # by a real teardown), so we let the relay self-heal silently.
-            #
-            # All slot mutations (worker, queue) are gated on our captured
-            # worker still being the active one. If a same-session
-            # reattach has run during our await, _setup_audio_worker
-            # synchronously installed a fresh worker AND a fresh audio_ws
-            # in the same atomic block — `is worker` returns False, and
-            # we leave the new state untouched (otherwise we'd orphan its
-            # new worker).
-            if sess.get("audio_send_worker") is worker:
-                # Clear the QUEUE so fan-out skips this peer (no pushes to
-                # a queue with no live consumer), but leave audio_send_worker
-                # pointing at the cancelled worker so concurrent rule-2
-                # audio reconnects in _take_session_slot can still snapshot
-                # `prev_audio_worker = sess["audio_send_worker"]` and route
-                # their old-ws close through _close_audio_after_worker —
-                # which awaits the cancelled worker before close, avoiding
-                # the ASGI single-sender race. The audio_send_worker slot
-                # itself will be replaced by either:
-                #   (a) the deferred restart helper below, after the
-                #       cancelled worker has actually exited, or
-                #   (b) a concurrent reattach via _setup_audio_worker.
-                #
-                # We DO NOT close audio_ws — closing here would emit a
-                # misleading close code (the session is typically still
-                # alive — our cleanup was interrupted by an external
-                # cancel like a same-session reconnect of the OTHER
-                # endpoint, not by a real teardown).
-                sess["audio_send_queue"] = None
-                if (
-                    room is not None
-                    and player_id is not None
-                    and sess.get("audio_ws") is not None
-                ):
-                    asyncio.create_task(
-                        _restart_audio_worker_after_old(
-                            room, player_id, sess, worker,
-                        )
+        # OUR caller was cancelled. We MUST NOT restart the worker here
+        # even if audio_ws is still alive: the old worker may not have
+        # fully exited from ws.send_bytes yet (we abandoned the gather),
+        # and starting a fresh worker on the same ws would have two
+        # concurrent senders, violating ASGI's one-sender-at-a-time rule
+        # and corrupting the relay.
+        #
+        # Synchronously clear the queue so fan-out immediately skips
+        # this peer, but leave the existing /audio WebSocket open. If
+        # the cancelled worker is still the active one, we only schedule
+        # a deferred worker restart that waits for that worker to
+        # actually exit before replacing it; we do not close the same
+        # ws here. Closing would emit a misleading close code (the
+        # session is typically still alive — our cleanup was interrupted
+        # by an external cancel like a same-session reconnect of the
+        # OTHER endpoint, not by a real teardown), so we let the relay
+        # self-heal silently.
+        #
+        # All slot mutations (worker, queue) are gated on our captured
+        # worker still being the active one. If a same-session reattach
+        # has run during our await, _setup_audio_worker synchronously
+        # installed a fresh worker AND a fresh audio_ws in the same
+        # atomic block — `is worker` returns False, and we leave the
+        # new state untouched (otherwise we'd orphan its new worker).
+        if sess.get("audio_send_worker") is worker:
+            # Clear the QUEUE so fan-out skips this peer (no pushes to a
+            # queue with no live consumer), but leave audio_send_worker
+            # pointing at the cancelled worker so concurrent rule-2
+            # audio reconnects in _take_session_slot can still snapshot
+            # `prev_audio_worker = sess["audio_send_worker"]` and route
+            # their old-ws close through _close_audio_after_worker —
+            # which awaits the cancelled worker before close, avoiding
+            # the ASGI single-sender race. The audio_send_worker slot
+            # itself will be replaced by either:
+            #   (a) the deferred restart helper below, after the
+            #       cancelled worker has actually exited, or
+            #   (b) a concurrent reattach via _setup_audio_worker.
+            sess["audio_send_queue"] = None
+            if (
+                room is not None
+                and player_id is not None
+                and sess.get("audio_ws") is not None
+            ):
+                asyncio.create_task(
+                    _restart_audio_worker_after_old(
+                        room, player_id, sess, worker,
                     )
-            raise
-    except Exception:
-        pass
+                )
+        raise
+    # Normal completion path: gather returned (worker exited, possibly
+    # via the cancellation we requested). Clear the slots if our worker
+    # is still what's there.
     if sess.get("audio_send_worker") is worker:
         sess["audio_send_worker"] = None
         sess["audio_send_queue"] = None
