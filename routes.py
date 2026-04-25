@@ -233,6 +233,18 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
     rec[slot] = websocket
     rec[f"{endpoint}_ever_opened"] = True
     sessions[player_id] = rec
+    # Clear the player's stale highway-WS reference. After rule 3 the new
+    # session's highway_ws is None until the new tab's highway WS connects;
+    # leaving player["ws"] pointing at the just-closed old highway makes
+    # _promote_host (which treats ws is not None as "highway-active") think
+    # the player has a live highway, and makes _broadcast waste send attempts
+    # on a closed socket. The highway-side caller of _take_session_slot
+    # immediately reassigns player["ws"] = websocket after this returns, so
+    # for the highway endpoint this is a no-op; for the audio endpoint it
+    # closes a real bug.
+    player = room["players"].get(player_id)
+    if player is not None:
+        player["ws"] = None
     await _safe_close(old_highway_ws, _CLOSE_SUPERSEDED)
     await _safe_close(old_audio_ws, _CLOSE_SUPERSEDED)
     return "takeover"

@@ -155,20 +155,34 @@ def test_binary_frame_forwarded_byte_identical_to_other_peer(client):
 
 
 def test_sender_does_not_receive_own_frame(client):
+    """Verify the relay never echoes a frame back to its sender. Uses a second
+    player as a canary: if the sender were getting echoes, their FIRST inbound
+    frame after sending frame_X would be frame_X. We instead expect frame_Y
+    (sent by the other player AFTER) — proving sender's queue is empty until
+    the other player speaks."""
     code, host_pid = _create_room(client)
+    bob_pid = _join_room(client, code, "Bob")
 
-    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")) as host_audio:
-        host_audio.send_bytes(_build_audio_frame(b"\x00\x11\x22"))
-        # No other audio subscribers exist; nothing to forward to.
-        # Sending a control frame and checking that the next receive is a close
-        # would be ideal, but TestClient WS receive blocks. Assert the session
-        # state reflects the frame was processed (no error).
-        # Most reliable: the next message should be... nothing — there is no
-        # other peer, so we instead assert that closing cleanly works (no
-        # echo got buffered).
-        # Use the implicit drain via context-exit; the test relies on the
-        # receive loop not having queued a self-echo (else this connection
-        # would have a leftover frame in its receive buffer).
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")) as host_audio, \
+         client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")) as bob_audio:
+
+        frame_x = _build_audio_frame(b"\xAA" * 16, interval_index=1)
+        frame_y = _build_audio_frame(b"\xBB" * 16, interval_index=2)
+
+        host_audio.send_bytes(frame_x)
+        # Bob receives X — confirms the relay delivered it forward.
+        assert bob_audio.receive_bytes() == frame_x
+
+        # Now Bob sends frame_y. If host were also receiving its own echoes,
+        # host's queue would already contain frame_x and that would be the
+        # FIRST receive. The assertion that the FIRST receive is frame_y
+        # therefore proves no echo of X reached host.
+        bob_audio.send_bytes(frame_y)
+        first_received_by_host = host_audio.receive_bytes()
+        assert first_received_by_host == frame_y, (
+            "Sender's first inbound frame must be the canary from the OTHER peer, "
+            "not an echo of its own send. Got bytes that match frame_x echo."
+        )
 
 
 def test_two_listeners_both_receive_host_frame(client):
