@@ -1386,6 +1386,19 @@ def setup(app, context):
                 if message.get("type") == "websocket.disconnect":
                     break
 
+                # Self-check: if this socket has been superseded by a same-
+                # session reconnect (Rule 2) or different-session takeover
+                # (Rule 3) since we entered the loop, our slot in the session
+                # record now points at a NEW ws. Continuing to forward frames
+                # from THIS (old) ws would put two senders on the same
+                # player_id and violate the single-active-slot invariant
+                # PROTOCOL.md guarantees. Exit the loop; the deferred close
+                # already scheduled by Rule 2 / takeover will close us
+                # cleanly with 4410 / 4409.
+                live_sess = room.get("sessions", {}).get(player_id)
+                if live_sess is None or live_sess.get("audio_ws") is not websocket:
+                    break
+
                 payload = message.get("bytes")
                 if payload is None:
                     # Non-binary frame on the audio WS — drop silently per
