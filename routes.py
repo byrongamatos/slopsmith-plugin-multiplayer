@@ -431,17 +431,24 @@ async def _cleanup_audio_worker(sess):
             # closing the same ws. Without the close, the client's /audio
             # socket stays open with no signal that it's gone mute, and
             # the listener has no trigger to reconnect.
+            # All slot mutations (worker, queue, audio_ws) are gated on our
+            # captured worker still being the active one. If a same-session
+            # reattach has run during our await, _setup_audio_worker
+            # synchronously installed a fresh worker AND a fresh audio_ws
+            # in the same atomic block — `is worker` returns False, and we
+            # leave the new state untouched (otherwise we'd null/close the
+            # freshly reattached /audio socket and orphan its new worker).
             if sess.get("audio_send_worker") is worker:
                 sess["audio_send_worker"] = None
                 sess["audio_send_queue"] = None
-            stale_audio_ws = sess.get("audio_ws")
-            if stale_audio_ws is not None:
-                sess["audio_ws"] = None
-                asyncio.create_task(
-                    _close_audio_after_worker(
-                        stale_audio_ws, worker, _CLOSE_GRACE_EXPIRED,
+                stale_audio_ws = sess.get("audio_ws")
+                if stale_audio_ws is not None:
+                    sess["audio_ws"] = None
+                    asyncio.create_task(
+                        _close_audio_after_worker(
+                            stale_audio_ws, worker, _CLOSE_GRACE_EXPIRED,
+                        )
                     )
-                )
             raise
     except Exception:
         pass
