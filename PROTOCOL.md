@@ -5,7 +5,7 @@ This document describes the wire protocol used by the Slopsmith Multiplayer plug
 - **Highway WS** — `/ws/plugins/multiplayer/{code}` — JSON control plane (already implemented; see `routes.py`).
 - **Audio WS** — `/ws/plugins/multiplayer/{code}/audio` — binary peer-audio relay. Planned for the interval-quantized peer-audio feature; not live in any released plugin version yet. `plugin.json` stays at the current version until the endpoint actually ships.
 
-Both endpoints share the same room registry and authentication: the connecting client must pass `player_id` as a query parameter, the room must exist, and the player must already be a member of the room (joined via the REST API). The audio WS rejects connections that fail this check the same way the highway WS does.
+Both endpoints share the same room registry and authentication state: the connecting client must pass `player_id` as a query parameter, the room must exist, and the player must already be a member of the room (joined via the REST API). The two endpoints use different rejection mechanisms because their framing rules differ — see each endpoint section below.
 
 ---
 
@@ -19,6 +19,8 @@ ws://<host>/ws/plugins/multiplayer/{code}?player_id={id}
 
 Carries all control messages. The message types used by the audio feature are documented under "Audio control messages" below; the existing playback/queue/recording messages are unchanged.
 
+**Rejection on auth failure:** the highway WS sends a JSON `{"type": "error", "message": "..."}` text frame and then closes the connection (existing behavior; preserves backward compatibility with already-shipped clients).
+
 ### Audio WS — binary peer-audio relay (NEW)
 
 ```
@@ -29,7 +31,19 @@ Carries **binary frames only**. Every frame is one full Ninjam-style interval of
 
 The server's forwarding path is intentionally trivial: on receipt of a binary frame from a subscriber, it forwards the frame **byte-for-byte** to every other audio subscriber in the same room — no re-encoding, no payload inspection, no rewriting. The server DOES, however, parse the fixed-size 40-byte header before forwarding in order to enforce the safety checks in "Frame size budget and bounds" below (magic, version, frame-length / `opus_size` consistency, and the `MAX_FRAME_BYTES` hard limit). Those are O(1) integrity checks on the header only; the Opus payload is never touched.
 
-JSON / text frames on the audio WS are reserved for future use and are **not part of v1**. Clients **MUST NOT** send them. If the server receives a non-binary frame on the audio WS in v1, it **MUST drop the frame and MUST NOT forward it to any peer**. (Servers MAY additionally close the connection; v1 implementations are not required to.)
+**The audio WS is binary-only in BOTH directions in v1.** Neither client nor server may send text/JSON frames over it. Specifically:
+
+- Clients MUST NOT send text frames. If the server receives a non-binary frame, it MUST drop it and MUST NOT forward it to any peer. (Servers MAY additionally close the connection on receipt of a non-binary frame; v1 implementations are not required to.)
+- Servers MUST NOT send text frames either. **Connection-rejection on auth failure (room not found, player not in room) is signalled via the WebSocket close handshake only**, with one of the close codes below — no JSON error payload as on the highway WS. This preserves the binary-only invariant and lets clients implement a single uniform reader.
+
+| Close code | Meaning                                                             |
+|-----------:|---------------------------------------------------------------------|
+| `4401`     | Auth failure (room does not exist or `player_id` not in the room).  |
+| `4409`     | Conflict (e.g. another connection from the same `player_id`; reserved). |
+| `1009`     | Frame too big — see Frame size budget and bounds below.             |
+| `1011`     | Server error (unexpected; rare).                                    |
+
+Codes in the `4000–4999` range are protocol-reserved per RFC 6455 and visible to the client via `event.code` on the `close` event. The optional `event.reason` string MAY include a short ASCII hint (≤ 123 bytes per RFC) but clients MUST NOT depend on a specific reason string.
 
 ---
 
