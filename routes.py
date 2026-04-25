@@ -35,6 +35,7 @@ _CLOSE_SUPERSEDED = 4409
 _CLOSE_REPLACED = 4410
 _CLOSE_FRAME_TOO_BIG = 1009
 _CLOSE_NORMAL = 1000
+_CLOSE_INTERNAL_ERROR = 1011
 
 # Audio WS frame format constants — see PROTOCOL.md "Audio frame format".
 _AUDIO_FRAME_MAGIC = b"SMAU"
@@ -464,9 +465,18 @@ async def _cleanup_audio_worker(sess):
                 stale_audio_ws = sess.get("audio_ws")
                 if stale_audio_ws is not None:
                     sess["audio_ws"] = None
+                    # Close with 1011 (server error), NOT 4408. 4408 has
+                    # specific spec semantics — "session timed out / grace
+                    # expired, you MAY reconnect with a new session_id" —
+                    # which is wrong here: the session may still be alive
+                    # (our caller was cancelled by something like a
+                    # same-session reconnect of the OTHER endpoint, NOT
+                    # by grace expiry). 1011 is the spec-allowed
+                    # "unexpected server error" close that lets the
+                    # client retry their existing session_id cleanly.
                     asyncio.create_task(
                         _close_audio_after_worker(
-                            stale_audio_ws, worker, _CLOSE_GRACE_EXPIRED,
+                            stale_audio_ws, worker, _CLOSE_INTERNAL_ERROR,
                         )
                     )
             raise
