@@ -319,12 +319,19 @@ def _start_cleanup(code):
     `_grace_then_finalize_endpoint` can reach it without a NameError when the
     only-player-just-disconnected branch fires.
     """
+    # `_rooms` is canonically keyed by uppercase code (see _gen_code() and the
+    # `code = code.upper()` normalization at every WS handler entry). Normalize
+    # here too so a stray lower-case caller can't park the cleanup task under a
+    # case-mismatched key, which would later look up _rooms[lowercase] → None
+    # and leak the room dict + room-dir files.
+    code = code.upper()
     if code in _cleanup_tasks:
         return
     _cleanup_tasks[code] = asyncio.ensure_future(_cleanup_after_grace(code))
 
 
 async def _cleanup_after_grace(code, seconds=60):
+    code = code.upper()
     await asyncio.sleep(seconds)
     room = _rooms.get(code)
     if room and _connected_count(room) == 0:

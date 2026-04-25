@@ -111,7 +111,10 @@ def test_audio_ws_unknown_player_id_rejected(client):
 
 def test_audio_ws_unknown_room_rejected(client):
     code, pid = _create_room(client)
-    with client.websocket_connect(_audio_url("ZZZZZZ", pid, "sid")) as ws:
+    # Use a code containing characters outside _CODE_ALPHABET (no 0/O/1/I/L)
+    # so _gen_code() could never produce it — guaranteed unknown regardless
+    # of which room the test fixture happened to mint.
+    with client.websocket_connect(_audio_url("000000", pid, "sid")) as ws:
         with pytest.raises(WebSocketDisconnect) as excinfo:
             ws.receive_bytes()
         assert excinfo.value.code == 4401
