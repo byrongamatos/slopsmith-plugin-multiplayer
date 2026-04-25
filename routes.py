@@ -944,21 +944,24 @@ def setup(app, context):
         # (not just connected=True), so leave_room may have left the room with
         # `room["host"]` pointing at the departed player when every remaining
         # player was in audio-only state. Re-run the election now that this
-        # highway attach made the candidate set non-empty. Without this, the
-        # room stays unhostable forever even after a perfectly normal reconnect.
-        # We update room["host"] BEFORE sending the 'connected' snapshot so the
-        # new client sees the corrected host_id immediately, then broadcast
-        # host_changed to OTHER peers (the new client already has it via the
-        # snapshot) AFTER sending 'connected' so messages stay properly ordered.
+        # highway attach made the candidate set non-empty.
+        #
+        # IMPORTANT: only self-heal when the host has truly departed (their
+        # player record is gone from room["players"]). A host whose highway
+        # slot is temporarily empty because of a per-endpoint grace window
+        # (audio still alive, highway dropped, awaiting reattach) is still
+        # the host — promoting another player here over a transient drop
+        # would permanently steal their host privileges.
+        #
+        # We update room["host"] BEFORE sending the 'connected' snapshot so
+        # the new client sees the corrected host_id immediately, then
+        # broadcast host_changed to OTHER peers AFTER sending 'connected'
+        # so messages stay properly ordered.
         host_id = room.get("host")
         host_player = room["players"].get(host_id) if host_id else None
-        host_alive = (
-            host_player is not None
-            and host_player.get("connected")
-            and host_player.get("ws") is not None
-        )
+        host_truly_gone = host_id is None or host_player is None
         host_was_self_healed = False
-        if not host_alive:
+        if host_truly_gone:
             new_host = _promote_host(room)
             if new_host is not None and new_host != host_id:
                 host_was_self_healed = True

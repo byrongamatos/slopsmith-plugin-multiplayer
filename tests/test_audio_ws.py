@@ -506,6 +506,41 @@ def test_host_self_heal_when_audio_only_player_reattaches_highway(client, routes
         assert room["host"] == bob_pid
 
 
+def test_host_grace_window_does_not_steal_host_to_other_player(client, routes_module):
+    """Codex round 3 P1: while the host is in a per-endpoint grace window
+    (highway dropped, audio still alive), another player attaching their
+    highway MUST NOT steal host privileges. The host's player record is
+    still present — they're transiently disconnected, not gone."""
+    code, host_pid = _create_room(client)
+    other_pid = _join_room(client, code, "Bob")
+    room = routes_module._rooms[code]
+
+    sid = "host-sid"
+    # Host opens highway+audio. Then drops highway only (audio still alive).
+    with client.websocket_connect(_audio_url(code, host_pid, sid)):
+        with client.websocket_connect(_highway_url(code, host_pid, sid)) as host_hw:
+            host_hw.receive_json()  # 'connected'
+        # Host's highway closed inside the with block. Audio still alive.
+        # Host is in grace window: player record present, ws=None, connected=True.
+        host_record = room["players"][host_pid]
+        assert host_record["connected"] is True
+        assert host_record["ws"] is None
+        assert room["host"] == host_pid
+
+        # Bob attaches highway. The self-heal logic MUST notice that the host
+        # is still in the players dict (just transiently in grace) and NOT
+        # promote bob.
+        with client.websocket_connect(_highway_url(code, other_pid, "bob-sid")) as bob_hw:
+            snapshot = bob_hw.receive_json()
+            assert snapshot["type"] == "connected"
+            assert snapshot["room"]["host"] == host_pid, (
+                f"host must NOT be transferred away during a grace window; "
+                f"snapshot says new host is {snapshot['room']['host']!r} but "
+                f"original host {host_pid!r} is still in players"
+            )
+            assert room["host"] == host_pid
+
+
 def test_audio_grace_expiry_closes_highway_with_4408(client, routes_module, fast_grace):
     code, pid = _create_room(client)
     sid = "joint-sid"
