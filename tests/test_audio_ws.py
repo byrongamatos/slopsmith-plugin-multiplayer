@@ -271,9 +271,10 @@ def test_send_queue_drops_oldest_on_overflow(client, routes_module):
             host_audio.send_bytes(_build_audio_frame(payload, interval_index=i))
 
         # Confirm sender wasn't stalled — drive a deterministic round-trip
-        # through the highway by sending a marker frame from bob and reading
-        # it back. The relay should have processed all sender frames already
-        # (or dropped overflow) by the time bob's marker shows up.
+        # through the audio relay by sending a marker frame from bob and
+        # reading it on host. The relay should have processed all sender
+        # frames already (or dropped overflow) by the time bob's marker
+        # shows up.
         marker = _build_audio_frame(b"MARKER", interval_index=99999)
         bob_audio.send_bytes(marker)
         # Host receives bob's marker — confirms the relay is still alive

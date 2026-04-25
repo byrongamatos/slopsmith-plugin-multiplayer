@@ -229,6 +229,13 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
         ever_key = f"{endpoint}_ever_opened"
         ever_opened_before = existing.get(ever_key, False)
         old_ws = existing[slot]
+        # Snapshot the prior audio worker BEFORE _setup_audio_worker
+        # overwrites the slot, so the audio-side close below can defer
+        # until the cancelled worker has actually exited (avoids the
+        # close-vs-send_bytes race on the same WebSocket).
+        prev_audio_worker = (
+            existing.get("audio_send_worker") if endpoint == _AUDIO else None
+        )
         existing[slot] = websocket
         existing[ever_key] = True
         # Reattach cancels any in-flight grace timer for this endpoint only.
@@ -238,13 +245,26 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
         existing[grace] = None
         # Audio reconnect/first_attach gets a fresh worker + queue bound to
         # the new ws so any tasks left over from the old ws can't block the
-        # newly-attached socket.
+        # newly-attached socket. _setup_audio_worker cancels prev_audio_worker
+        # but does NOT await its exit (cancel only requests; the worker may
+        # still be inside ws.send_bytes on old_ws).
         if endpoint == _AUDIO:
             _setup_audio_worker(existing)
         if not ever_opened_before:
             return "first_attach"
         if old_ws is not None and old_ws is not websocket:
-            await _safe_close(old_ws, _CLOSE_REPLACED)
+            if endpoint == _AUDIO and prev_audio_worker is not None:
+                # Fire-and-forget the close: _close_audio_after_worker waits
+                # for prev_audio_worker to actually exit, then closes old_ws
+                # with 4410. This is the sole sender on old_ws by the time
+                # close fires.
+                asyncio.create_task(
+                    _close_audio_after_worker(
+                        old_ws, prev_audio_worker, _CLOSE_REPLACED,
+                    )
+                )
+            else:
+                await _safe_close(old_ws, _CLOSE_REPLACED)
         return "reconnect"
 
     # Rule 3: takeover by a different session_id — close BOTH old endpoints.
