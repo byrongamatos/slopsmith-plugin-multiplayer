@@ -45,6 +45,18 @@ The server's forwarding path is intentionally trivial: on receipt of a binary fr
 
 Codes in the `4000–4999` range are protocol-reserved per RFC 6455 and visible to the client via `event.code` on the `close` event. The optional `event.reason` string MAY include a short ASCII hint (≤ 123 bytes per RFC) but clients MUST NOT depend on a specific reason string.
 
+**Implementation note (server side).** To make the typed close code actually reach the browser, the server MUST accept the WebSocket upgrade first and only then close with the custom code. On Starlette / FastAPI, `await websocket.close(code=4401)` *before* `await websocket.accept()` causes the HTTP upgrade to fail with `403 Forbidden`, and browser clients receive a generic `WebSocket` error rather than a `close` event whose `event.code === 4401`. The required pattern is:
+
+```python
+@app.websocket("/ws/plugins/multiplayer/{code}/audio")
+async def audio_ws(websocket: WebSocket, code: str, player_id: str = ""):
+    await websocket.accept()                 # accept first
+    if not _is_authorised(code, player_id):
+        await websocket.close(code=4401)     # then close with typed code
+        return
+    # ... normal session ...
+```
+
 ---
 
 ## Audio control messages (Highway WS)
