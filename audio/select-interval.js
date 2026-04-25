@@ -28,7 +28,7 @@ var DEFAULT_BEATS = 4;
 var FAST_TEMPO_BEATS = 8;
 
 function selectInterval(bpm) {
-    if (!isFinite(bpm) || bpm <= 0) return DEFAULT_BEATS;
+    if (!Number.isFinite(bpm) || bpm <= 0) return DEFAULT_BEATS;
     var secondsPerBeat = 60 / bpm;
     if (DEFAULT_BEATS * secondsPerBeat < MIN_DURATION_SEC) {
         return FAST_TEMPO_BEATS;
@@ -37,7 +37,7 @@ function selectInterval(bpm) {
 }
 
 function intervalDuration(bpm, beats) {
-    if (!isFinite(bpm) || bpm <= 0 || !isFinite(beats) || beats <= 0) return 0;
+    if (!Number.isFinite(bpm) || bpm <= 0 || !Number.isFinite(beats) || beats <= 0) return 0;
     return (60 / bpm) * beats;
 }
 

@@ -99,6 +99,23 @@ test('Infinity BPM → default 4', function () {
     assert.strictEqual(selectInterval(Infinity), DEFAULT_BEATS);
 });
 
+test('string BPM ("120") → default 4 (Number.isFinite rejects non-numbers)', function () {
+    assert.strictEqual(selectInterval('120'), DEFAULT_BEATS);
+});
+
+test('null BPM → default 4', function () {
+    assert.strictEqual(selectInterval(null), DEFAULT_BEATS);
+});
+
+test('undefined BPM → default 4', function () {
+    assert.strictEqual(selectInterval(undefined), DEFAULT_BEATS);
+});
+
+test('boolean BPM → default 4', function () {
+    assert.strictEqual(selectInterval(true), DEFAULT_BEATS);
+    assert.strictEqual(selectInterval(false), DEFAULT_BEATS);
+});
+
 // intervalDuration sanity.
 test('intervalDuration at 120 BPM × 4 beats = 2.0s', function () {
     assert.strictEqual(intervalDuration(120, 4), 2);

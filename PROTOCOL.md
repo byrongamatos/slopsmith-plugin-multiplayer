@@ -17,7 +17,9 @@ Both endpoints share the same room registry and authentication state: the connec
 ws://<host>/ws/plugins/multiplayer/{code}?player_id={id}&session_id={sid}
 ```
 
-`session_id` is a client-generated random identifier (UUIDv4 recommended; e.g. `crypto.randomUUID()`) that uniquely identifies a single browser tab / app instance for the lifetime of the session. **Wire-format requirement:** any non-empty string matching `[A-Za-z0-9_-]{1,128}` is a valid session_id. Servers MUST accept any value matching this pattern (UUIDv4 satisfies it) and MUST reject only missing or non-conformant values with `4401`. The client mints it when it starts trying to connect and keeps it in `sessionStorage` (or equivalent) so reconnects after a network blip carry the same `session_id`. A different tab gets a different `session_id`. **`session_id` is REQUIRED.** Connections without `session_id` are rejected with close code `4401` (treated as a malformed-handshake auth failure). Because slopsmith plugins ship client and server code as one unit (the user updates `routes.py` and `screen.js` atomically when they update the plugin), there is no in-the-wild legacy client problem to maintain compatibility for: the audio feature has not shipped, and Phase 1 will land the `session_id` requirement on the highway WS in the same release that introduces the audio WS.
+`session_id` is a client-generated random identifier (UUIDv4 recommended; e.g. `crypto.randomUUID()`) that uniquely identifies a single browser tab / app instance for the lifetime of the session. **Wire-format requirement:** any non-empty string matching `[A-Za-z0-9_-]{1,128}` is a valid session_id. Servers MUST accept any value matching this pattern (UUIDv4 satisfies it) and MUST reject only missing or non-conformant values with `4401`. The client mints it when it starts trying to connect and keeps it in `sessionStorage` (or equivalent) so reconnects after a network blip carry the same `session_id`. A different tab gets a different `session_id`.
+
+**Status (as of this PR — Phase 0).** The `session_id` parameter, the per-session takeover/grace lifecycle, and the lifecycle close codes (`4408`/`4409`/`4410`) describe the **target protocol** that Phase 1 will implement. The shipped highway WS handler in `routes.py` does NOT currently read `session_id` and rejects auth failures via the legacy `{"type":"error","message":"..."}` JSON-then-close path. Phase 1 (the next PR) lands the session-aware highway behavior, the audio WS endpoint, and the matching client wiring in `screen.js` together — so spec and code go from "Phase 0 spec only" to "Phase 1 spec + impl" in one release. Until that ships, this section is normative for implementers, not a description of current runtime behavior.
 
 Carries all control messages. The message types used by the audio feature are documented under "Audio control messages" below; the existing playback/queue/recording messages are unchanged.
 
@@ -49,19 +51,21 @@ The server's forwarding path is intentionally trivial: on receipt of a binary fr
 | `1009`     | Frame too big — see Frame size budget and bounds below.             |
 | `1011`     | Server error (unexpected; rare).                                    |
 
-**v1 server policy: at most one active *session* per `player_id`, where a session is identified by the client-supplied `session_id` and owns BOTH the highway WS and the audio WS atomically.** The server keeps state of the form:
+**v1 server policy: at most one active *session* per `(room_code, player_id)`, where a session is identified by the client-supplied `session_id` and owns BOTH the highway WS and the audio WS atomically.** Session tracking is **per-room** — `player_id` values are scoped to a room (see existing `room["players"][player_id]` in `routes.py`), so the session registry lives on the room object alongside that map. The server keeps state of the form:
 
 ```
-sessions[player_id] = {
+room["sessions"][player_id] = {
     session_id,
     highway_ws,   # may be None if not yet opened or already closed
     audio_ws,     # may be None if not yet opened or already closed
 }
 ```
 
-Connection-arrival rules (apply identically to a highway-WS open and an audio-WS open; the only difference is which slot the new socket fills):
+Two rooms with the same `player_id` value (which is theoretically possible since `player_id`s are minted per-room) keep independent sessions. Implementations MUST NOT build a global `player_id → session` map.
 
-1. **No existing session for this `player_id`** → create a new session with the supplied `session_id`, register the new socket in the matching slot, accept normally.
+Connection-arrival rules (apply identically to a highway-WS open and an audio-WS open; the only difference is which slot the new socket fills; lookup is always against `room["sessions"][player_id]` for the room identified by the URL `code`):
+
+1. **No existing session for this `(room_code, player_id)`** → create a new session with the supplied `session_id`, register the new socket in the matching slot, accept normally.
 2. **Existing session and `session_id` matches** → this is the same tab opening its second endpoint, OR a reconnect of the same endpoint after a network blip. Close any existing socket already in the matching slot with code `4410`, register the new socket in that slot, accept normally. The OTHER endpoint's socket is **left untouched** — it remains a live, healthy member of the same session.
 3. **Existing session and `session_id` differs** → this is a different tab taking over. Close BOTH the existing highway and audio sockets in the existing session with code `4409`, discard the old session, create a new session with the supplied `session_id`, register the new socket, accept normally.
 
