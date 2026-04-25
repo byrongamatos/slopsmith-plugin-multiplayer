@@ -7,6 +7,7 @@
 let _ws = null;
 let _roomCode = null;
 let _playerId = null;
+let _sessionId = null;
 let _playerName = '';
 let _isHost = false;
 let _room = null;
@@ -38,8 +39,40 @@ let _origSeekBy = null;
 let _origSetSpeed = null;
 
 const STORAGE_KEY = 'slopsmith_mp';
+const SESSION_STORAGE_KEY = 'mp_session';
 const SYNC_ROUNDS = 5;
 const HEARTBEAT_HZ = 100;  // ms between heartbeats
+
+// Close codes from PROTOCOL.md "Endpoints" / "v1 server policy".
+const CLOSE_GRACE_EXPIRED = 4408;
+const CLOSE_SUPERSEDED = 4409;
+const CLOSE_REPLACED = 4410;
+
+function _mintSessionId() {
+    // crypto.randomUUID is widely available; fall back to a hex token if not.
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+    const bytes = new Uint8Array(16);
+    (crypto && crypto.getRandomValues ? crypto : { getRandomValues: (a) => {
+        for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256);
+    }}).getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function _getOrMintSessionId() {
+    let sid = sessionStorage.getItem(SESSION_STORAGE_KEY);
+    if (!sid) {
+        sid = _mintSessionId();
+        sessionStorage.setItem(SESSION_STORAGE_KEY, sid);
+    }
+    return sid;
+}
+
+function _resetSessionId() {
+    _sessionId = _mintSessionId();
+    sessionStorage.setItem(SESSION_STORAGE_KEY, _sessionId);
+}
 
 // ── Lobby ──────────────────────────────────────────────────────────────
 
@@ -88,6 +121,9 @@ window.mpCreateRoom = async function () {
         _roomCode = data.code;
         _playerId = data.player_id;
         _isHost = true;
+        // Fresh join: always start with a new session_id so we can't accidentally
+        // collide with a stale session left over from a previous tab.
+        _resetSessionId();
         sessionStorage.setItem('mp_room', _roomCode);
         sessionStorage.setItem('mp_player', _playerId);
         _connectWS();
@@ -120,6 +156,7 @@ window.mpJoinRoom = async function () {
         _playerId = data.player_id;
         _isHost = false;
         _room = data.room;
+        _resetSessionId();
         sessionStorage.setItem('mp_room', _roomCode);
         sessionStorage.setItem('mp_player', _playerId);
         _connectWS();
@@ -157,11 +194,13 @@ function _cleanup() {
     if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
     _roomCode = null;
     _playerId = null;
+    _sessionId = null;
     _isHost = false;
     _room = null;
     _reconnectAttempts = 0;
     sessionStorage.removeItem('mp_room');
     sessionStorage.removeItem('mp_player');
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
 }
 
 // ── Views ──────────────────────────────────────────────────────────────
@@ -192,20 +231,24 @@ function _showRoomView() {
 function _connectWS() {
     if (_ws) { try { _ws.close(); } catch (e) { /* */ } }
     _intentionalClose = false;
+    if (!_sessionId) _sessionId = _getOrMintSessionId();
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${proto}//${location.host}/ws/plugins/multiplayer/${_roomCode}?player_id=${_playerId}`;
-    _ws = new WebSocket(url);
+    const url = `${proto}//${location.host}/ws/plugins/multiplayer/${_roomCode}`
+        + `?player_id=${encodeURIComponent(_playerId)}`
+        + `&session_id=${encodeURIComponent(_sessionId)}`;
+    const ws = new WebSocket(url);
+    _ws = ws;
 
     const statusEl = document.getElementById('mp-connection-status');
 
-    _ws.onopen = () => {
+    ws.onopen = () => {
         _reconnectAttempts = 0;
         if (statusEl) statusEl.textContent = 'Connected';
         // Clock sync starts when we receive 'connected' message
     };
 
-    _ws.onmessage = (ev) => {
+    ws.onmessage = (ev) => {
         try {
             const msg = JSON.parse(ev.data);
             _handleMessage(msg);
@@ -214,15 +257,41 @@ function _connectWS() {
         }
     };
 
-    _ws.onclose = () => {
-        if (statusEl) statusEl.textContent = 'Disconnected';
+    ws.onclose = (ev) => {
+        // If a newer connection has already replaced _ws, this is the OLD socket
+        // closing — don't touch global state or trigger reconnect.
+        if (ws !== _ws) return;
         _stopHeartbeat();
+
+        if (ev && ev.code === CLOSE_REPLACED) {
+            // Same-session reconnect performed by us elsewhere; new socket has
+            // already taken over (or is about to). Nothing to do here.
+            if (statusEl) statusEl.textContent = 'Connection replaced';
+            return;
+        }
+        if (ev && ev.code === CLOSE_SUPERSEDED) {
+            // Different tab took over the session. Per PROTOCOL.md, we MUST NOT
+            // auto-reconnect (would just steal back).
+            _intentionalClose = true;
+            if (statusEl) statusEl.textContent = 'Session moved to another tab';
+            return;
+        }
+        if (ev && ev.code === CLOSE_GRACE_EXPIRED) {
+            // Grace expired without reattach. The held session is dead; mint a
+            // fresh session_id and let the reconnect path open a new one.
+            _resetSessionId();
+            if (statusEl) statusEl.textContent = 'Reconnecting…';
+            if (!_intentionalClose && _roomCode) _scheduleReconnect();
+            return;
+        }
+
+        if (statusEl) statusEl.textContent = 'Disconnected';
         if (!_intentionalClose && _roomCode) {
             _scheduleReconnect();
         }
     };
 
-    _ws.onerror = () => {
+    ws.onerror = () => {
         if (statusEl) statusEl.textContent = 'Connection error';
     };
 }

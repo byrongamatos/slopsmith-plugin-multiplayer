@@ -2,6 +2,7 @@
 
 import asyncio
 import math
+import re
 import secrets
 import shutil
 import subprocess
@@ -16,6 +17,15 @@ _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 30 chars, no 0/O/1/I/L
 
 _rooms = {}           # code -> room dict
 _cleanup_tasks = {}   # code -> asyncio.Task
+
+# Session lifecycle constants — see PROTOCOL.md "v1 server policy".
+SESSION_GRACE_SEC = 5.0
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# Lifecycle close codes; values track PROTOCOL.md.
+_CLOSE_AUTH_FAIL = 4401
+_CLOSE_GRACE_EXPIRED = 4408
+_CLOSE_SUPERSEDED = 4409
+_CLOSE_REPLACED = 4410
 
 
 def _gen_code():
@@ -79,6 +89,123 @@ def _promote_host(room):
     return None
 
 
+# ── Session lifecycle (PROTOCOL.md "v1 server policy") ─────────────────
+
+def _is_valid_session_id(sid):
+    return bool(sid) and bool(_SESSION_ID_RE.match(sid))
+
+
+async def _safe_close(ws, code):
+    """Close a WebSocket without raising. Used for server-initiated session closes."""
+    if ws is None:
+        return
+    try:
+        await ws.close(code=code)
+    except Exception:
+        pass
+
+
+def _new_session_record(session_id, highway_ws=None, audio_ws=None):
+    return {
+        "session_id": session_id,
+        "highway_ws": highway_ws,
+        "audio_ws": audio_ws,
+        "highway_grace_task": None,
+        "audio_grace_task": None,
+    }
+
+
+def _cancel_grace_tasks(sess):
+    for k in ("highway_grace_task", "audio_grace_task"):
+        t = sess.get(k)
+        if t and not t.done():
+            t.cancel()
+        sess[k] = None
+
+
+async def _take_highway_slot(websocket, room, player_id, session_id):
+    """Apply PROTOCOL.md connection-arrival rules for the highway endpoint.
+    Returns one of 'new_session', 'reconnect', 'takeover' indicating what
+    transition just occurred. The new websocket is registered in the
+    room's session record on success.
+    """
+    sessions = room["sessions"]
+    existing = sessions.get(player_id)
+
+    if existing is None:
+        sessions[player_id] = _new_session_record(session_id, highway_ws=websocket)
+        return "new_session"
+
+    if existing["session_id"] == session_id:
+        # Rule 2: same-session reconnect of this endpoint.
+        old_ws = existing["highway_ws"]
+        existing["highway_ws"] = websocket
+        # Reattach cancels any in-flight grace timer for this endpoint.
+        t = existing.get("highway_grace_task")
+        if t and not t.done():
+            t.cancel()
+        existing["highway_grace_task"] = None
+        if old_ws is not None and old_ws is not websocket:
+            await _safe_close(old_ws, _CLOSE_REPLACED)
+        return "reconnect"
+
+    # Rule 3: takeover by a different session_id — close BOTH old endpoints.
+    _cancel_grace_tasks(existing)
+    await _safe_close(existing.get("highway_ws"), _CLOSE_SUPERSEDED)
+    await _safe_close(existing.get("audio_ws"), _CLOSE_SUPERSEDED)
+    sessions[player_id] = _new_session_record(session_id, highway_ws=websocket)
+    return "takeover"
+
+
+async def _on_highway_disconnect(websocket, room, player_id):
+    """Called from the highway WS handler's finally block.
+
+    Distinguishes "this socket is still the active highway slot for the
+    session" (start grace timer) from "the server already replaced this
+    socket via 4409/4410" (no further action).
+    """
+    sess = room.get("sessions", {}).get(player_id)
+    if sess is None or sess.get("highway_ws") is not websocket:
+        # Server-initiated close already swapped this slot; nothing to do.
+        return
+    sess["highway_ws"] = None
+    # Schedule grace expiry.
+    sess["highway_grace_task"] = asyncio.create_task(
+        _grace_then_finalize(room, player_id)
+    )
+
+
+async def _grace_then_finalize(room, player_id):
+    """Wait SESSION_GRACE_SEC; if the highway slot is still empty, end the session."""
+    try:
+        await asyncio.sleep(SESSION_GRACE_SEC)
+    except asyncio.CancelledError:
+        return
+
+    sessions = room.get("sessions", {})
+    sess = sessions.get(player_id)
+    if sess is None:
+        return
+    if sess.get("highway_ws") is not None:
+        # Reattached during the grace window.
+        return
+
+    # Grace expired with no reattach: end the session.
+    audio_ws = sess.get("audio_ws")
+    sessions.pop(player_id, None)
+    await _safe_close(audio_ws, _CLOSE_GRACE_EXPIRED)
+
+    player = room["players"].get(player_id)
+    if player is not None:
+        player["connected"] = False
+        player["ws"] = None
+
+    await _broadcast(room, {"type": "player_disconnected", "player_id": player_id})
+
+    if _connected_count(room) == 0:
+        _start_cleanup(room["code"])
+
+
 def setup(app, context):
     config_dir = context["config_dir"]
     STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
@@ -114,6 +241,7 @@ def setup(app, context):
             "recordings": {},
             "mixdown_path": None,
             "skip_votes": set(),
+            "sessions": {},
         }
         _rooms[code] = room
         return {"code": code, "player_id": player_id, "is_host": True}
@@ -168,6 +296,12 @@ def setup(app, context):
                 await ws.close()
             except Exception:
                 pass
+
+        # Drop the session record + cancel any in-flight grace timers for this player.
+        sess = room.get("sessions", {}).pop(player_id, None)
+        if sess is not None:
+            _cancel_grace_tasks(sess)
+            await _safe_close(sess.get("audio_ws"), _CLOSE_GRACE_EXPIRED)
 
         del room["players"][player_id]
         await _broadcast(room, {"type": "player_left", "player_id": player_id})
@@ -576,7 +710,12 @@ def setup(app, context):
     # ── WebSocket ──────────────────────────────────────────────────────
 
     @app.websocket("/ws/plugins/multiplayer/{code}")
-    async def multiplayer_ws(websocket: WebSocket, code: str, player_id: str = ""):
+    async def multiplayer_ws(
+        websocket: WebSocket,
+        code: str,
+        player_id: str = "",
+        session_id: str = "",
+    ):
         await websocket.accept()
 
         code = code.upper()
@@ -586,29 +725,43 @@ def setup(app, context):
             await websocket.close()
             return
 
+        if not _is_valid_session_id(session_id):
+            await websocket.send_json(
+                {"type": "error", "message": "Missing or malformed session_id"}
+            )
+            await websocket.close()
+            return
+
+        # Apply PROTOCOL.md connection-arrival rules. May close prior sockets
+        # for this player_id with 4410 (same-session reconnect) or 4409
+        # (different-session takeover) before accepting this one.
+        transition = await _take_highway_slot(websocket, room, player_id, session_id)
+
         player = room["players"][player_id]
         player["ws"] = websocket
         player["connected"] = True
         player["last_seen"] = time.monotonic()
 
-        # Cancel cleanup if reconnecting
+        # Cancel pending room-empty cleanup if any (e.g. last player just rejoined).
         task = _cleanup_tasks.pop(code, None)
         if task:
             task.cancel()
 
-        # Send full room state
         await websocket.send_json({
             "type": "connected",
             "room": _serialize_room(room),
             "server_time": time.monotonic() * 1000,
         })
 
-        # Notify others
-        await _broadcast(room, {
-            "type": "player_connected",
-            "player_id": player_id,
-            "name": player["name"],
-        }, exclude=player_id)
+        # On a fresh session (new_session) peers learn the player is here;
+        # on reconnect/takeover the player_id was already visible to peers,
+        # so no new player_connected event is emitted.
+        if transition == "new_session":
+            await _broadcast(room, {
+                "type": "player_connected",
+                "player_id": player_id,
+                "name": player["name"],
+            }, exclude=player_id)
 
         try:
             while True:
@@ -619,15 +772,7 @@ def setup(app, context):
         except Exception as e:
             print(f"[Multiplayer] WS error for {player_id}: {e}")
         finally:
-            player["connected"] = False
-            player["ws"] = None
-            await _broadcast(room, {
-                "type": "player_disconnected",
-                "player_id": player_id,
-            })
-            # Check if room needs cleanup
-            if _connected_count(room) == 0:
-                _start_cleanup(code)
+            await _on_highway_disconnect(websocket, room, player_id)
 
     async def _handle_message(room, player_id, data):
         msg_type = data.get("type", "")
@@ -768,6 +913,10 @@ def setup(app, context):
         await asyncio.sleep(seconds)
         room = _rooms.get(code)
         if room and _connected_count(room) == 0:
+            # Cancel any session-grace tasks before discarding the room so the
+            # tasks don't fire against a deleted room dict.
+            for sess in room.get("sessions", {}).values():
+                _cancel_grace_tasks(sess)
             del _rooms[code]
             # Clean up files
             room_dir = MP_DIR / code
