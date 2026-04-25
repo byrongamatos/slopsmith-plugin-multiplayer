@@ -51,8 +51,11 @@ def test_missing_session_id_rejected(client):
         msg = ws.receive_json()
         assert msg["type"] == "error"
         assert "session_id" in msg["message"].lower()
-        with pytest.raises(WebSocketDisconnect):
+        with pytest.raises(WebSocketDisconnect) as excinfo:
             ws.receive_json()
+        assert excinfo.value.code == 4401, (
+            "missing session_id must close with 4401 per PROTOCOL.md"
+        )
 
 
 def test_malformed_session_id_rejected(client):
@@ -70,8 +73,11 @@ def test_malformed_session_id_rejected(client):
         with client.websocket_connect(_ws_url(code, pid, bad)) as ws:
             msg = ws.receive_json()
             assert msg["type"] == "error", f"expected reject for session_id={bad!r}"
-            with pytest.raises(WebSocketDisconnect):
+            with pytest.raises(WebSocketDisconnect) as excinfo:
                 ws.receive_json()
+            assert excinfo.value.code == 4401, (
+                f"malformed session_id={bad!r} must close with 4401 per PROTOCOL.md"
+            )
 
 
 def test_well_formed_session_id_accepted(client):

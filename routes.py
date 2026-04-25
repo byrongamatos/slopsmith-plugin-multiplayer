@@ -298,10 +298,14 @@ def setup(app, context):
                 pass
 
         # Drop the session record + cancel any in-flight grace timers for this player.
+        # User-initiated leave uses RFC 6455 1000 (normal closure) on the audio
+        # slot — 4408 means "grace expired / timed out" and would mislead a
+        # client into auto-reconnecting with a fresh session_id when in fact
+        # the user has explicitly left.
         sess = room.get("sessions", {}).pop(player_id, None)
         if sess is not None:
             _cancel_grace_tasks(sess)
-            await _safe_close(sess.get("audio_ws"), _CLOSE_GRACE_EXPIRED)
+            await _safe_close(sess.get("audio_ws"), 1000)
 
         del room["players"][player_id]
         await _broadcast(room, {"type": "player_left", "player_id": player_id})
@@ -721,15 +725,18 @@ def setup(app, context):
         code = code.upper()
         room = _rooms.get(code)
         if not room or player_id not in room["players"]:
+            # PROTOCOL.md "Rejection on auth failure": send the JSON error frame
+            # for backward compatibility with already-shipped clients, then close
+            # with the typed 4401 so spec-aware clients can branch on event.code.
             await websocket.send_json({"type": "error", "message": "Invalid room or player"})
-            await websocket.close()
+            await websocket.close(code=_CLOSE_AUTH_FAIL)
             return
 
         if not _is_valid_session_id(session_id):
             await websocket.send_json(
                 {"type": "error", "message": "Missing or malformed session_id"}
             )
-            await websocket.close()
+            await websocket.close(code=_CLOSE_AUTH_FAIL)
             return
 
         # Apply PROTOCOL.md connection-arrival rules. May close prior sockets
