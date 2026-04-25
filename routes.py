@@ -652,8 +652,14 @@ async def _cleanup_after_grace(code, seconds=60):
     if room and _connected_count(room) == 0:
         # Cancel any session-grace tasks AND audio workers before discarding
         # the room so they don't fire / stay parked against a deleted room
-        # dict.
-        for sess in room.get("sessions", {}).values():
+        # dict. Snapshot the values list FIRST: _cleanup_audio_worker awaits
+        # the worker's exit, which yields to the event loop. Other tasks
+        # (grace finalizers, leave paths) can pop entries from
+        # room["sessions"] during that yield, which would raise
+        # RuntimeError: dictionary changed size during iteration if we were
+        # iterating the live view.
+        sessions_snapshot = list(room.get("sessions", {}).values())
+        for sess in sessions_snapshot:
             _cancel_grace_tasks(sess)
             await _cleanup_audio_worker(sess)
         # Same for the one-shot creator-grace timer.
