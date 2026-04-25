@@ -274,24 +274,24 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
     sessions[player_id] = rec
     if endpoint == _AUDIO:
         _setup_audio_worker(rec)
+    # Clear the player's stale highway-WS reference SYNCHRONOUSLY (before any
+    # await below). After rule 3 the new session's highway_ws is None until
+    # the new tab's highway WS connects; leaving player["ws"] pointing at the
+    # just-superseded old highway during the awaits below would create a
+    # split-routing window: audio fan-out uses sessions[player_id] = rec
+    # (new audio_ws) while _broadcast still targets the OLD highway. The
+    # highway-side caller of _take_session_slot immediately reassigns
+    # player["ws"] = websocket after this returns, so for the highway
+    # endpoint this is a no-op; for the audio endpoint it closes the gap.
+    player = room["players"].get(player_id)
+    if player is not None:
+        player["ws"] = None
     # Cancel the OLD session's worker. Operates on a detached old_existing
     # reference (sessions[player_id] no longer points at it), so the
     # _cleanup_audio_worker reference-check at the end of its body simply
     # confirms old_existing.audio_send_worker is still its own captured
     # value and clears the slot on the OLD dict — never touches the new.
     await _cleanup_audio_worker(old_existing)
-    # Clear the player's stale highway-WS reference. After rule 3 the new
-    # session's highway_ws is None until the new tab's highway WS connects;
-    # leaving player["ws"] pointing at the just-closed old highway makes
-    # _promote_host (which treats ws is not None as "highway-active") think
-    # the player has a live highway, and makes _broadcast waste send attempts
-    # on a closed socket. The highway-side caller of _take_session_slot
-    # immediately reassigns player["ws"] = websocket after this returns, so
-    # for the highway endpoint this is a no-op; for the audio endpoint it
-    # closes a real bug.
-    player = room["players"].get(player_id)
-    if player is not None:
-        player["ws"] = None
     await _safe_close(old_highway_ws, _CLOSE_SUPERSEDED)
     await _safe_close(old_audio_ws, _CLOSE_SUPERSEDED)
     return "takeover"
@@ -399,8 +399,18 @@ async def _cleanup_audio_worker(sess):
         await worker
     except asyncio.CancelledError:
         if not worker.cancelled():
-            # Our caller was cancelled, not the worker we cancelled.
-            # Propagate so cancellation semantics aren't broken.
+            # Our caller was cancelled, not the worker we cancelled. The
+            # session may keep going (e.g. _grace_then_finalize_endpoint
+            # was cancelled by a same-session reconnect after we'd already
+            # torn down the live audio worker). If the audio_ws is still
+            # alive, install a fresh worker so audio relay isn't silently
+            # broken until /audio reconnects, then re-raise so cancellation
+            # semantics aren't broken.
+            if (
+                sess.get("audio_ws") is not None
+                and sess.get("audio_send_worker") is worker
+            ):
+                _setup_audio_worker(sess)
             raise
     except Exception:
         pass
