@@ -188,6 +188,66 @@ def test_sender_does_not_receive_own_frame(client):
         )
 
 
+def test_audio_worker_cleaned_up_on_leave_room(client, routes_module):
+    """Codex round 6 P2: leave_room pops the session before closing the
+    audio_ws, which makes the handler's finally block see sess=None and
+    skip its worker cancel. Without explicit cleanup in leave_room the
+    worker stays parked on queue.get() forever."""
+    code, host_pid = _create_room(client)
+    bob_pid = _join_room(client, code, "Bob")
+    room = routes_module._rooms[code]
+
+    bob_ws_holder = {}
+    with client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")) as bob_audio:
+        bob_sess = room["sessions"][bob_pid]
+        worker = bob_sess.get("audio_send_worker")
+        assert worker is not None and not worker.done()
+        bob_ws_holder["worker"] = worker
+
+        # Explicit user-leave path.
+        leave_resp = client.post(
+            f"/api/plugins/multiplayer/rooms/{code}/leave",
+            json={"player_id": bob_pid},
+        )
+        leave_resp.raise_for_status()
+
+    # After leave_room the session is gone and the worker must be cancelled.
+    assert bob_pid not in room["sessions"]
+    leaked = bob_ws_holder["worker"]
+    assert leaked.done() or leaked.cancelled(), (
+        "leave_room must cancel the audio worker, otherwise it leaks "
+        "parked on queue.get() forever per departed listener"
+    )
+
+
+def test_audio_worker_cleaned_up_on_grace_expiry(client, routes_module, fast_grace):
+    """Codex round 6 P2: _grace_then_finalize_endpoint pops the session and
+    closes the OTHER endpoint, but the now-dropped audio worker is also
+    parked on queue.get(). It must be cancelled before pop, not relied on
+    via the audio handler's finally (which early-returns on sess=None)."""
+    code, host_pid = _create_room(client)
+    bob_pid = _join_room(client, code, "Bob")
+    room = routes_module._rooms[code]
+
+    # Open audio for bob, then ALSO open highway, then drop highway only.
+    # Highway grace expires, finalization closes audio_ws with 4408. We need
+    # the worker to be gone by the time finalization completes.
+    with client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")):
+        bob_sess = room["sessions"][bob_pid]
+        worker = bob_sess.get("audio_send_worker")
+        assert worker is not None and not worker.done()
+
+        with client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
+            bob_hw.receive_json()
+        # Highway closed; per-endpoint grace starts. Wait past the grace
+        # window so _grace_then_finalize_endpoint runs.
+        time.sleep(fast_grace * 2.5)
+
+    # Session is gone, worker must be cancelled.
+    assert bob_pid not in room["sessions"]
+    assert worker.done() or worker.cancelled()
+
+
 def test_send_queue_drops_oldest_on_overflow(client, routes_module):
     """Codex round 5 P1: a slow listener's queue must be bounded. The sender
     pushes more than _AUDIO_SEND_QUEUE_MAX frames before the listener has

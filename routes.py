@@ -259,9 +259,7 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
     # Cancel the prior session's audio worker too — the new session's
     # _setup_audio_worker (if endpoint is audio) installs a fresh one bound
     # to the new ws.
-    prev_worker = existing.get("audio_send_worker")
-    if prev_worker is not None and not prev_worker.done():
-        prev_worker.cancel()
+    _cleanup_audio_worker(existing)
     old_highway_ws = existing.get("highway_ws")
     old_audio_ws = existing.get("audio_ws")
     rec = _new_session_record(session_id)
@@ -310,11 +308,7 @@ async def _on_endpoint_disconnect(websocket, room, player_id, endpoint):
         if player is not None:
             player["ws"] = None
     elif endpoint == _AUDIO:
-        worker = sess.get("audio_send_worker")
-        if worker is not None and not worker.done():
-            worker.cancel()
-        sess["audio_send_worker"] = None
-        sess["audio_send_queue"] = None
+        _cleanup_audio_worker(sess)
     # Schedule per-endpoint grace expiry. Either endpoint expiring ends the
     # whole session per PROTOCOL.md "Per-endpoint grace".
     sess[_grace_key(endpoint)] = asyncio.create_task(
@@ -349,6 +343,21 @@ async def _audio_send_worker(ws, queue):
                 return
     except asyncio.CancelledError:
         return
+
+
+def _cleanup_audio_worker(sess):
+    """Cancel the audio worker (if any) and clear the queue. Safe to call
+    on a session that has no worker (no-op). Called from every teardown
+    path that pops the session BEFORE the audio handler's finally block
+    can run (leave_room, grace finalization, room destroy) — without this,
+    the worker stays parked on queue.get() forever and leaks per departed
+    listener.
+    """
+    worker = sess.get("audio_send_worker")
+    if worker is not None and not worker.done():
+        worker.cancel()
+    sess["audio_send_worker"] = None
+    sess["audio_send_queue"] = None
 
 
 def _setup_audio_worker(sess):
@@ -442,10 +451,12 @@ async def _cleanup_after_grace(code, seconds=60):
     await asyncio.sleep(seconds)
     room = _rooms.get(code)
     if room and _connected_count(room) == 0:
-        # Cancel any session-grace tasks before discarding the room so the
-        # tasks don't fire against a deleted room dict.
+        # Cancel any session-grace tasks AND audio workers before discarding
+        # the room so they don't fire / stay parked against a deleted room
+        # dict.
         for sess in room.get("sessions", {}).values():
             _cancel_grace_tasks(sess)
+            _cleanup_audio_worker(sess)
         # Same for the one-shot creator-grace timer.
         cgt = room.get("creator_grace_task")
         if cgt and not cgt.done():
@@ -505,7 +516,10 @@ async def _grace_then_finalize_endpoint(room, player_id, endpoint):
         # Reattached during the grace window.
         return
 
-    # Grace expired with no reattach: end the session.
+    # Grace expired with no reattach: end the session. Cancel any audio
+    # worker now BEFORE popping/closing so it doesn't leak after the audio
+    # handler's finally block hits the sess-is-None early return.
+    _cleanup_audio_worker(sess)
     other = _slot_key(_other_endpoint(endpoint))
     other_ws = sess.get(other)
     sessions.pop(player_id, None)
@@ -637,10 +651,14 @@ def setup(app, context):
         # User-initiated leave uses RFC 6455 1000 (normal closure) on the audio
         # slot — 4408 means "grace expired / timed out" and would mislead a
         # client into auto-reconnecting with a fresh session_id when in fact
-        # the user has explicitly left.
+        # the user has explicitly left. Also tear down the audio worker
+        # explicitly: closing the audio_ws makes the handler's finally block
+        # see `sess is None` (we just popped) and early-return without
+        # cancelling the worker, leaking it.
         sess = room.get("sessions", {}).pop(player_id, None)
         if sess is not None:
             _cancel_grace_tasks(sess)
+            _cleanup_audio_worker(sess)
             await _safe_close(sess.get("audio_ws"), _CLOSE_NORMAL)
 
         del room["players"][player_id]
