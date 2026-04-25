@@ -413,6 +413,12 @@ def setup(app, context):
                     "connected": False,
                     "ws": None,
                     "last_seen": time.monotonic(),
+                    # Sticky flag: True the first time this player opens any
+                    # WS (highway or audio). Used by the host self-heal
+                    # logic to distinguish "creator hasn't connected yet"
+                    # (never_attached, keep host) from "host connected
+                    # once and then expired" (attached_then_gone, self-heal).
+                    "ever_attached": False,
                 }
             },
             "queue": [],
@@ -442,6 +448,7 @@ def setup(app, context):
             "connected": False,
             "ws": None,
             "last_seen": time.monotonic(),
+            "ever_attached": False,
         }
         await _broadcast(room, {
             "type": "player_joined",
@@ -934,6 +941,7 @@ def setup(app, context):
         player["ws"] = websocket
         player["connected"] = True
         player["last_seen"] = time.monotonic()
+        player["ever_attached"] = True
 
         # Cancel pending room-empty cleanup if any (e.g. last player just rejoined).
         task = _cleanup_tasks.pop(code, None)
@@ -949,10 +957,23 @@ def setup(app, context):
         # player["ws"]=None). Re-run the election now that this highway
         # attach made the candidate set non-empty.
         #
-        # IMPORTANT: do NOT self-heal during a transient per-endpoint grace
-        # window — `room["sessions"][host_id]` still exists then, even if
-        # the host's highway slot is temporarily None. Promoting another
-        # player over a transient drop would permanently steal host rights.
+        # Three conditions must hold to self-heal away from the current host:
+        #   1. host_id missing OR
+        #   2. host's player record is gone (left via leave_room) OR
+        #   3. host has ever attached a WS in this room AND no longer has an
+        #      active session.
+        #
+        # The `ever_attached` qualifier on case (3) is critical: a brand-new
+        # room has the creator as host with no session yet (they haven't
+        # opened /ws). The first guest who beats them to a highway connect
+        # would otherwise steal host privileges from a creator who simply
+        # hadn't connected yet. Once the creator opens any WS once, their
+        # ever_attached flag flips to True and stays there; from that point
+        # on, "no session" means they actually disconnected past grace.
+        #
+        # The transient-grace protection is preserved because the session
+        # record IS present during a per-endpoint grace window (only the
+        # endpoint slot is None), so condition (3) doesn't fire.
         #
         # We update room["host"] BEFORE sending the 'connected' snapshot so
         # the new client sees the corrected host_id immediately, then
@@ -964,7 +985,7 @@ def setup(app, context):
         host_truly_gone = (
             host_id is None
             or host_player is None
-            or host_session is None
+            or (host_player.get("ever_attached") and host_session is None)
         )
         host_was_self_healed = False
         if host_truly_gone:
@@ -1047,6 +1068,7 @@ def setup(app, context):
         player = room["players"][player_id]
         player["connected"] = True
         player["last_seen"] = time.monotonic()
+        player["ever_attached"] = True
         task = _cleanup_tasks.pop(code, None)
         if task:
             task.cancel()

@@ -506,6 +506,33 @@ def test_host_self_heal_when_audio_only_player_reattaches_highway(client, routes
         assert room["host"] == bob_pid
 
 
+def test_never_connected_creator_keeps_host_when_guest_attaches_first(client, routes_module):
+    """Codex round 4 P2: a brand-new room has the creator as host with no
+    session yet — they haven't opened /ws. If a guest beats them to a
+    highway connect, the self-heal must NOT promote the guest. Only a
+    host who has ever attached and then expired qualifies as 'truly gone'."""
+    code, host_pid = _create_room(client)
+    other_pid = _join_room(client, code, "Bob")
+    room = routes_module._rooms[code]
+
+    # Host hasn't connected. ever_attached is False.
+    assert room["players"][host_pid]["ever_attached"] is False
+    assert host_pid not in room["sessions"]
+    assert room["host"] == host_pid
+
+    # Bob (guest) attaches highway BEFORE the creator. Self-heal must NOT
+    # fire — host is a never-attached creator, not a stale tombstone.
+    with client.websocket_connect(_highway_url(code, other_pid, "bob-sid")) as bob_hw:
+        snapshot = bob_hw.receive_json()
+        assert snapshot["type"] == "connected"
+        assert snapshot["room"]["host"] == host_pid, (
+            f"a never-connected creator must keep the host slot when a guest "
+            f"attaches first; snapshot says {snapshot['room']['host']!r}, "
+            f"expected {host_pid!r}"
+        )
+        assert room["host"] == host_pid
+
+
 def test_host_self_heal_after_session_grace_expiry(client, routes_module, fast_grace):
     """Codex round 4 P1: when the host fully disconnects long enough for the
     grace timer to fire, _grace_then_finalize_endpoint pops their session
