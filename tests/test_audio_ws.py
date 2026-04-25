@@ -325,6 +325,59 @@ def test_4409_on_audio_closes_both_endpoints(client):
             assert exc_a.value.code == 4409
 
 
+def test_audio_first_then_highway_emits_player_connected(client):
+    """Codex round 1 P2: audio-first connection ordering still has to fire
+    player_connected to peers when the highway opens, otherwise the player
+    is invisible on the control plane until a full room refresh."""
+    code, host_pid = _create_room(client)
+    bob_pid = _join_room(client, code, "Bob")
+
+    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw:
+        host_hw.receive_json()  # 'connected'
+
+        # Bob opens AUDIO first (no highway yet) — host should see no event
+        # because the audio handler doesn't broadcast player_connected.
+        with client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")):
+            # Bob then opens highway with the SAME session_id. This is now a
+            # 'first_attach' on the highway slot, NOT a quiet 'reconnect',
+            # so peers MUST see player_connected for the first time.
+            with client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
+                bob_hw.receive_json()  # 'connected'
+                evt = host_hw.receive_json()
+                assert evt["type"] == "player_connected"
+                assert evt["player_id"] == bob_pid
+
+
+def test_audio_only_session_keeps_room_alive(client, routes_module, fast_grace):
+    """Codex round 1 P2: audio-only attach (no highway open) must cancel any
+    pending 60s room cleanup — otherwise an /audio reconnect that happens
+    before /ws during recovery would silently lose the room."""
+    code, pid = _create_room(client)
+    sid = "audio-only-sid"
+
+    # Set up the cleanup-pending state: connect highway, then disconnect AND
+    # wait past the per-endpoint grace so the session ends and _start_cleanup
+    # queues the 60-second room destruction.
+    with client.websocket_connect(_highway_url(code, pid, sid)) as hw:
+        hw.receive_json()
+    time.sleep(fast_grace * 2.5)
+    # _grace_then_finalize ran: connected=False, cleanup queued.
+    assert code in routes_module._cleanup_tasks
+    assert not routes_module._rooms[code]["players"][pid]["connected"]
+
+    # Now reconnect audio-only with a fresh session_id (the prior session
+    # ended). The audio handler must cancel the pending cleanup so the room
+    # survives.
+    with client.websocket_connect(_audio_url(code, pid, "fresh-sid")):
+        assert code not in routes_module._cleanup_tasks, (
+            "audio attach must cancel pending room cleanup"
+        )
+        assert routes_module._rooms[code]["players"][pid]["connected"], (
+            "audio attach must mark the player as connected so _connected_count "
+            "keeps the room alive"
+        )
+
+
 def test_audio_grace_expiry_closes_highway_with_4408(client, routes_module, fast_grace):
     code, pid = _create_room(client)
     sid = "joint-sid"

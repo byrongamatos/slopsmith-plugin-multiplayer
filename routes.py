@@ -17,6 +17,7 @@ _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 30 chars, no 0/O/1/I/L
 
 _rooms = {}           # code -> room dict
 _cleanup_tasks = {}   # code -> asyncio.Task
+_MP_DIR = None        # set by setup(); used by module-level _cleanup_after_grace
 
 # Session lifecycle constants — see PROTOCOL.md "v1 server policy".
 SESSION_GRACE_SEC = 5.0
@@ -149,9 +150,20 @@ def _grace_key(endpoint):
 
 async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
     """Apply PROTOCOL.md connection-arrival rules for the given endpoint
-    (`_HIGHWAY` or `_AUDIO`). Returns one of 'new_session', 'reconnect',
-    'takeover' indicating what transition just occurred. The new websocket is
-    registered in the room's session record on success.
+    (`_HIGHWAY` or `_AUDIO`). Returns one of:
+
+      'new_session'  — no prior session existed; this endpoint started it.
+      'first_attach' — prior session existed (other endpoint already open) but
+                       THIS slot was empty until now. Distinct from 'reconnect'
+                       so callers (the highway handler in particular) can fire
+                       a peer-visible event when the player only becomes
+                       visible via this endpoint for the first time.
+      'reconnect'    — THIS slot had an existing socket that the new connection
+                       supersedes (4410 emitted to the old socket).
+      'takeover'     — prior session with a DIFFERENT session_id; closes BOTH
+                       slots of the old session with 4409.
+
+    The new websocket is registered in the room's session record on success.
     """
     sessions = room["sessions"]
     existing = sessions.get(player_id)
@@ -165,7 +177,10 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
         return "new_session"
 
     if existing["session_id"] == session_id:
-        # Rule 2: same-session reconnect of this endpoint.
+        # Rule 2: matching session_id. Either the same endpoint is reconnecting
+        # over its prior socket (true 'reconnect'), or this slot was empty and
+        # the new connection is the first attach for THIS endpoint of an
+        # already-existing session ('first_attach').
         old_ws = existing[slot]
         existing[slot] = websocket
         # Reattach cancels any in-flight grace timer for this endpoint only.
@@ -173,7 +188,9 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
         if t and not t.done():
             t.cancel()
         existing[grace] = None
-        if old_ws is not None and old_ws is not websocket:
+        if old_ws is None:
+            return "first_attach"
+        if old_ws is not websocket:
             await _safe_close(old_ws, _CLOSE_REPLACED)
         return "reconnect"
 
@@ -258,6 +275,35 @@ def _classify_audio_frame(data):
     return "ok"
 
 
+def _start_cleanup(code):
+    """Start the 60-second grace period before destroying a room.
+
+    Module-level (not inside setup()) so module-level coroutines like
+    `_grace_then_finalize_endpoint` can reach it without a NameError when the
+    only-player-just-disconnected branch fires.
+    """
+    if code in _cleanup_tasks:
+        return
+    _cleanup_tasks[code] = asyncio.ensure_future(_cleanup_after_grace(code))
+
+
+async def _cleanup_after_grace(code, seconds=60):
+    await asyncio.sleep(seconds)
+    room = _rooms.get(code)
+    if room and _connected_count(room) == 0:
+        # Cancel any session-grace tasks before discarding the room so the
+        # tasks don't fire against a deleted room dict.
+        for sess in room.get("sessions", {}).values():
+            _cancel_grace_tasks(sess)
+        del _rooms[code]
+        if _MP_DIR is not None:
+            room_dir = _MP_DIR / code
+            if room_dir.exists():
+                shutil.rmtree(str(room_dir), ignore_errors=True)
+        print(f"[Multiplayer] Room {code} destroyed after grace period")
+    _cleanup_tasks.pop(code, None)
+
+
 async def _grace_then_finalize_endpoint(room, player_id, endpoint):
     """Wait SESSION_GRACE_SEC; if `endpoint`'s slot is still empty, end the
     entire session (close the OTHER endpoint with 4408 if it's still alive,
@@ -297,6 +343,12 @@ def setup(app, context):
     config_dir = context["config_dir"]
     STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
     MP_DIR = config_dir / "multiplayer"
+    # Make MP_DIR reachable from module-level coroutines (e.g.
+    # _cleanup_after_grace runs the room-destroy path, which deletes files
+    # from this dir). Stored at module level so it survives across the
+    # closures here.
+    global _MP_DIR
+    _MP_DIR = MP_DIR
     _get_dlc_dir = context.get("get_dlc_dir")
 
     # ── Room CRUD ──────────────────────────────────────────────────────
@@ -850,10 +902,13 @@ def setup(app, context):
             "server_time": time.monotonic() * 1000,
         })
 
-        # On a fresh session (new_session) peers learn the player is here;
-        # on reconnect/takeover the player_id was already visible to peers,
-        # so no new player_connected event is emitted.
-        if transition == "new_session":
+        # Peers see player_connected when this is the FIRST highway attach for
+        # this player_id — whether the session is brand-new ('new_session') or
+        # the audio endpoint already opened the session before highway joined
+        # ('first_attach'). On 'reconnect' (replacing a still-live highway slot)
+        # and 'takeover' (different session_id, but same player_id was already
+        # visible to peers), no new player_connected event is needed.
+        if transition in ("new_session", "first_attach"):
             await _broadcast(room, {
                 "type": "player_connected",
                 "player_id": player_id,
@@ -897,6 +952,22 @@ def setup(app, context):
         # Apply rules 1/2/3 for the audio slot. Same close-code semantics as
         # the highway slot (4410 / 4409 on takeover/replace).
         await _take_session_slot(websocket, room, player_id, session_id, _AUDIO)
+
+        # An audio attach keeps the room alive even when no highway WS is
+        # currently open — for example during a recovery where /audio reconnects
+        # before /ws. Without this, _connected_count would stay 0 and a pending
+        # 60-second room cleanup would delete the room while audio is still
+        # flowing, leaving listeners stranded with a 404 on their next HTTP
+        # action. The legacy `connected` flag tracks "any live endpoint exists";
+        # `player["ws"]` stays whatever the highway handler last set (None when
+        # highway is closed) so _broadcast still skips this player on JSON
+        # control-plane messages it can't deliver.
+        player = room["players"][player_id]
+        player["connected"] = True
+        player["last_seen"] = time.monotonic()
+        task = _cleanup_tasks.pop(code, None)
+        if task:
+            task.cancel()
 
         try:
             while True:
@@ -1072,24 +1143,5 @@ def setup(app, context):
                 "now_playing": -1,
             })
 
-    def _start_cleanup(code):
-        """Start 60s grace period before destroying a room."""
-        if code in _cleanup_tasks:
-            return
-        _cleanup_tasks[code] = asyncio.ensure_future(_cleanup_after_grace(code))
-
-    async def _cleanup_after_grace(code, seconds=60):
-        await asyncio.sleep(seconds)
-        room = _rooms.get(code)
-        if room and _connected_count(room) == 0:
-            # Cancel any session-grace tasks before discarding the room so the
-            # tasks don't fire against a deleted room dict.
-            for sess in room.get("sessions", {}).values():
-                _cancel_grace_tasks(sess)
-            del _rooms[code]
-            # Clean up files
-            room_dir = MP_DIR / code
-            if room_dir.exists():
-                shutil.rmtree(str(room_dir), ignore_errors=True)
-            print(f"[Multiplayer] Room {code} destroyed after grace period")
-        _cleanup_tasks.pop(code, None)
+    # _start_cleanup and _cleanup_after_grace live at module level (above)
+    # so module-level coroutines can call them — see comment there.
