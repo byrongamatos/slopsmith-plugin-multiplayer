@@ -484,7 +484,21 @@ async def _cleanup_audio_worker(sess, room=None, player_id=None):
     try:
         await worker
     except asyncio.CancelledError:
-        if not worker.cancelled():
+        # Distinguishing "caller cancelled" from "worker cancelled" via
+        # `worker.cancelled()` alone is unreliable: when our task is
+        # cancelled while awaiting the worker, asyncio raises CancelledError
+        # due to OUR task's cancellation regardless, and worker.cancelled()
+        # is also True (we did call worker.cancel() ourselves). Use
+        # Task.cancelling() (Python 3.11+) to detect that our task is the
+        # one being cancelled. On Py<3.11 the getattr fallback returns 1,
+        # which conservatively treats every CancelledError as caller
+        # cancellation — safer than swallowing.
+        current = asyncio.current_task()
+        current_is_cancelling = (
+            current is not None
+            and getattr(current, "cancelling", lambda: 1)() > 0
+        )
+        if current_is_cancelling or not worker.cancelled():
             # Our caller was cancelled, not the worker we cancelled. We MUST
             # NOT restart the worker here even if audio_ws is still alive:
             # the old worker may not have fully exited from ws.send_bytes
