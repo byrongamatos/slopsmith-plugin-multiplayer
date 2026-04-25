@@ -169,6 +169,16 @@ async def _on_highway_disconnect(websocket, room, player_id):
         # Server-initiated close already swapped this slot; nothing to do.
         return
     sess["highway_ws"] = None
+    # Also clear the player's WS reference so _broadcast skips the dead socket
+    # for the duration of the grace window (otherwise it pile-runs send_json
+    # against a closed connection on every broadcast — exceptions are swallowed
+    # but it's wasteful). `connected` stays True: the player is still considered
+    # in the room until the grace timer either expires or is cancelled by a
+    # reattach. _connected_count therefore keeps counting them, which prevents
+    # the 60-second room-empty cleanup from kicking in during a transient drop.
+    player = room["players"].get(player_id)
+    if player is not None:
+        player["ws"] = None
     # Schedule grace expiry.
     sess["highway_grace_task"] = asyncio.create_task(
         _grace_then_finalize(room, player_id)

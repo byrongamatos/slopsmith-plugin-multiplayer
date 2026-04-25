@@ -256,7 +256,15 @@ function _showRoomView() {
 // ── WebSocket ──────────────────────────────────────────────────────────
 
 function _connectWS() {
-    if (_ws) { try { _ws.close(); } catch (e) { /* */ } }
+    // Stale-out the old socket BEFORE closing it. If onclose fires synchronously
+    // (or before we reassign _ws below), the early-return `if (ws !== _ws)` in
+    // the close handler catches it and avoids touching state for a connection
+    // we're intentionally replacing.
+    if (_ws) {
+        const old = _ws;
+        _ws = null;
+        try { old.close(); } catch (e) { /* */ }
+    }
     _intentionalClose = false;
     if (!_sessionId) _sessionId = _getOrMintSessionId();
 

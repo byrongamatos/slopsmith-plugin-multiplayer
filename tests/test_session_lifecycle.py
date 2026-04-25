@@ -5,9 +5,13 @@ module-level state is reset between tests by the conftest fixture
 (re-importing the routes module).
 
 PROTOCOL.md sections covered:
-  - Endpoints / "session_id REQUIRED" (rejection on missing/malformed)
+  - Endpoints / "session_id REQUIRED" (rejection on missing/malformed → 4401)
   - v1 server policy / Connection-arrival rules 1, 2, 3
-  - Lifecycle close codes 4408 (grace expiry), 4409 (superseded), 4410 (replaced)
+  - Lifecycle close codes 4409 (superseded), 4410 (replaced)
+  - Grace-window finalization: emits player_disconnected + cleans up the
+    session record. (4408 itself is reserved for the audio slot in Phase 1b
+    — Phase 1a does not emit it on the highway WS, so this suite does not
+    assert a 4408 close event.)
 """
 
 import time
