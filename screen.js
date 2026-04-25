@@ -49,14 +49,22 @@ const CLOSE_SUPERSEDED = 4409;
 const CLOSE_REPLACED = 4410;
 
 function _mintSessionId() {
-    // crypto.randomUUID is widely available; fall back to a hex token if not.
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    // crypto.randomUUID is widely available; fall back through getRandomValues
+    // if available, then to Math.random as last resort. Every reference to
+    // `crypto` is gated by `typeof crypto !== 'undefined'` so environments
+    // without Web Crypto don't throw a ReferenceError.
+    const hasCrypto = typeof crypto !== 'undefined';
+    if (hasCrypto && typeof crypto.randomUUID === 'function') {
         return crypto.randomUUID();
     }
     const bytes = new Uint8Array(16);
-    (crypto && crypto.getRandomValues ? crypto : { getRandomValues: (a) => {
-        for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256);
-    }}).getRandomValues(bytes);
+    if (hasCrypto && typeof crypto.getRandomValues === 'function') {
+        crypto.getRandomValues(bytes);
+    } else {
+        for (let i = 0; i < bytes.length; i++) {
+            bytes[i] = Math.floor(Math.random() * 256);
+        }
+    }
     return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
@@ -271,8 +279,16 @@ function _connectWS() {
         }
         if (ev && ev.code === CLOSE_SUPERSEDED) {
             // Different tab took over the session. Per PROTOCOL.md, we MUST NOT
-            // auto-reconnect (would just steal back).
+            // auto-reconnect (would just steal back). Clear persisted room +
+            // session keys so a future page refresh in this tab doesn't see them
+            // and re-attempt a connection.
             _intentionalClose = true;
+            sessionStorage.removeItem('mp_room');
+            sessionStorage.removeItem('mp_player');
+            sessionStorage.removeItem(SESSION_STORAGE_KEY);
+            _roomCode = null;
+            _playerId = null;
+            _sessionId = null;
             if (statusEl) statusEl.textContent = 'Session moved to another tab';
             return;
         }

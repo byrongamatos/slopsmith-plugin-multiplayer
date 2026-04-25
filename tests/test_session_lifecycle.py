@@ -150,24 +150,25 @@ def test_same_session_reconnect_does_not_emit_player_connected(client):
 
         with client.websocket_connect(_ws_url(code, other_pid, "bob-sid")) as bob_ws_1:
             bob_ws_1.receive_json()
-            host_ws.receive_json()  # player_connected for bob
+            evt = host_ws.receive_json()
+            assert evt["type"] == "player_connected"
 
             # Bob reconnects with the SAME session_id.
             with client.websocket_connect(_ws_url(code, other_pid, "bob-sid")) as bob_ws_2:
                 bob_ws_2.receive_json()  # 'connected'
-                # Host should NOT receive a fresh player_connected — same session.
-                # Also drain any clock_sync_response or similar that may be in-flight.
-                # We check by attempting to receive with a tiny timeout via no-block.
-                # Since TestClient WS is synchronous, drain via a small queue check:
-                # attempt to get any event; if it's player_connected, fail.
-                # If timeout-style, no message means rule 2 was honored.
-                try:
-                    msg = host_ws.receive_json(timeout=0.05)
-                    assert msg.get("type") != "player_connected", (
-                        "Rule 2 reconnect must not emit player_connected"
-                    )
-                except Exception:
-                    pass  # No message — correct.
+
+                # Drive a deterministic event from bob_ws_2 that the server
+                # WILL forward to host: set_arrangement → arrangement_changed.
+                # If Rule 2 was violated, host's queue would contain a duplicate
+                # player_connected BEFORE the arrangement_changed.
+                bob_ws_2.send_json({"type": "set_arrangement", "arrangement": "Bass"})
+                evt2 = host_ws.receive_json()
+                assert evt2["type"] == "arrangement_changed", (
+                    f"Rule 2 reconnect must not emit a fresh player_connected; "
+                    f"host received {evt2['type']!r} first"
+                )
+                assert evt2["player_id"] == other_pid
+                assert evt2["arrangement"] == "Bass"
 
 
 # ── Rule 3: takeover by different session_id (4409) ───────────────────────
