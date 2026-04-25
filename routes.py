@@ -143,8 +143,9 @@ def _is_valid_session_id(sid):
 def _validate_broadcast_params(data):
     """Apply PROTOCOL.md "Control-plane validation" to a broadcast_start
     payload. Returns a normalized params dict on success, or a string
-    describing the failure reason. v1 only accepts opus / 48kHz / mono /
-    [16k, 256k] kbps; future versions may relax these."""
+    describing the failure reason. v1 only accepts opus / 48 kHz / mono /
+    bitrate in [16_000, 256_000] bits-per-second (i.e. 16–256 kbps);
+    future versions may relax these."""
     sample_rate = data.get("sample_rate")
     if sample_rate != _V1_SAMPLE_RATE:
         return f"sample_rate must be {_V1_SAMPLE_RATE} (got {sample_rate!r})"
@@ -181,9 +182,13 @@ async def _clear_broadcaster_if_player(room, player_id):
     """If `player_id` is the current room broadcaster, clear the slot and
     broadcast `broadcaster_changed: null` to all peers. No-op otherwise.
 
-    Called from every session-end path (grace expiry, takeover, leave_room,
-    room destroy) so the broadcast slot can never tombstone past a real
-    departure. Idempotent and safe to call when broadcaster_id is None.
+    Called from every session-end path that could leave a tombstoned
+    broadcaster_id while peers remain in the room: grace expiry,
+    Rule 3 takeover, leave_room. Not called from `_cleanup_after_grace`
+    (room destroy) because that path only runs when `_connected_count`
+    is zero — the room dict is dropped along with broadcaster_id and
+    there are no peers left to notify, so the broadcast event would be
+    a no-op. Idempotent and safe to call when broadcaster_id is None.
     """
     if room.get("broadcaster_id") != player_id:
         return
