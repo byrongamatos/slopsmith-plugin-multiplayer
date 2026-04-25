@@ -334,6 +334,25 @@ async def _on_highway_disconnect(websocket, room, player_id):
     await _on_endpoint_disconnect(websocket, room, player_id, _HIGHWAY)
 
 
+async def _close_audio_after_worker(ws, worker, code):
+    """Wait for `worker` to actually exit, THEN close `ws` with `code`.
+
+    Used by the cancel-propagation path in _cleanup_audio_worker, where we
+    couldn't safely await the worker ourselves (our caller was being
+    cancelled). The cancelled worker may still be inside an in-flight
+    ws.send_bytes when we abandon it; closing the same ws concurrently
+    would race with that send (ASGI single-sender rule). This helper runs
+    as a fire-and-forget task: it waits the worker to completion (best
+    effort) and only then closes, so the close is the sole sender.
+    """
+    if worker is not None:
+        try:
+            await worker
+        except (asyncio.CancelledError, Exception):
+            pass
+    await _safe_close(ws, code)
+
+
 async def _audio_send_worker(ws, queue):
     """Drain a per-peer audio send queue, calling ws.send_bytes for each frame.
 
@@ -406,13 +425,23 @@ async def _cleanup_audio_worker(sess):
             # the same ws would have two concurrent senders, violating
             # ASGI's one-sender-at-a-time rule and corrupting the relay.
             #
-            # Clobber the slot to None so fan-out skips this peer (audio
-            # mute) and re-raise to preserve cancellation semantics. The
-            # listener can recover by reconnecting /audio, which spawns a
-            # fresh worker via _setup_audio_worker in _take_session_slot.
+            # Synchronously clear the slots so fan-out immediately skips
+            # this peer, then schedule a fire-and-forget close that FIRST
+            # waits for the cancelled worker to actually exit before
+            # closing the same ws. Without the close, the client's /audio
+            # socket stays open with no signal that it's gone mute, and
+            # the listener has no trigger to reconnect.
             if sess.get("audio_send_worker") is worker:
                 sess["audio_send_worker"] = None
                 sess["audio_send_queue"] = None
+            stale_audio_ws = sess.get("audio_ws")
+            if stale_audio_ws is not None:
+                sess["audio_ws"] = None
+                asyncio.create_task(
+                    _close_audio_after_worker(
+                        stale_audio_ws, worker, _CLOSE_GRACE_EXPIRED,
+                    )
+                )
             raise
     except Exception:
         pass
