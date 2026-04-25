@@ -216,8 +216,10 @@ function _cleanup() {
 function _showLobbyView() {
     const lobby = document.getElementById('mp-lobby-view');
     const room = document.getElementById('mp-room-view');
+    const mixer = document.getElementById('mp-mixer-view');
     if (lobby) lobby.classList.remove('hidden');
     if (room) room.classList.add('hidden');
+    if (mixer) mixer.classList.add('hidden');
 }
 
 function _showRoomView() {
@@ -282,11 +284,13 @@ function _connectWS() {
             // auto-reconnect (would just steal back). Run the full cleanup path
             // (clears _room, _isHost, _roomCode/_playerId/_sessionId, restores
             // playback controls, removes sessionStorage keys) and bounce back to
-            // the lobby so the UI doesn't keep showing the room view + host
-            // controls for a session this tab no longer owns.
+            // the lobby so the UI doesn't keep showing the room view, host
+            // controls, OR mixer view for a session this tab no longer owns.
             _cleanup();
             _showLobbyView();
-            if (statusEl) statusEl.textContent = 'Session moved to another tab';
+            // Surface the takeover notice via the lobby-visible error element;
+            // #mp-connection-status lives inside the now-hidden room view.
+            _showError('Session moved to another tab');
             return;
         }
         if (ev && ev.code === CLOSE_GRACE_EXPIRED) {
