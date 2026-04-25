@@ -481,7 +481,7 @@ def setup(app, context):
         sess = room.get("sessions", {}).pop(player_id, None)
         if sess is not None:
             _cancel_grace_tasks(sess)
-            await _safe_close(sess.get("audio_ws"), 1000)
+            await _safe_close(sess.get("audio_ws"), _CLOSE_NORMAL)
 
         del room["players"][player_id]
         await _broadcast(room, {"type": "player_left", "player_id": player_id})
