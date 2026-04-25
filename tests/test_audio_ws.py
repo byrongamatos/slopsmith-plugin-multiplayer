@@ -513,6 +513,29 @@ def fast_creator_grace(routes_module):
     yield 0.3
 
 
+def test_abandoned_creator_grace_fires_when_guest_already_connected(client, routes_module, fast_creator_grace):
+    """Codex round 6 P1: abandoned-creator self-heal must also fire on a
+    timer, not just on a subsequent highway attach. A guest who connected
+    BEFORE creator-grace expired and stays connected would otherwise be
+    stuck without host privileges forever."""
+    code, host_pid = _create_room(client)
+    bob_pid = _join_room(client, code, "Bob")
+
+    # Bob connects highway BEFORE creator-grace expires.
+    with client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
+        first = bob_hw.receive_json()
+        assert first["type"] == "connected"
+        # At this point creator hasn't connected and grace hasn't fired yet.
+        assert first["room"]["host"] == host_pid
+
+        # Wait past the (shrunk) creator-grace window. Timer fires, _promote_host
+        # picks Bob (highway-active), broadcasts host_changed.
+        time.sleep(fast_creator_grace * 2.5)
+        evt = bob_hw.receive_json()
+        assert evt["type"] == "host_changed"
+        assert evt["new_host_id"] == bob_pid
+
+
 def test_abandoned_creator_releases_host_after_creator_grace(client, routes_module, fast_creator_grace):
     """Codex round 5 P1: a creator who never opens any WS must eventually
     release the host slot to a connected guest. Without a time-bound on

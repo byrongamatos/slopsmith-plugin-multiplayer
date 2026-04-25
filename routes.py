@@ -345,6 +345,10 @@ async def _cleanup_after_grace(code, seconds=60):
         # tasks don't fire against a deleted room dict.
         for sess in room.get("sessions", {}).values():
             _cancel_grace_tasks(sess)
+        # Same for the one-shot creator-grace timer.
+        cgt = room.get("creator_grace_task")
+        if cgt and not cgt.done():
+            cgt.cancel()
         del _rooms[code]
         if _MP_DIR is not None:
             room_dir = _MP_DIR / code
@@ -352,6 +356,34 @@ async def _cleanup_after_grace(code, seconds=60):
                 shutil.rmtree(str(room_dir), ignore_errors=True)
         print(f"[Multiplayer] Room {code} destroyed after grace period")
     _cleanup_tasks.pop(code, None)
+
+
+async def _creator_grace_timer(code, creator_pid):
+    """Fires HOST_CREATOR_GRACE_SEC after a room is created. If the creator
+    has not opened any WebSocket by then AND another player is connected,
+    transfer the host slot to the first eligible connected guest. This is
+    the time-driven half of the abandoned-creator self-heal — the
+    highway-attach branch in multiplayer_ws covers the case where the
+    guest arrives AFTER grace, this timer covers the case where the
+    guest is already connected when grace expires."""
+    try:
+        await asyncio.sleep(HOST_CREATOR_GRACE_SEC)
+    except asyncio.CancelledError:
+        return
+    room = _rooms.get(code)
+    if room is None:
+        return
+    if room.get("host") != creator_pid:
+        return  # Host changed by some other path; nothing to do.
+    creator = room["players"].get(creator_pid)
+    if creator is None or creator.get("ever_attached"):
+        return  # Creator left or actually showed up.
+    new_host = _promote_host(room)
+    if new_host is not None and new_host != creator_pid:
+        await _broadcast(room, {
+            "type": "host_changed",
+            "new_host_id": new_host,
+        })
 
 
 async def _grace_then_finalize_endpoint(room, player_id, endpoint):
@@ -437,8 +469,15 @@ def setup(app, context):
             "mixdown_path": None,
             "skip_votes": set(),
             "sessions": {},
+            "creator_grace_task": None,
         }
         _rooms[code] = room
+        # Schedule the one-shot creator-grace timer. If the creator never
+        # opens any WS within HOST_CREATOR_GRACE_SEC, this transfers host
+        # to the first connected guest. See _creator_grace_timer.
+        room["creator_grace_task"] = asyncio.create_task(
+            _creator_grace_timer(code, player_id)
+        )
         return {"code": code, "player_id": player_id, "is_host": True}
 
     @app.post("/api/plugins/multiplayer/rooms/{code}/join")
