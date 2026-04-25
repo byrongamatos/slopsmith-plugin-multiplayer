@@ -26,6 +26,14 @@ _CLOSE_AUTH_FAIL = 4401
 _CLOSE_GRACE_EXPIRED = 4408
 _CLOSE_SUPERSEDED = 4409
 _CLOSE_REPLACED = 4410
+_CLOSE_FRAME_TOO_BIG = 1009
+_CLOSE_NORMAL = 1000
+
+# Audio WS frame format constants — see PROTOCOL.md "Audio frame format".
+_AUDIO_FRAME_MAGIC = b"SMAU"
+_AUDIO_FRAME_VERSION = 1
+_AUDIO_FRAME_HEADER_LEN = 40
+_AUDIO_FRAME_MAX_BYTES = 262144  # 256 KB hard limit (header + payload)
 
 
 def _gen_code():
@@ -123,28 +131,48 @@ def _cancel_grace_tasks(sess):
         sess[k] = None
 
 
-async def _take_highway_slot(websocket, room, player_id, session_id):
-    """Apply PROTOCOL.md connection-arrival rules for the highway endpoint.
-    Returns one of 'new_session', 'reconnect', 'takeover' indicating what
-    transition just occurred. The new websocket is registered in the
-    room's session record on success.
+_HIGHWAY = "highway"
+_AUDIO = "audio"
+
+
+def _other_endpoint(endpoint):
+    return _AUDIO if endpoint == _HIGHWAY else _HIGHWAY
+
+
+def _slot_key(endpoint):
+    return f"{endpoint}_ws"
+
+
+def _grace_key(endpoint):
+    return f"{endpoint}_grace_task"
+
+
+async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
+    """Apply PROTOCOL.md connection-arrival rules for the given endpoint
+    (`_HIGHWAY` or `_AUDIO`). Returns one of 'new_session', 'reconnect',
+    'takeover' indicating what transition just occurred. The new websocket is
+    registered in the room's session record on success.
     """
     sessions = room["sessions"]
     existing = sessions.get(player_id)
+    slot = _slot_key(endpoint)
+    grace = _grace_key(endpoint)
 
     if existing is None:
-        sessions[player_id] = _new_session_record(session_id, highway_ws=websocket)
+        rec = _new_session_record(session_id)
+        rec[slot] = websocket
+        sessions[player_id] = rec
         return "new_session"
 
     if existing["session_id"] == session_id:
         # Rule 2: same-session reconnect of this endpoint.
-        old_ws = existing["highway_ws"]
-        existing["highway_ws"] = websocket
-        # Reattach cancels any in-flight grace timer for this endpoint.
-        t = existing.get("highway_grace_task")
+        old_ws = existing[slot]
+        existing[slot] = websocket
+        # Reattach cancels any in-flight grace timer for this endpoint only.
+        t = existing.get(grace)
         if t and not t.done():
             t.cancel()
-        existing["highway_grace_task"] = None
+        existing[grace] = None
         if old_ws is not None and old_ws is not websocket:
             await _safe_close(old_ws, _CLOSE_REPLACED)
         return "reconnect"
@@ -152,51 +180,89 @@ async def _take_highway_slot(websocket, room, player_id, session_id):
     # Rule 3: takeover by a different session_id — close BOTH old endpoints.
     # Replace the session record FIRST, then close the old sockets. Each
     # `await _safe_close(...)` yields to the event loop, which lets the OLD
-    # highway handler's finally block run and call `_on_highway_disconnect`.
-    # That helper checks `sess.get("highway_ws") is websocket` against the
-    # CURRENT session record — so by the time it runs, sessions[player_id] is
-    # already the new record and the helper sees `is websocket (old)` → False
-    # and early-returns instead of scheduling a grace task on the orphaned
-    # `existing` dict and transiently nulling out `player["ws"]`.
+    # endpoint handlers' finally blocks run and call _on_endpoint_disconnect.
+    # Those helpers check `sess.get(slot) is websocket` against the CURRENT
+    # session record — so by the time they run, sessions[player_id] is the
+    # new record and they early-return instead of scheduling a grace task on
+    # the orphaned `existing` dict.
     _cancel_grace_tasks(existing)
     old_highway_ws = existing.get("highway_ws")
     old_audio_ws = existing.get("audio_ws")
-    sessions[player_id] = _new_session_record(session_id, highway_ws=websocket)
+    rec = _new_session_record(session_id)
+    rec[slot] = websocket
+    sessions[player_id] = rec
     await _safe_close(old_highway_ws, _CLOSE_SUPERSEDED)
     await _safe_close(old_audio_ws, _CLOSE_SUPERSEDED)
     return "takeover"
 
 
-async def _on_highway_disconnect(websocket, room, player_id):
-    """Called from the highway WS handler's finally block.
+async def _on_endpoint_disconnect(websocket, room, player_id, endpoint):
+    """Called from a WS handler's finally block.
 
-    Distinguishes "this socket is still the active highway slot for the
-    session" (start grace timer) from "the server already replaced this
+    Distinguishes "this socket is still the active slot for `endpoint` on
+    this session" (start grace timer) from "the server already replaced this
     socket via 4409/4410" (no further action).
     """
     sess = room.get("sessions", {}).get(player_id)
-    if sess is None or sess.get("highway_ws") is not websocket:
+    if sess is None or sess.get(_slot_key(endpoint)) is not websocket:
         # Server-initiated close already swapped this slot; nothing to do.
         return
-    sess["highway_ws"] = None
-    # Also clear the player's WS reference so _broadcast skips the dead socket
-    # for the duration of the grace window (otherwise it pile-runs send_json
-    # against a closed connection on every broadcast — exceptions are swallowed
-    # but it's wasteful). `connected` stays True: the player is still considered
-    # in the room until the grace timer either expires or is cancelled by a
-    # reattach. _connected_count therefore keeps counting them, which prevents
-    # the 60-second room-empty cleanup from kicking in during a transient drop.
-    player = room["players"].get(player_id)
-    if player is not None:
-        player["ws"] = None
-    # Schedule grace expiry.
-    sess["highway_grace_task"] = asyncio.create_task(
-        _grace_then_finalize(room, player_id)
+    sess[_slot_key(endpoint)] = None
+    # If the highway slot just emptied, also clear the player's WS reference so
+    # _broadcast skips the dead socket during the grace window. The audio slot
+    # has no equivalent on the player object, so nothing to clear there.
+    if endpoint == _HIGHWAY:
+        player = room["players"].get(player_id)
+        if player is not None:
+            player["ws"] = None
+    # Schedule per-endpoint grace expiry. Either endpoint expiring ends the
+    # whole session per PROTOCOL.md "Per-endpoint grace".
+    sess[_grace_key(endpoint)] = asyncio.create_task(
+        _grace_then_finalize_endpoint(room, player_id, endpoint)
     )
 
 
-async def _grace_then_finalize(room, player_id):
-    """Wait SESSION_GRACE_SEC; if the highway slot is still empty, end the session."""
+# Backward-compat alias retained for any in-flight callers; new call sites
+# should use _on_endpoint_disconnect directly.
+async def _on_highway_disconnect(websocket, room, player_id):
+    await _on_endpoint_disconnect(websocket, room, player_id, _HIGHWAY)
+
+
+def _classify_audio_frame(data):
+    """Validate the 40-byte SMAU header on an audio WS binary frame.
+
+    Returns one of:
+      "ok"            — frame passes server-side safety checks; safe to fan out.
+      "size_violation"  — frame_length < 40, > MAX, or header/body mismatch.
+                          Caller MUST drop and SHOULD close the sender's
+                          audio WS with 1009 per PROTOCOL.md.
+      "drop"          — magic mismatch or version mismatch. Caller MUST drop
+                          (no close — this is a benign protocol-version skew
+                          that the spec lets the receiver handle silently).
+    """
+    if data is None:
+        return "drop"
+    n = len(data)
+    if n > _AUDIO_FRAME_MAX_BYTES or n < _AUDIO_FRAME_HEADER_LEN:
+        return "size_violation"
+    if data[:4] != _AUDIO_FRAME_MAGIC:
+        return "drop"
+    # Bytes 4-5: u16 little-endian version.
+    version = data[4] | (data[5] << 8)
+    if version != _AUDIO_FRAME_VERSION:
+        return "drop"
+    # Bytes 36-39: u32 little-endian opus_size; total frame must equal header + payload.
+    opus_size = data[36] | (data[37] << 8) | (data[38] << 16) | (data[39] << 24)
+    if _AUDIO_FRAME_HEADER_LEN + opus_size != n:
+        return "size_violation"
+    return "ok"
+
+
+async def _grace_then_finalize_endpoint(room, player_id, endpoint):
+    """Wait SESSION_GRACE_SEC; if `endpoint`'s slot is still empty, end the
+    entire session (close the OTHER endpoint with 4408 if it's still alive,
+    drop the session record, fire player_disconnected, run room cleanup if
+    appropriate)."""
     try:
         await asyncio.sleep(SESSION_GRACE_SEC)
     except asyncio.CancelledError:
@@ -206,14 +272,15 @@ async def _grace_then_finalize(room, player_id):
     sess = sessions.get(player_id)
     if sess is None:
         return
-    if sess.get("highway_ws") is not None:
+    if sess.get(_slot_key(endpoint)) is not None:
         # Reattached during the grace window.
         return
 
     # Grace expired with no reattach: end the session.
-    audio_ws = sess.get("audio_ws")
+    other = _slot_key(_other_endpoint(endpoint))
+    other_ws = sess.get(other)
     sessions.pop(player_id, None)
-    await _safe_close(audio_ws, _CLOSE_GRACE_EXPIRED)
+    await _safe_close(other_ws, _CLOSE_GRACE_EXPIRED)
 
     player = room["players"].get(player_id)
     if player is not None:
@@ -763,7 +830,9 @@ def setup(app, context):
         # for this player_id with 4410 (same-session reconnect) or 4409
         # (different-session takeover) before this socket's "connected" frame
         # is sent. The WebSocket upgrade itself was already accepted above.
-        transition = await _take_highway_slot(websocket, room, player_id, session_id)
+        transition = await _take_session_slot(
+            websocket, room, player_id, session_id, _HIGHWAY,
+        )
 
         player = room["players"][player_id]
         player["ws"] = websocket
@@ -800,7 +869,79 @@ def setup(app, context):
         except Exception as e:
             print(f"[Multiplayer] WS error for {player_id}: {e}")
         finally:
-            await _on_highway_disconnect(websocket, room, player_id)
+            await _on_endpoint_disconnect(websocket, room, player_id, _HIGHWAY)
+
+    @app.websocket("/ws/plugins/multiplayer/{code}/audio")
+    async def multiplayer_audio_ws(
+        websocket: WebSocket,
+        code: str,
+        player_id: str = "",
+        session_id: str = "",
+    ):
+        # Accept-then-close pattern (PROTOCOL.md "Implementation note (server
+        # side)"): always accept the upgrade so the close-code reaches the
+        # browser as a `close` event with `event.code === 4401`. Closing
+        # before accept yields HTTP 403 in Starlette and the browser only
+        # sees a generic WebSocket error.
+        await websocket.accept()
+
+        code = code.upper()
+        room = _rooms.get(code)
+        if not room or player_id not in room["players"]:
+            await websocket.close(code=_CLOSE_AUTH_FAIL)
+            return
+        if not _is_valid_session_id(session_id):
+            await websocket.close(code=_CLOSE_AUTH_FAIL)
+            return
+
+        # Apply rules 1/2/3 for the audio slot. Same close-code semantics as
+        # the highway slot (4410 / 4409 on takeover/replace).
+        await _take_session_slot(websocket, room, player_id, session_id, _AUDIO)
+
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+
+                payload = message.get("bytes")
+                if payload is None:
+                    # Non-binary frame on the audio WS — drop silently per
+                    # PROTOCOL.md "binary frames only". Servers MAY also close;
+                    # v1 implementation chooses to drop and keep the connection.
+                    continue
+
+                verdict = _classify_audio_frame(payload)
+                if verdict == "size_violation":
+                    # Frame too big / truncated header / body length mismatch:
+                    # drop and close with 1009 per PROTOCOL.md "Frame size
+                    # budget and bounds".
+                    await _safe_close(websocket, _CLOSE_FRAME_TOO_BIG)
+                    break
+                if verdict == "drop":
+                    # Bad magic or version mismatch: drop, keep connection.
+                    continue
+
+                # Verdict "ok": fan out byte-for-byte to every other audio
+                # subscriber in the same room. The Opus payload is never
+                # touched — only header validation happened above.
+                for pid, sess in list(room.get("sessions", {}).items()):
+                    if pid == player_id:
+                        continue
+                    other_audio = sess.get("audio_ws")
+                    if other_audio is None:
+                        continue
+                    try:
+                        await other_audio.send_bytes(payload)
+                    except Exception:
+                        # Skip dead sockets; their own handler will clean up.
+                        pass
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            print(f"[Multiplayer] Audio WS error for {player_id}: {e}")
+        finally:
+            await _on_endpoint_disconnect(websocket, room, player_id, _AUDIO)
 
     async def _handle_message(room, player_id, data):
         msg_type = data.get("type", "")
