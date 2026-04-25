@@ -57,12 +57,14 @@ async def audio_ws(websocket: WebSocket, code: str, player_id: str = ""):
     # ... normal session ...
 ```
 
-**Implementation note (client side).** A direct consequence of accept-then-close is that **the audio WS `open` event is NOT proof that authentication succeeded.** A rejected socket fires `open` first and only then `close` with code `4401`. Clients MUST therefore wait for one of:
+**Implementation note (client side).** A direct consequence of accept-then-close is that **the audio WS `open` event is NOT proof that authentication succeeded.** A rejected socket fires `open` first and only then `close` with code `4401`. Treating `open` alone as "ready" — for example, enabling broadcaster UI or starting a send loop in the open handler — will mis-handle rejected connections, and there is no fixed timeout that closes this race deterministically (close delivery is not bounded under network stall).
 
-- a successful first message exchange (e.g. starting to receive binary frames after the broadcaster begins streaming, or completing an application-level handshake), OR
-- a short post-`open` grace window (e.g. 250 ms) with no `close` event,
+The deterministic readiness signal for the audio WS comes from the **control plane on the highway WS**, not from the audio WS itself:
 
-before treating the audio WS as "ready" — for example, before enabling broadcast UI or starting a send loop. Treating `open` alone as "auth succeeded" will mis-handle rejected connections.
+- **Host (sender).** Treat the audio WS as ready for outbound audio only after the server has acknowledged `broadcast_start` by emitting `broadcaster_changed` on the highway WS with the host's own `broadcaster_id`. If the audio WS was rejected with `4401`, the server's broadcaster registry will not contain the host's audio subscriber, and the server MUST refuse `broadcast_start` from that host (returning `{"type":"error","message":"audio_ws_not_open"}` on the highway WS). UI that begins capture or sending MUST be gated on the `broadcaster_changed` ack, not on the audio WS `open` event.
+- **Listener.** Treat the audio WS as ready for inbound audio only after receiving the first valid binary frame from a broadcaster. The audio WS `open` event MAY be used to release any "connecting…" UI state, but listener-side processing logic does not need an explicit readiness signal — there is simply nothing to do until a frame arrives.
+
+This anchors readiness on the already-authenticated highway WS (which uses the existing JSON-error-then-close rejection path), so a flaky audio WS handshake cannot silently mis-classify itself as ready.
 
 ---
 
