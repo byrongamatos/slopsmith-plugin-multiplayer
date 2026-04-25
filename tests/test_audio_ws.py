@@ -506,6 +506,42 @@ def test_host_self_heal_when_audio_only_player_reattaches_highway(client, routes
         assert room["host"] == bob_pid
 
 
+def test_host_self_heal_after_session_grace_expiry(client, routes_module, fast_grace):
+    """Codex round 4 P1: when the host fully disconnects long enough for the
+    grace timer to fire, _grace_then_finalize_endpoint pops their session
+    and flips connected=False but leaves the player record in
+    room["players"]. The next other-player highway attach must self-heal
+    the host slot — checking only "is the player record present" would
+    leave the room stuck with a tombstoned host forever."""
+    code, host_pid = _create_room(client)
+    other_pid = _join_room(client, code, "Bob")
+    room = routes_module._rooms[code]
+
+    # Host attaches highway, then drops it. Audio never opens.
+    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw:
+        host_hw.receive_json()
+    # Wait past per-endpoint grace so the session is finalized.
+    time.sleep(fast_grace * 2.5)
+
+    # Post-grace state: player record still there, session gone, connected=False.
+    assert host_pid in room["players"]
+    assert host_pid not in room["sessions"]
+    assert room["players"][host_pid]["connected"] is False
+    # Tombstoned room["host"] still points at the gone player.
+    assert room["host"] == host_pid
+
+    # Bob attaches highway → self-heal must promote Bob.
+    with client.websocket_connect(_highway_url(code, other_pid, "bob-sid")) as bob_hw:
+        snapshot = bob_hw.receive_json()
+        assert snapshot["type"] == "connected"
+        assert snapshot["room"]["host"] == other_pid, (
+            f"highway attach must self-heal a stranded host slot after the "
+            f"prior host's session expired; snapshot says host is "
+            f"{snapshot['room']['host']!r} (expected {other_pid!r})"
+        )
+        assert room["host"] == other_pid
+
+
 def test_host_grace_window_does_not_steal_host_to_other_player(client, routes_module):
     """Codex round 3 P1: while the host is in a per-endpoint grace window
     (highway dropped, audio still alive), another player attaching their

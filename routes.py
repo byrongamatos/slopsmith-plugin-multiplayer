@@ -941,17 +941,18 @@ def setup(app, context):
             task.cancel()
 
         # Self-heal the host slot. _promote_host requires an active highway WS
-        # (not just connected=True), so leave_room may have left the room with
-        # `room["host"]` pointing at the departed player when every remaining
-        # player was in audio-only state. Re-run the election now that this
-        # highway attach made the candidate set non-empty.
+        # (not just connected=True), so the room can end up with `room["host"]`
+        # pointing at a player who can no longer hold host duties — either
+        # because they left (leave_room removed their player record) OR
+        # because their session expired beyond grace and was finalized
+        # (room["sessions"][host_id] was popped, player["connected"]=False,
+        # player["ws"]=None). Re-run the election now that this highway
+        # attach made the candidate set non-empty.
         #
-        # IMPORTANT: only self-heal when the host has truly departed (their
-        # player record is gone from room["players"]). A host whose highway
-        # slot is temporarily empty because of a per-endpoint grace window
-        # (audio still alive, highway dropped, awaiting reattach) is still
-        # the host — promoting another player here over a transient drop
-        # would permanently steal their host privileges.
+        # IMPORTANT: do NOT self-heal during a transient per-endpoint grace
+        # window — `room["sessions"][host_id]` still exists then, even if
+        # the host's highway slot is temporarily None. Promoting another
+        # player over a transient drop would permanently steal host rights.
         #
         # We update room["host"] BEFORE sending the 'connected' snapshot so
         # the new client sees the corrected host_id immediately, then
@@ -959,7 +960,12 @@ def setup(app, context):
         # so messages stay properly ordered.
         host_id = room.get("host")
         host_player = room["players"].get(host_id) if host_id else None
-        host_truly_gone = host_id is None or host_player is None
+        host_session = room.get("sessions", {}).get(host_id) if host_id else None
+        host_truly_gone = (
+            host_id is None
+            or host_player is None
+            or host_session is None
+        )
         host_was_self_healed = False
         if host_truly_gone:
             new_host = _promote_host(room)
