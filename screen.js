@@ -279,16 +279,13 @@ function _connectWS() {
         }
         if (ev && ev.code === CLOSE_SUPERSEDED) {
             // Different tab took over the session. Per PROTOCOL.md, we MUST NOT
-            // auto-reconnect (would just steal back). Clear persisted room +
-            // session keys so a future page refresh in this tab doesn't see them
-            // and re-attempt a connection.
-            _intentionalClose = true;
-            sessionStorage.removeItem('mp_room');
-            sessionStorage.removeItem('mp_player');
-            sessionStorage.removeItem(SESSION_STORAGE_KEY);
-            _roomCode = null;
-            _playerId = null;
-            _sessionId = null;
+            // auto-reconnect (would just steal back). Run the full cleanup path
+            // (clears _room, _isHost, _roomCode/_playerId/_sessionId, restores
+            // playback controls, removes sessionStorage keys) and bounce back to
+            // the lobby so the UI doesn't keep showing the room view + host
+            // controls for a session this tab no longer owns.
+            _cleanup();
+            _showLobbyView();
             if (statusEl) statusEl.textContent = 'Session moved to another tab';
             return;
         }
