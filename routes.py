@@ -143,6 +143,11 @@ def _new_session_record(session_id, highway_ws=None, audio_ws=None):
         # temporarily None during a grace window).
         "highway_ever_opened": highway_ws is not None,
         "audio_ever_opened": audio_ws is not None,
+        # Per-peer async lock that serializes audio_ws.send_bytes() calls so
+        # ASGI's "one sender at a time" rule isn't violated when a sender's
+        # read loop fan-outs to many peers via fire-and-forget tasks. Lazily
+        # created in the audio handler the first time the slot is filled.
+        "audio_send_lock": None,
     }
 
 
@@ -286,6 +291,21 @@ async def _on_endpoint_disconnect(websocket, room, player_id, endpoint):
 # should use _on_endpoint_disconnect directly.
 async def _on_highway_disconnect(websocket, room, player_id):
     await _on_endpoint_disconnect(websocket, room, player_id, _HIGHWAY)
+
+
+async def _send_audio_to_peer(ws, lock, payload):
+    """Fire-and-forget audio send guarded by a per-peer lock.
+
+    The lock serializes concurrent send_bytes calls to the same WebSocket
+    (ASGI requires one sender at a time), but does NOT couple peers — sends
+    to different peers run concurrently. Failures are silently dropped;
+    the peer's own handler tears down a broken connection.
+    """
+    async with lock:
+        try:
+            await ws.send_bytes(payload)
+        except Exception:
+            pass
 
 
 def _classify_audio_frame(data):
@@ -1110,6 +1130,13 @@ def setup(app, context):
         # the highway slot (4410 / 4409 on takeover/replace).
         await _take_session_slot(websocket, room, player_id, session_id, _AUDIO)
 
+        # Ensure a per-peer send lock exists for this audio_ws. The lock is
+        # used by the fire-and-forget fan-out path below to serialize
+        # concurrent send_bytes calls without coupling peers.
+        sess = room["sessions"].get(player_id)
+        if sess is not None and sess.get("audio_send_lock") is None:
+            sess["audio_send_lock"] = asyncio.Lock()
+
         # An audio attach keeps the room alive even when no highway WS is
         # currently open — for example during a recovery where /audio reconnects
         # before /ws. Without this, _connected_count would stay 0 and a pending
@@ -1162,22 +1189,30 @@ def setup(app, context):
                 # subscriber in the same room. The Opus payload is never
                 # touched — only header validation happened above.
                 #
-                # Sends run concurrently via asyncio.gather so a slow peer
-                # can't head-of-line-block forwarding to other listeners or
-                # stall the read loop on the next inbound frame from this
-                # sender. Exceptions are returned (return_exceptions=True)
-                # and silently dropped — dead sockets' own handlers will
-                # clean themselves up.
-                send_coros = []
-                for pid, sess in list(room.get("sessions", {}).items()):
+                # Each peer gets its own fire-and-forget task guarded by that
+                # peer's `audio_send_lock`. The read loop never awaits any
+                # send, so a slow peer cannot head-of-line-block forwarding
+                # to other listeners OR stall ingestion of the next inbound
+                # frame. Per-peer locks preserve send order for each peer
+                # (ASGI requires one sender at a time on a given WS) without
+                # coupling peers to each other.
+                #
+                # Bounded-queue / drop-on-overflow semantics for chronically
+                # slow peers are deferred to v2 — for v1, the per-peer lock
+                # is enough to keep one slow listener from breaking the rest
+                # of the room. A consistently-stuck peer would accumulate
+                # waiting tasks, but the SESSION_GRACE_SEC window will close
+                # them out within a few seconds of any real network failure.
+                for pid, peer_sess in list(room.get("sessions", {}).items()):
                     if pid == player_id:
                         continue
-                    other_audio = sess.get("audio_ws")
-                    if other_audio is None:
+                    other_audio = peer_sess.get("audio_ws")
+                    other_lock = peer_sess.get("audio_send_lock")
+                    if other_audio is None or other_lock is None:
                         continue
-                    send_coros.append(other_audio.send_bytes(payload))
-                if send_coros:
-                    await asyncio.gather(*send_coros, return_exceptions=True)
+                    asyncio.create_task(
+                        _send_audio_to_peer(other_audio, other_lock, payload)
+                    )
         except WebSocketDisconnect:
             pass
         except Exception as e:
