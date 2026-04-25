@@ -508,19 +508,23 @@ async def _cleanup_audio_worker(sess, room=None, player_id=None):
             # the same ws would have two concurrent senders, violating
             # ASGI's one-sender-at-a-time rule and corrupting the relay.
             #
-            # Synchronously clear the slots so fan-out immediately skips
-            # this peer, then schedule a fire-and-forget close that FIRST
-            # waits for the cancelled worker to actually exit before
-            # closing the same ws. Without the close, the client's /audio
-            # socket stays open with no signal that it's gone mute, and
-            # the listener has no trigger to reconnect.
-            # All slot mutations (worker, queue, audio_ws) are gated on our
-            # captured worker still being the active one. If a same-session
+            # Synchronously clear the queue so fan-out immediately skips
+            # this peer, but leave the existing /audio WebSocket open in
+            # this cancellation path. If the cancelled worker is still
+            # the active one, we only schedule a deferred worker restart
+            # that waits for that worker to actually exit before replacing
+            # it; we do not close the same ws here. Closing would emit a
+            # misleading close code (the session is typically still alive
+            # — our cleanup was interrupted by an external cancel, not
+            # by a real teardown), so we let the relay self-heal silently.
+            #
+            # All slot mutations (worker, queue) are gated on our captured
+            # worker still being the active one. If a same-session
             # reattach has run during our await, _setup_audio_worker
             # synchronously installed a fresh worker AND a fresh audio_ws
-            # in the same atomic block — `is worker` returns False, and we
-            # leave the new state untouched (otherwise we'd null/close the
-            # freshly reattached /audio socket and orphan its new worker).
+            # in the same atomic block — `is worker` returns False, and
+            # we leave the new state untouched (otherwise we'd orphan its
+            # new worker).
             if sess.get("audio_send_worker") is worker:
                 # Clear the QUEUE so fan-out skips this peer (no pushes to
                 # a queue with no live consumer), but leave audio_send_worker
@@ -677,12 +681,15 @@ async def _cleanup_after_grace(code, seconds=60):
 
 async def _creator_grace_timer(code, creator_pid):
     """Fires HOST_CREATOR_GRACE_SEC after a room is created. If the creator
-    has not opened any WebSocket by then AND another player is connected,
-    transfer the host slot to the first eligible connected guest. This is
-    the time-driven half of the abandoned-creator self-heal — the
-    highway-attach branch in multiplayer_ws covers the case where the
-    guest arrives AFTER grace, this timer covers the case where the
-    guest is already connected when grace expires."""
+    has not opened the highway / control-plane WebSocket by then (their
+    `ever_attached` flag stays False — audio-only attaches intentionally
+    do not flip it because audio alone can't perform host duties) AND
+    another player is connected, transfer the host slot to the first
+    eligible connected guest. This is the time-driven half of the
+    abandoned-creator self-heal — the highway-attach branch in
+    multiplayer_ws covers the case where the guest arrives AFTER grace,
+    this timer covers the case where the guest is already connected
+    when grace expires."""
     try:
         await asyncio.sleep(HOST_CREATOR_GRACE_SEC)
     except asyncio.CancelledError:
