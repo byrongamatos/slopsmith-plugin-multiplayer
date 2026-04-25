@@ -49,7 +49,16 @@ let _audioReconnectTimer = null;
 // (one would arrive as session A, the other as session B → server treats
 // it as a Rule 3 takeover loop). _resetMarker remembers the new id we just
 // minted; the second handler sees _sessionId == _resetMarker and skips.
+//
+// _resetMarker stays armed until BOTH endpoints have committed to the
+// new session_id (highway received its `connected` message AND audio's
+// onopen fired). Clearing on the first endpoint's commit alone reopens
+// the race: a late 4408 from the still-stale OTHER endpoint would see
+// _resetMarker == null and mint a SECOND fresh session_id, invalidating
+// the recovery.
 let _resetMarker = null;
+let _highwayAuthedAfterReset = true;  // initially true — no reset has happened
+let _audioOpenedAfterReset = true;
 
 // Original functions (saved for restore on leave)
 let _origTogglePlay = null;
@@ -107,6 +116,16 @@ function _onSessionEnded() {
     }
     _resetSessionId();
     _resetMarker = _sessionId;
+    // Both endpoints must re-confirm BEFORE we'll consider the recovery
+    // complete and clear the dedupe marker. See _maybeClearResetMarker.
+    _highwayAuthedAfterReset = false;
+    _audioOpenedAfterReset = false;
+}
+
+function _maybeClearResetMarker() {
+    if (_highwayAuthedAfterReset && _audioOpenedAfterReset) {
+        _resetMarker = null;
+    }
 }
 
 // ── Lobby ──────────────────────────────────────────────────────────────
@@ -258,6 +277,8 @@ function _cleanup() {
     _reconnectAttempts = 0;
     _audioReconnectAttempts = 0;
     _resetMarker = null;
+    _highwayAuthedAfterReset = true;
+    _audioOpenedAfterReset = true;
     sessionStorage.removeItem('mp_room');
     sessionStorage.removeItem('mp_player');
     sessionStorage.removeItem(SESSION_STORAGE_KEY);
@@ -434,6 +455,11 @@ function _connectAudioWs() {
         // user-visible "audio is live" signal lives in the highway WS
         // control plane (broadcaster_changed) and the first inbound frame.
         _audioReconnectAttempts = 0;
+        // Audio side of a session-recovery has reattached. _maybeClearResetMarker
+        // only clears the dedupe marker once the highway side has ALSO
+        // reattached. See _resetMarker comment.
+        _audioOpenedAfterReset = true;
+        _maybeClearResetMarker();
     };
 
     ws.onmessage = (ev) => {
@@ -522,12 +548,11 @@ function _handleMessage(msg) {
             _renderQueue();
             _updateControls();
             _doClockSync();
-            // Recovery confirmed: the new session_id is now active on the
-            // server. Clearing the dedupe marker means a FUTURE 4408 (for
-            // this newly-established session) will correctly rotate to a
-            // fresh session_id again. Leaving it set would let the second
-            // grace expiry reuse the now-expired _sessionId.
-            _resetMarker = null;
+            // Highway side of the recovery is confirmed. _maybeClearResetMarker
+            // only clears the dedupe marker once the audio side has ALSO
+            // reattached — see _resetMarker comment for the race this guards.
+            _highwayAuthedAfterReset = true;
+            _maybeClearResetMarker();
             break;
 
         case 'clock_sync_response':
