@@ -448,6 +448,47 @@ def test_promote_host_skips_audio_only_players(client, routes_module, fast_grace
         )
 
 
+def test_host_self_heal_when_audio_only_player_reattaches_highway(client, routes_module):
+    """Codex round 3 P1: when leave_room runs while every remaining player is
+    audio-only (highway grace), _promote_host returns None and room["host"]
+    stays pointing at the departed player. The next highway attach must
+    self-heal by re-running the election and broadcasting host_changed."""
+    code, host_pid = _create_room(client)
+    bob_pid = _join_room(client, code, "Bob")
+    room = routes_module._rooms[code]
+
+    # Host opens highway; Bob opens audio only (no highway → audio-only state).
+    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
+         client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")):
+        host_hw.receive_json()  # 'connected'
+
+        # Host leaves while Bob is still audio-only. _promote_host returns None
+        # because no remaining player has an active highway WS.
+        leave_resp = client.post(
+            f"/api/plugins/multiplayer/rooms/{code}/leave",
+            json={"player_id": host_pid},
+        )
+        leave_resp.raise_for_status()
+        # Stale host id remains; this is the bug condition.
+        assert room["host"] == host_pid
+        assert host_pid not in room["players"]
+
+    # Now Bob opens highway. The handler must detect the stale host and
+    # promote Bob, broadcasting host_changed (Bob is the only listener at this
+    # point; he sees his own elevation via the 'connected' room snapshot OR
+    # via host_changed).
+    with client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
+        # Drain initial 'connected'.
+        first = bob_hw.receive_json()
+        assert first["type"] == "connected"
+        # The 'connected' room snapshot already reflects the new host.
+        assert first["room"]["host"] == bob_pid, (
+            f"highway attach must self-heal a stranded host slot; "
+            f"snapshot still says {first['room']['host']!r}"
+        )
+        assert room["host"] == bob_pid
+
+
 def test_audio_grace_expiry_closes_highway_with_4408(client, routes_module, fast_grace):
     code, pid = _create_room(client)
     sid = "joint-sid"
