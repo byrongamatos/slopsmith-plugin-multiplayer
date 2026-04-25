@@ -21,6 +21,12 @@ _MP_DIR = None        # set by setup(); used by module-level _cleanup_after_grac
 
 # Session lifecycle constants — see PROTOCOL.md "v1 server policy".
 SESSION_GRACE_SEC = 5.0
+# How long a creator who has never opened any WS keeps the host slot before
+# self-heal will transfer it to the first connected guest. Long enough to
+# absorb a normal page-load + WS-handshake (typically 1–3s); short enough that
+# an abandoned room (creator closed the tab without connecting) doesn't stay
+# permanently hostless once a guest arrives.
+HOST_CREATOR_GRACE_SEC = 30.0
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # Lifecycle close codes; values track PROTOCOL.md.
 _CLOSE_AUTH_FAIL = 4401
@@ -957,23 +963,26 @@ def setup(app, context):
         # player["ws"]=None). Re-run the election now that this highway
         # attach made the candidate set non-empty.
         #
-        # Three conditions must hold to self-heal away from the current host:
-        #   1. host_id missing OR
-        #   2. host's player record is gone (left via leave_room) OR
+        # Four conditions trigger self-heal away from the current host:
+        #   1. host_id missing.
+        #   2. host's player record is gone (left via leave_room).
         #   3. host has ever attached a WS in this room AND no longer has an
-        #      active session.
+        #      active session (they connected, dropped, grace expired).
+        #   4. host has NEVER attached a WS AND the creator-grace window has
+        #      already passed (room is older than HOST_CREATOR_GRACE_SEC).
         #
-        # The `ever_attached` qualifier on case (3) is critical: a brand-new
-        # room has the creator as host with no session yet (they haven't
-        # opened /ws). The first guest who beats them to a highway connect
-        # would otherwise steal host privileges from a creator who simply
-        # hadn't connected yet. Once the creator opens any WS once, their
-        # ever_attached flag flips to True and stays there; from that point
-        # on, "no session" means they actually disconnected past grace.
+        # Cases (3) and (4) together catch every "host can't fulfill duties"
+        # state without stealing host from a slow-but-arriving creator:
+        #   - Slow creator (within HOST_CREATOR_GRACE_SEC): never_attached
+        #     but room is young → no self-heal, creator keeps host slot.
+        #   - Abandoned creator (past HOST_CREATOR_GRACE_SEC): never_attached
+        #     and room is old → self-heal, guest takes over.
+        #   - Connected-then-dropped: ever_attached + no session → self-heal
+        #     immediately on next guest highway attach.
         #
-        # The transient-grace protection is preserved because the session
-        # record IS present during a per-endpoint grace window (only the
-        # endpoint slot is None), so condition (3) doesn't fire.
+        # Transient-grace protection: during a per-endpoint grace window the
+        # session record IS present (only the endpoint slot is None), so
+        # condition (3) doesn't fire and the host keeps their slot.
         #
         # We update room["host"] BEFORE sending the 'connected' snapshot so
         # the new client sees the corrected host_id immediately, then
@@ -982,10 +991,16 @@ def setup(app, context):
         host_id = room.get("host")
         host_player = room["players"].get(host_id) if host_id else None
         host_session = room.get("sessions", {}).get(host_id) if host_id else None
+        room_age = time.monotonic() - room.get("created_at", time.monotonic())
         host_truly_gone = (
             host_id is None
             or host_player is None
             or (host_player.get("ever_attached") and host_session is None)
+            or (
+                host_player is not None
+                and not host_player.get("ever_attached")
+                and room_age > HOST_CREATOR_GRACE_SEC
+            )
         )
         host_was_self_healed = False
         if host_truly_gone:

@@ -506,6 +506,37 @@ def test_host_self_heal_when_audio_only_player_reattaches_highway(client, routes
         assert room["host"] == bob_pid
 
 
+@pytest.fixture
+def fast_creator_grace(routes_module):
+    """Shrink the creator-grace window so abandoned-creator tests run quickly."""
+    routes_module.HOST_CREATOR_GRACE_SEC = 0.3
+    yield 0.3
+
+
+def test_abandoned_creator_releases_host_after_creator_grace(client, routes_module, fast_creator_grace):
+    """Codex round 5 P1: a creator who never opens any WS must eventually
+    release the host slot to a connected guest. Without a time-bound on
+    the never-attached protection, the room stays permanently hostless
+    when the creator closes the tab without connecting."""
+    code, host_pid = _create_room(client)
+    other_pid = _join_room(client, code, "Bob")
+    room = routes_module._rooms[code]
+
+    # Wait past the (shrunk) creator-grace window.
+    time.sleep(fast_creator_grace * 2.0)
+
+    # Bob attaches highway. With creator-grace expired, self-heal must fire.
+    with client.websocket_connect(_highway_url(code, other_pid, "bob-sid")) as bob_hw:
+        snapshot = bob_hw.receive_json()
+        assert snapshot["type"] == "connected"
+        assert snapshot["room"]["host"] == other_pid, (
+            f"abandoned creator (never attached, room older than grace) must "
+            f"release host to the connected guest; got {snapshot['room']['host']!r}, "
+            f"expected {other_pid!r}"
+        )
+        assert room["host"] == other_pid
+
+
 def test_never_connected_creator_keeps_host_when_guest_attaches_first(client, routes_module):
     """Codex round 4 P2: a brand-new room has the creator as host with no
     session yet — they haven't opened /ws. If a guest beats them to a
