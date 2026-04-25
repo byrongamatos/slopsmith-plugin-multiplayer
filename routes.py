@@ -48,6 +48,15 @@ _AUDIO_FRAME_MAX_BYTES = 262144  # 256 KB hard limit (header + payload)
 # typical interval of ~2 s and 96 kbps Opus, 8 frames ≈ 16 s of headroom.
 _AUDIO_SEND_QUEUE_MAX = 8
 
+# v1 broadcast control-plane validation (PROTOCOL.md "Receiver validation /
+# Control-plane validation"). broadcast_start parameters MUST conform to
+# these or the server rejects the request before flipping broadcaster_id.
+_V1_SAMPLE_RATE = 48000
+_V1_CHANNEL_COUNT = 1
+_V1_CODEC = "opus"
+_V1_BITRATE_MIN = 16000
+_V1_BITRATE_MAX = 256000
+
 
 def _gen_code():
     for _ in range(100):
@@ -81,6 +90,11 @@ def _serialize_room(room):
         "speed": room["speed"],
         "recording": room["recording"],
         "recordings_received": list(room["recordings"].keys()),
+        # Broadcast control plane (PROTOCOL.md). Late joiners see the
+        # active broadcaster in their initial 'connected' snapshot rather
+        # than waiting for a fresh broadcaster_changed event.
+        "broadcaster_id": room.get("broadcaster_id"),
+        "broadcast_params": room.get("broadcast_params"),
     }
 
 
@@ -124,6 +138,61 @@ def _promote_host(room):
 
 def _is_valid_session_id(sid):
     return bool(sid) and bool(_SESSION_ID_RE.match(sid))
+
+
+def _validate_broadcast_params(data):
+    """Apply PROTOCOL.md "Control-plane validation" to a broadcast_start
+    payload. Returns a normalized params dict on success, or a string
+    describing the failure reason. v1 only accepts opus / 48kHz / mono /
+    [16k, 256k] kbps; future versions may relax these."""
+    sample_rate = data.get("sample_rate")
+    if sample_rate != _V1_SAMPLE_RATE:
+        return f"sample_rate must be {_V1_SAMPLE_RATE} (got {sample_rate!r})"
+    channel_count = data.get("channel_count")
+    if channel_count != _V1_CHANNEL_COUNT:
+        return f"channel_count must be {_V1_CHANNEL_COUNT} (got {channel_count!r})"
+    codec = data.get("codec")
+    if codec != _V1_CODEC:
+        return f"codec must be {_V1_CODEC!r} (got {codec!r})"
+    bitrate = data.get("bitrate")
+    if (
+        not isinstance(bitrate, int)
+        or isinstance(bitrate, bool)
+        or bitrate < _V1_BITRATE_MIN
+        or bitrate > _V1_BITRATE_MAX
+    ):
+        return (
+            f"bitrate must be an int in [{_V1_BITRATE_MIN}, {_V1_BITRATE_MAX}] "
+            f"(got {bitrate!r})"
+        )
+    interval_beats = data.get("interval_beats")
+    if not isinstance(interval_beats, int) or isinstance(interval_beats, bool) or interval_beats <= 0:
+        return f"interval_beats must be a positive int (got {interval_beats!r})"
+    return {
+        "interval_beats": interval_beats,
+        "sample_rate": sample_rate,
+        "channel_count": channel_count,
+        "codec": codec,
+        "bitrate": bitrate,
+    }
+
+
+async def _clear_broadcaster_if_player(room, player_id):
+    """If `player_id` is the current room broadcaster, clear the slot and
+    broadcast `broadcaster_changed: null` to all peers. No-op otherwise.
+
+    Called from every session-end path (grace expiry, takeover, leave_room,
+    room destroy) so the broadcast slot can never tombstone past a real
+    departure. Idempotent and safe to call when broadcaster_id is None.
+    """
+    if room.get("broadcaster_id") != player_id:
+        return
+    room["broadcaster_id"] = None
+    room["broadcast_params"] = None
+    await _broadcast(room, {
+        "type": "broadcaster_changed",
+        "broadcaster_id": None,
+    })
 
 
 async def _safe_close(ws, code):
@@ -315,6 +384,12 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
     await _cleanup_audio_worker(old_existing)
     await _safe_close(old_highway_ws, _CLOSE_SUPERSEDED)
     await _safe_close(old_audio_ws, _CLOSE_SUPERSEDED)
+    # If the OLD session was the active broadcaster, end the broadcast.
+    # The new tab is conceptually the same player_id but a different
+    # session, so it must explicitly re-issue broadcast_start to resume —
+    # otherwise listeners would receive frames from a session that
+    # never announced itself as the broadcaster.
+    await _clear_broadcaster_if_player(room, player_id)
     return "takeover"
 
 
@@ -737,6 +812,11 @@ async def _grace_then_finalize_endpoint(room, player_id, endpoint):
 
     await _broadcast(room, {"type": "player_disconnected", "player_id": player_id})
 
+    # If this player was the active broadcaster, the session ending means
+    # the broadcast also ended. Tell peers so they can tear down their
+    # listener pipelines.
+    await _clear_broadcaster_if_player(room, player_id)
+
     if _connected_count(room) == 0:
         _start_cleanup(room["code"])
 
@@ -794,6 +874,11 @@ def setup(app, context):
             "skip_votes": set(),
             "sessions": {},
             "creator_grace_task": None,
+            # Broadcast control plane: who is currently broadcasting audio
+            # (player_id) and the codec parameters they advertised in
+            # broadcast_start. Both None when no one is broadcasting.
+            "broadcaster_id": None,
+            "broadcast_params": None,
         }
         _rooms[code] = room
         # Schedule the one-shot creator-grace timer. If the creator never
@@ -874,6 +959,10 @@ def setup(app, context):
 
         del room["players"][player_id]
         await _broadcast(room, {"type": "player_left", "player_id": player_id})
+
+        # If the leaving player was the broadcaster, end the broadcast so
+        # peers tear down their listener pipelines.
+        await _clear_broadcaster_if_player(room, player_id)
 
         # Promote host if needed
         if room["host"] == player_id and room["players"]:
@@ -1628,6 +1717,70 @@ def setup(app, context):
         elif msg_type == "stop_recording" and is_host:
             room["recording"] = False
             await _broadcast(room, {"type": "recording_state", "recording": False})
+
+        # ── Broadcast control plane (PROTOCOL.md "Audio control messages") ──
+        elif msg_type == "broadcast_start":
+            current = room.get("broadcaster_id")
+            ws = room["players"][player_id].get("ws")
+            if current is not None and current != player_id:
+                # v1: single broadcaster per room. Reject the new attempt.
+                if ws is not None:
+                    try:
+                        await ws.send_json({
+                            "type": "error",
+                            "message": "broadcaster_busy",
+                        })
+                    except Exception:
+                        pass
+            else:
+                params_or_err = _validate_broadcast_params(data)
+                if isinstance(params_or_err, str):
+                    if ws is not None:
+                        try:
+                            await ws.send_json({
+                                "type": "error",
+                                "message": f"broadcast_start_invalid: {params_or_err}",
+                            })
+                        except Exception:
+                            pass
+                else:
+                    room["broadcaster_id"] = player_id
+                    room["broadcast_params"] = params_or_err
+                    await _broadcast(room, {
+                        "type": "broadcaster_changed",
+                        "broadcaster_id": player_id,
+                        **params_or_err,
+                    })
+
+        elif msg_type == "broadcast_stop":
+            # Only the active broadcaster can stop their own broadcast.
+            # A stop from anyone else is silently ignored to avoid
+            # exposing broadcast state to unrelated peers.
+            if room.get("broadcaster_id") == player_id:
+                await _clear_broadcaster_if_player(room, player_id)
+
+        elif msg_type == "audio_quality":
+            # Forward listener-side quality telemetry to the broadcaster
+            # (and only the broadcaster — peers don't need each other's
+            # stats). No-op if no one is broadcasting or the report
+            # references a different broadcaster_id (stale telemetry).
+            current = room.get("broadcaster_id")
+            if current is not None and data.get("broadcaster_id") == current:
+                broadcaster = room["players"].get(current)
+                if broadcaster is not None and broadcaster.get("ws") is not None:
+                    try:
+                        await broadcaster["ws"].send_json({
+                            "type": "audio_quality",
+                            "from_player_id": player_id,
+                            "broadcaster_id": current,
+                            "intervals_received": data.get("intervals_received"),
+                            "intervals_late": data.get("intervals_late"),
+                            "intervals_dropped": data.get("intervals_dropped"),
+                            "decoder_underruns": data.get("decoder_underruns"),
+                            "report_period_ms": data.get("report_period_ms"),
+                        })
+                    except Exception:
+                        pass
 
         elif msg_type == "song_ended" and is_host:
             room["skip_votes"] = set()
