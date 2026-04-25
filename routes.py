@@ -486,18 +486,20 @@ async def _cleanup_audio_worker(sess, room=None, player_id=None):
     except asyncio.CancelledError:
         # Distinguishing "caller cancelled" from "worker cancelled" via
         # `worker.cancelled()` alone is unreliable: when our task is
-        # cancelled while awaiting the worker, asyncio raises CancelledError
-        # due to OUR task's cancellation regardless, and worker.cancelled()
-        # is also True (we did call worker.cancel() ourselves). Use
-        # Task.cancelling() (Python 3.11+) to detect that our task is the
-        # one being cancelled. On Py<3.11 the getattr fallback returns 1,
-        # which conservatively treats every CancelledError as caller
-        # cancellation — safer than swallowing.
+        # cancelled while awaiting the worker, asyncio raises
+        # CancelledError due to OUR task's cancellation regardless, and
+        # worker.cancelled() is also True (we called worker.cancel()
+        # ourselves). Task.cancelling() (Python 3.11+) gives us a
+        # reliable signal; on older Python we fall back to the
+        # best-effort `not worker.cancelled()` check, which misses the
+        # simultaneous-cancel edge case but is the same behavior we had
+        # before this fix. Slopsmith targets Python 3.12 in production
+        # (see Dockerfile), so the reliable path is the common one.
         current = asyncio.current_task()
-        current_is_cancelling = (
-            current is not None
-            and getattr(current, "cancelling", lambda: 1)() > 0
-        )
+        if current is not None and hasattr(current, "cancelling"):
+            current_is_cancelling = current.cancelling() > 0
+        else:
+            current_is_cancelling = False  # pre-3.11 best-effort fallback
         if current_is_cancelling or not worker.cancelled():
             # Our caller was cancelled, not the worker we cancelled. We MUST
             # NOT restart the worker here even if audio_ws is still alive:
