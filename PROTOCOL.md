@@ -39,10 +39,20 @@ The server's forwarding path is intentionally trivial: on receipt of a binary fr
 | Close code | Meaning                                                             |
 |-----------:|---------------------------------------------------------------------|
 | `4401`     | Auth failure (room does not exist or `player_id` not in the room).  |
+| `4409`     | Superseded — another connection for the same `player_id` took over (see "v1 server policy" below). |
 | `1009`     | Frame too big — see Frame size budget and bounds below.             |
 | `1011`     | Server error (unexpected; rare).                                    |
 
-**v1 server policy: at most one audio WS per `player_id`.** If a second connection arrives with a `player_id` that already has an active audio WS, the server MUST reject the new upgrade with HTTP `403 Forbidden` **before calling `accept()`**. This is deliberately different from the auth-failure path: the second connection's browser fires a generic `WebSocket` `error` event and **NEVER fires `open`**, so client-side readiness logic that gates on `open` cannot race against the rejection. As a corollary, `broadcaster_id` references `player_id`, which uniquely identifies the active audio WS — there is no per-tab session token to manage. A future protocol revision MAY introduce session-migration semantics with a `4409` close code; v1 reserves the code but does not emit it.
+**v1 server policy: at most one active connection per `player_id` for EACH WS endpoint** (highway and audio independently). When a new connection arrives for a `player_id` that already has an active connection on the same endpoint, the server MUST cleanly close the existing connection (close code `4409`, reason `"superseded"`) before accepting the new one — most-recent-wins semantics. The closed-out tab's WebSocket fires `close` with code `4409`; clients seeing `4409` MUST treat it as "another tab took over" and tear down their broadcast/listener state cleanly (no error UI, since this is the user's own action elsewhere).
+
+This rule applies symmetrically to BOTH the highway WS and the audio WS:
+
+- Without it on the audio WS, a duplicate connection would race with the listener's "first-frame" readiness signal.
+- Without it on the highway WS, a duplicate tab could receive `broadcaster_changed` events for the shared `player_id` even though its own audio WS does not exist or was superseded.
+
+Phase 1 will tighten the existing highway WS handler in `routes.py` to enforce the same rule (today it overwrites `player["ws"]` without closing the old socket; that becomes a bug under the new audio feature).
+
+As a corollary of this policy, `broadcaster_id` (= `player_id`) uniquely identifies BOTH the host's audio WS and the host's highway WS at any moment in time — no per-tab session token is required. The `4401` close code remains for auth failures (room/player_id invalid) and uses the accept-then-close pattern documented above. v1 servers MUST NOT use any close code outside `{4401, 4409, 1009, 1011}` on the audio WS.
 
 Codes in the `4000–4999` range are protocol-reserved per RFC 6455 and visible to the client via `event.code` on the `close` event. The optional `event.reason` string MAY include a short ASCII hint (≤ 123 bytes per RFC) but clients MUST NOT depend on a specific reason string.
 
@@ -63,7 +73,7 @@ async def audio_ws(websocket: WebSocket, code: str, player_id: str = ""):
 The deterministic readiness signal for the audio WS comes from the **control plane on the highway WS**, not from the audio WS itself:
 
 - **Host (sender).** Treat the audio WS as ready for outbound audio only after the server has acknowledged `broadcast_start` by emitting `broadcaster_changed` on the highway WS with the host's own `broadcaster_id`. If the audio WS was rejected with `4401`, the server's broadcaster registry will not contain the host's audio subscriber, and the server MUST refuse `broadcast_start` from that host (returning `{"type":"error","message":"audio_ws_not_open"}` on the highway WS). Combined with the one-audio-WS-per-player_id server policy above, the `broadcaster_changed` ack uniquely identifies the host's own audio WS. UI that begins capture or sending MUST be gated on the `broadcaster_changed` ack, not on the audio WS `open` event.
-- **Listener.** Treat the audio WS as ready for inbound audio only after receiving the first valid binary frame from a broadcaster. **Listeners MUST NOT use the audio WS `open` event for any UI or readiness purpose** — including clearing a "connecting…" indicator — because under the accept-then-close pattern, a rejected socket fires `open` first and `close(4401)` may be delivered arbitrarily later. Use the highway-WS `broadcaster_changed` event (with non-null id) plus first-frame arrival as the user-visible "audio is live" signal.
+- **Listener.** The user-visible "broadcast active" state comes from EITHER the initial `connected` room snapshot's `broadcaster_id` (for late joiners — clients that join while a broadcast is already in progress) OR a fresh `broadcaster_changed` event (for clients in the room when the broadcast starts). Both are valid signals; UI MUST treat them equivalently. The user-visible "audio is actually flowing" state is the **first valid binary frame** arriving on the audio WS; the listener's audio graph (decoder, gain node, scheduling) is constructed on receipt of that first frame. **Listeners MUST NOT use the audio WS `open` event for any UI or readiness purpose** — including clearing a "connecting…" indicator — because under the accept-then-close pattern, a rejected socket fires `open` first and `close(4401)` may be delivered arbitrarily later.
 
 This anchors readiness on the already-authenticated highway WS (which uses the existing JSON-error-then-close rejection path) plus deterministic data-plane events (first frame received) — never on audio WS `open`, which is racy for both auth-failure (`4401`) and is the canonical race source codex flagged.
 
