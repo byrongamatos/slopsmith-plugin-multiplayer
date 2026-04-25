@@ -14,8 +14,10 @@ Both endpoints share the same room registry and authentication state: the connec
 ### Highway WS — JSON control plane
 
 ```
-ws://<host>/ws/plugins/multiplayer/{code}?player_id={id}
+ws://<host>/ws/plugins/multiplayer/{code}?player_id={id}&session_id={sid}
 ```
+
+`session_id` is a client-generated random identifier (UUIDv4 recommended) that uniquely identifies a single browser tab / app instance for the lifetime of the session. The client mints it when it starts trying to connect and keeps it in `sessionStorage` (or equivalent) so reconnects after a network blip carry the same `session_id`. A different tab gets a different `session_id`. The `session_id` query param is OPTIONAL on the highway WS for backward compatibility with already-shipped clients (servers MUST treat its absence as "legacy session" — see "Server policy" below); NEW client builds SHOULD always send it.
 
 Carries all control messages. The message types used by the audio feature are documented under "Audio control messages" below; the existing playback/queue/recording messages are unchanged.
 
@@ -24,8 +26,10 @@ Carries all control messages. The message types used by the audio feature are do
 ### Audio WS — binary peer-audio relay (NEW)
 
 ```
-ws://<host>/ws/plugins/multiplayer/{code}/audio?player_id={id}
+ws://<host>/ws/plugins/multiplayer/{code}/audio?player_id={id}&session_id={sid}
 ```
+
+`session_id` is REQUIRED on the audio WS and MUST be the same value the client used (or will use) on its highway WS. This binds the two endpoints into a single session and is the mechanism that lets the server distinguish "same tab opening its second socket" from "different tab taking over."
 
 Carries **binary frames only**. Every frame is one full Ninjam-style interval of Opus-encoded audio.
 
@@ -43,15 +47,30 @@ The server's forwarding path is intentionally trivial: on receipt of a binary fr
 | `1009`     | Frame too big — see Frame size budget and bounds below.             |
 | `1011`     | Server error (unexpected; rare).                                    |
 
-**v1 server policy: at most one active *session* per `player_id`, where a session owns BOTH the highway WS and the audio WS atomically.** When a new connection arrives on EITHER endpoint for a `player_id` that already has an active session, the server MUST cleanly close BOTH the existing highway WS *and* the existing audio WS for that `player_id` (close code `4409`, reason `"superseded"`) **before accepting the new connection**. Most-recent-wins semantics, applied to the session as a whole — never just to one endpoint.
+**v1 server policy: at most one active *session* per `player_id`, where a session is identified by the client-supplied `session_id` and owns BOTH the highway WS and the audio WS atomically.** The server keeps state of the form:
 
-The closed-out tab's WebSockets fire `close` with code `4409`; clients seeing `4409` on either endpoint MUST treat it as "another tab took over the session" and tear down BOTH their highway-WS and audio-WS state cleanly (no error UI — this is the user's own action elsewhere). The new tab is then responsible for opening both endpoints fresh.
+```
+sessions[player_id] = {
+    session_id,
+    highway_ws,   # may be None if not yet opened or already closed
+    audio_ws,     # may be None if not yet opened or already closed
+}
+```
 
-Why atomic across endpoints: per-endpoint uniqueness alone is not sufficient. A reconnect-order race could otherwise leave tab A owning the audio WS while tab B owns the highway WS for the same `player_id`, and a `broadcast_start` from tab B would then be acknowledged against tab A's still-open audio socket — defeating the per-tab determinism this rule is meant to guarantee. Closing both endpoints together makes session ownership always atomic per tab.
+Connection-arrival rules (apply identically to a highway-WS open and an audio-WS open; the only difference is which slot the new socket fills):
 
-Phase 1 will tighten the existing highway WS handler in `routes.py` to enforce the same rule (today it overwrites `player["ws"]` without closing the old socket; that becomes a bug under the new audio feature).
+1. **No existing session for this `player_id`** → create a new session with the supplied `session_id`, register the new socket in the matching slot, accept normally.
+2. **Existing session and `session_id` matches** → this is the same tab opening its second endpoint, OR a reconnect of the same endpoint after a network blip. Close any existing socket already in the matching slot (code `4409`, reason `"reconnect"`), register the new socket in that slot, accept normally. The OTHER endpoint's socket is left untouched.
+3. **Existing session and `session_id` differs** → this is a different tab taking over. Close BOTH the existing highway and audio sockets in the existing session (code `4409`, reason `"superseded"`), discard the old session, create a new session with the supplied `session_id`, register the new socket, accept normally.
+4. **No `session_id` supplied (legacy client)** → treated as a brand-new session with a server-minted opaque `session_id`, applying rule 1 or 3 according to whether a session already exists. Servers MAY log a warning for telemetry; this path exists only for backward compatibility with already-shipped highway clients that pre-date this protocol revision.
 
-As a corollary of this policy, `broadcaster_id` (= `player_id`) uniquely identifies the host's session — both endpoints — at any moment in time. No per-tab session token is required. The `4401` close code remains for auth failures (room/player_id invalid) and uses the accept-then-close pattern documented above. v1 servers MUST NOT use any close code outside `{4401, 4409, 1009, 1011}` on the audio WS.
+The closed-out tab's WebSockets fire `close` with code `4409`; clients seeing `4409` on either endpoint MUST treat it as "another tab took over the session" (when `reason="superseded"`) or "the server replaced my prior connection" (when `reason="reconnect"`) and tear down BOTH their highway-WS and audio-WS state cleanly (no error UI — this is the user's own action elsewhere). The new tab is then responsible for re-opening both endpoints fresh.
+
+Why a `session_id` is needed at all: without it, a single tab opening its second endpoint is indistinguishable from a different tab taking over, since both arrive as "a new connection for the same `player_id`." `session_id` lets the server make that distinction deterministically without having to time-window or guess.
+
+Phase 1 will tighten the existing highway WS handler in `routes.py` to enforce these rules (today it overwrites `player["ws"]` without closing the old socket and accepts duplicate sessions silently; that becomes a bug under the new audio feature).
+
+As a corollary of this policy, `broadcaster_id` (= `player_id`) uniquely identifies the host's session — both endpoints — at any moment in time, and `broadcast_start` is acknowledged against whichever session currently holds both sockets for that `player_id`. The `4401` close code remains for auth failures (room/player_id invalid) and uses the accept-then-close pattern documented above. v1 servers MUST NOT use any close code outside `{4401, 4409, 1009, 1011}` on the audio WS.
 
 Codes in the `4000–4999` range are protocol-reserved per RFC 6455 and visible to the client via `event.code` on the `close` event. The optional `event.reason` string MAY include a short ASCII hint (≤ 123 bytes per RFC) but clients MUST NOT depend on a specific reason string.
 
