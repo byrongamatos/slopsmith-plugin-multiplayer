@@ -341,7 +341,7 @@ async def _on_endpoint_disconnect(websocket, room, player_id, endpoint):
         if player is not None:
             player["ws"] = None
     elif endpoint == _AUDIO:
-        await _cleanup_audio_worker(sess)
+        await _cleanup_audio_worker(sess, room, player_id)
     # Schedule per-endpoint grace expiry. Either endpoint expiring ends the
     # whole session per PROTOCOL.md "Per-endpoint grace".
     sess[_grace_key(endpoint)] = asyncio.create_task(
@@ -375,28 +375,30 @@ async def _close_audio_after_worker(ws, worker, code):
     await _safe_close(ws, code)
 
 
-async def _restart_audio_worker_after_old(sess, old_worker):
-    """Wait for `old_worker` to actually exit, THEN spawn a fresh worker
-    on the session's current audio_ws if and only if the slot is still
-    in the "audio_ws alive, no worker" state.
+async def _restart_audio_worker_after_old(room, player_id, expected_sess, old_worker):
+    """Wait for `old_worker` to exit, then spawn a fresh worker on
+    `expected_sess` IFF the room still references that exact session
+    dict for `player_id`. Used by _cleanup_audio_worker's cancel-
+    propagation branch.
 
-    Used by _cleanup_audio_worker's cancel-propagation branch. Closing
-    audio_ws there would emit a misleading close code (the session is
-    typically still alive — our cleanup was interrupted by an external
-    cancel like a same-session reconnect, not by a real teardown). This
-    helper instead lets the audio_ws keep running by installing a fresh
-    worker once the old one has fully exited, restoring the relay with
-    no client-visible event. If a separate reattach path has already
-    installed its own worker (or audio_ws has been cleared) the slot
-    check fails and we no-op.
+    The room/player_id re-lookup matters: existing teardown paths
+    (Rule 3 takeover, _grace_then_finalize_endpoint, leave_room) drop
+    the session dict from `room["sessions"]` without nulling
+    `sess["audio_ws"]` first. If we restarted blindly on the detached
+    dict, we'd call _setup_audio_worker on a closed/orphaned audio_ws,
+    leaking the new task and the audio_ws+session refs along with it.
+    Comparing `room["sessions"][player_id] is expected_sess` confirms
+    the session is still authoritative before we touch it.
     """
     if old_worker is not None:
         try:
             await old_worker
         except (asyncio.CancelledError, Exception):
             pass
-    if sess.get("audio_ws") is not None and sess.get("audio_send_worker") is None:
-        _setup_audio_worker(sess)
+    if room.get("sessions", {}).get(player_id) is not expected_sess:
+        return
+    if expected_sess.get("audio_ws") is not None and expected_sess.get("audio_send_worker") is None:
+        _setup_audio_worker(expected_sess)
 
 
 async def _audio_send_worker(ws, queue):
@@ -422,10 +424,17 @@ async def _audio_send_worker(ws, queue):
         return
 
 
-async def _cleanup_audio_worker(sess):
+async def _cleanup_audio_worker(sess, room=None, player_id=None):
     """Cancel the audio worker (if any), wait for it to actually exit, and
     clear the queue — but only if the slot still references the worker we
     captured. Safe to call on a session that has no worker (no-op).
+
+    `room` and `player_id` are optional. They are used only on the cancel-
+    propagation branch (external cancel of our caller) to safely schedule
+    a background restart of the audio worker if the session is still
+    authoritative. Callers who can't provide them (or for which a restart
+    isn't desired) may omit them — the cancel-propagation branch then
+    falls through without scheduling a restart.
 
     Why async / awaits the cancelled task: cancel() only REQUESTS
     cancellation. If the worker is currently inside `await ws.send_bytes(...)`
@@ -485,26 +494,34 @@ async def _cleanup_audio_worker(sess):
             # leave the new state untouched (otherwise we'd null/close the
             # freshly reattached /audio socket and orphan its new worker).
             if sess.get("audio_send_worker") is worker:
-                # Clear our worker/queue slots, but DON'T close audio_ws.
-                # Closing here would emit a misleading close code: the
-                # session is typically still alive (our cleanup was
-                # interrupted by an external cancel — e.g. a same-session
-                # reconnect of the other endpoint — not by a real
-                # teardown), and no close code in the v1 set accurately
-                # describes "audio relay temporarily had to be replaced
-                # mid-session for an internal reason." Schedule a
-                # background task that waits for the old worker to fully
-                # exit (avoiding ASGI's single-sender race), then installs
-                # a fresh worker on the same audio_ws — keeping the relay
-                # alive with no client-visible event. The slot guard in
-                # _restart_audio_worker_after_old prevents racing other
-                # reattach paths that may have installed their own worker
-                # in the interim.
-                sess["audio_send_worker"] = None
+                # Clear the QUEUE so fan-out skips this peer (no pushes to
+                # a queue with no live consumer), but leave audio_send_worker
+                # pointing at the cancelled worker so concurrent rule-2
+                # audio reconnects in _take_session_slot can still snapshot
+                # `prev_audio_worker = sess["audio_send_worker"]` and route
+                # their old-ws close through _close_audio_after_worker —
+                # which awaits the cancelled worker before close, avoiding
+                # the ASGI single-sender race. The audio_send_worker slot
+                # itself will be replaced by either:
+                #   (a) the deferred restart helper below, after the
+                #       cancelled worker has actually exited, or
+                #   (b) a concurrent reattach via _setup_audio_worker.
+                #
+                # We DO NOT close audio_ws — closing here would emit a
+                # misleading close code (the session is typically still
+                # alive — our cleanup was interrupted by an external
+                # cancel like a same-session reconnect of the OTHER
+                # endpoint, not by a real teardown).
                 sess["audio_send_queue"] = None
-                if sess.get("audio_ws") is not None:
+                if (
+                    room is not None
+                    and player_id is not None
+                    and sess.get("audio_ws") is not None
+                ):
                     asyncio.create_task(
-                        _restart_audio_worker_after_old(sess, worker)
+                        _restart_audio_worker_after_old(
+                            room, player_id, sess, worker,
+                        )
                     )
             raise
     except Exception:
@@ -676,7 +693,11 @@ async def _grace_then_finalize_endpoint(room, player_id, endpoint):
     # time; otherwise the close races with an in-flight send and may fail
     # silently). This also prevents the worker leak the audio handler's
     # finally would skip on sess-is-None early return.
-    await _cleanup_audio_worker(sess)
+    # Pass room/player_id so a cancel-propagation (a same-session
+    # endpoint reconnect cancelling this grace task) can schedule a
+    # background restart of the audio worker — the session is alive in
+    # that case and audio shouldn't go silently mute.
+    await _cleanup_audio_worker(sess, room, player_id)
     other = _slot_key(_other_endpoint(endpoint))
     other_ws = sess.get(other)
     sessions.pop(player_id, None)
