@@ -259,7 +259,7 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
     # Cancel the prior session's audio worker too — the new session's
     # _setup_audio_worker (if endpoint is audio) installs a fresh one bound
     # to the new ws.
-    _cleanup_audio_worker(existing)
+    await _cleanup_audio_worker(existing)
     old_highway_ws = existing.get("highway_ws")
     old_audio_ws = existing.get("audio_ws")
     rec = _new_session_record(session_id)
@@ -308,7 +308,7 @@ async def _on_endpoint_disconnect(websocket, room, player_id, endpoint):
         if player is not None:
             player["ws"] = None
     elif endpoint == _AUDIO:
-        _cleanup_audio_worker(sess)
+        await _cleanup_audio_worker(sess)
     # Schedule per-endpoint grace expiry. Either endpoint expiring ends the
     # whole session per PROTOCOL.md "Per-endpoint grace".
     sess[_grace_key(endpoint)] = asyncio.create_task(
@@ -345,17 +345,25 @@ async def _audio_send_worker(ws, queue):
         return
 
 
-def _cleanup_audio_worker(sess):
-    """Cancel the audio worker (if any) and clear the queue. Safe to call
-    on a session that has no worker (no-op). Called from every teardown
-    path that pops the session BEFORE the audio handler's finally block
-    can run (leave_room, grace finalization, room destroy) — without this,
-    the worker stays parked on queue.get() forever and leaks per departed
-    listener.
+async def _cleanup_audio_worker(sess):
+    """Cancel the audio worker (if any), wait for it to actually exit, and
+    clear the queue. Safe to call on a session that has no worker (no-op).
+
+    Why this is async / awaits the cancelled task: cancel() only REQUESTS
+    cancellation. If the worker is currently inside `await ws.send_bytes(...)`
+    when we cancel it, the next caller of `audio_ws.close(...)` would race
+    against the still-running send and the close can fail silently (ASGI
+    forbids concurrent senders on the same WebSocket). Awaiting the
+    cancelled task here guarantees the worker has fully exited before we
+    return, so any subsequent close on the same ws is the sole sender.
     """
     worker = sess.get("audio_send_worker")
     if worker is not None and not worker.done():
         worker.cancel()
+        try:
+            await worker
+        except (asyncio.CancelledError, Exception):
+            pass
     sess["audio_send_worker"] = None
     sess["audio_send_queue"] = None
 
@@ -456,7 +464,7 @@ async def _cleanup_after_grace(code, seconds=60):
         # dict.
         for sess in room.get("sessions", {}).values():
             _cancel_grace_tasks(sess)
-            _cleanup_audio_worker(sess)
+            await _cleanup_audio_worker(sess)
         # Same for the one-shot creator-grace timer.
         cgt = room.get("creator_grace_task")
         if cgt and not cgt.done():
@@ -516,10 +524,13 @@ async def _grace_then_finalize_endpoint(room, player_id, endpoint):
         # Reattached during the grace window.
         return
 
-    # Grace expired with no reattach: end the session. Cancel any audio
-    # worker now BEFORE popping/closing so it doesn't leak after the audio
-    # handler's finally block hits the sess-is-None early return.
-    _cleanup_audio_worker(sess)
+    # Grace expired with no reattach: end the session. Cancel + AWAIT the
+    # audio worker BEFORE the close below so the worker isn't still mid-
+    # send_bytes when we close the same ws (ASGI requires one sender at a
+    # time; otherwise the close races with an in-flight send and may fail
+    # silently). This also prevents the worker leak the audio handler's
+    # finally would skip on sess-is-None early return.
+    await _cleanup_audio_worker(sess)
     other = _slot_key(_other_endpoint(endpoint))
     other_ws = sess.get(other)
     sessions.pop(player_id, None)
@@ -658,7 +669,9 @@ def setup(app, context):
         sess = room.get("sessions", {}).pop(player_id, None)
         if sess is not None:
             _cancel_grace_tasks(sess)
-            _cleanup_audio_worker(sess)
+            # Await worker shutdown BEFORE close to avoid the race where the
+            # worker's in-flight send_bytes overlaps with our close.
+            await _cleanup_audio_worker(sess)
             await _safe_close(sess.get("audio_ws"), _CLOSE_NORMAL)
 
         del room["players"][player_id]
