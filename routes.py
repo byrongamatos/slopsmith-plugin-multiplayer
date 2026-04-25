@@ -492,9 +492,9 @@ async def _cleanup_audio_worker(sess, room=None, player_id=None):
         # ourselves). Task.cancelling() (Python 3.11+) gives us a
         # reliable signal; on older Python we fall back to the
         # best-effort `not worker.cancelled()` check, which misses the
-        # simultaneous-cancel edge case but is the same behavior we had
-        # before this fix. Slopsmith targets Python 3.12 in production
-        # (see Dockerfile), so the reliable path is the common one.
+        # simultaneous-cancel edge case but matches the behavior we had
+        # before this fix. When running on Python 3.11+ the reliable
+        # Task.cancelling() path is used; older runtimes use the fallback.
         current = asyncio.current_task()
         if current is not None and hasattr(current, "cancelling"):
             current_is_cancelling = current.cancelling() > 0
