@@ -453,8 +453,24 @@ function _connectAudioWs() {
             return;
         }
         if (ev && ev.code === CLOSE_SUPERSEDED) {
-            // Different tab took over the whole session. The highway-side
-            // 4409 handler runs the lobby bounce; we just exit here.
+            // Different tab took over the whole session. Normally the
+            // highway-side 4409 handler runs the lobby bounce — the server
+            // closes both endpoints simultaneously, and the highway path
+            // gets there first. But the spec explicitly allows audio-only
+            // sessions during per-endpoint grace, so this audio close may
+            // be the ONLY 4409 we see. If the highway socket is already
+            // gone (or never attached), run the cleanup ourselves;
+            // otherwise leave it to the highway handler.
+            const highwayDead = (
+                _ws === null
+                || _ws.readyState === WebSocket.CLOSING
+                || _ws.readyState === WebSocket.CLOSED
+            );
+            if (highwayDead) {
+                _cleanup();
+                _showLobbyView();
+                _showError('Session moved to another tab');
+            }
             return;
         }
         if (ev && ev.code === CLOSE_GRACE_EXPIRED) {
@@ -506,6 +522,12 @@ function _handleMessage(msg) {
             _renderQueue();
             _updateControls();
             _doClockSync();
+            // Recovery confirmed: the new session_id is now active on the
+            // server. Clearing the dedupe marker means a FUTURE 4408 (for
+            // this newly-established session) will correctly rotate to a
+            // fresh session_id again. Leaving it set would let the second
+            // grace expiry reuse the now-expired _sessionId.
+            _resetMarker = null;
             break;
 
         case 'clock_sync_response':
