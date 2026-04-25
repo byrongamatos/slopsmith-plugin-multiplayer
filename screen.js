@@ -91,6 +91,7 @@ const SMAU_HEADER_LEN = 40;
 const SMAU_VERSION = 1;
 const SMAU_MAX_FRAME_BYTES = 262144;   // 256 KB
 const SMAU_V1_SAMPLE_RATE = 48000;
+const SMAU_V1_CHANNEL_COUNT = 1;
 const SMAU_MAX_INTERVAL_SEC = 32;
 const SMAU_MAX_SLACK_SAMPLES = 480;    // ~10 ms at 48 kHz
 const SMAU_FLAG_TEMPO_CHANGE_AT_END = 0x0001;
@@ -161,6 +162,8 @@ function _smauDecodeFrame(buf) {
 // Exposed on window for debugging via _audioGetRxStats(); not a public API.
 let _audioRxFramesValid = 0;
 let _audioRxFramesDropped = 0;
+let _audioRxFramesLate = 0;        // Phase 2c: incremented in listener pipeline
+let _audioRxFramesScheduled = 0;   // Phase 2c: incremented in listener pipeline
 const _audioRxDropReasons = Object.create(null);
 
 function _audioRxRecordDrop(reason) {
@@ -171,6 +174,8 @@ function _audioRxRecordDrop(reason) {
 function _audioRxResetStats() {
     _audioRxFramesValid = 0;
     _audioRxFramesDropped = 0;
+    _audioRxFramesLate = 0;
+    _audioRxFramesScheduled = 0;
     for (const key of Object.keys(_audioRxDropReasons)) {
         delete _audioRxDropReasons[key];
     }
@@ -181,7 +186,489 @@ function _audioGetRxStats() {
         valid: _audioRxFramesValid,
         dropped: _audioRxFramesDropped,
         dropReasons: Object.assign({}, _audioRxDropReasons),
+        late: _audioRxFramesLate,
+        scheduled: _audioRxFramesScheduled,
     };
+}
+
+// ── Listener pipeline (Phase 2c) ─────────────────────────────────────────────
+//
+// Decode validated SMAU frames via WebCodecs AudioDecoder and schedule
+// playback so each interval starts when the listener's chart playback
+// reaches `chartTimeStart + intervalDuration` — i.e. one interval AFTER the
+// broadcaster recorded it (the structured Ninjam offset). Conversion from
+// chart-time → AudioContext.currentTime uses the listener's <audio> element
+// as the chart clock: at any given instant `audio.currentTime` is the
+// listener's chart playback position and AudioContext.currentTime is the
+// monotonic rendering clock. Their delta lets us schedule:
+//
+//   target_chart    = frame.chartTimeStart + (chartTimeEnd - chartTimeStart)
+//   chart_now       = audio.currentTime           // (paused → bail out)
+//   delta_sec       = target_chart - chart_now
+//   target_ac_time  = audioCtx.currentTime + delta_sec
+//
+// If delta_sec is negative the frame is late (can't schedule into the past)
+// and the frame is dropped with a 'late' counter increment. v1 ALSO bails out
+// when the chart is paused or playing at non-1.0 speed: speed changes warp
+// chart_now relative to AudioContext.currentTime, so a peer recording made
+// at 1.0x would not stay in alignment. Documented limitation; Phase 2d /
+// release polish may add `playbackRate` time-stretching on the source node.
+//
+// Decoder output is correlated to header metadata via the encoded chunk's
+// timestamp field. We allocate a monotonic per-pipeline counter rather than
+// reuse interval_index because EncodedAudioChunk.timestamp is Number-typed
+// (microseconds) and interval_index is u64 / BigInt — Number can't hold it
+// without precision loss above 2^53.
+//
+// WebCodecs AudioDecoder is required. v1 surfaces a one-shot console warning
+// when it's missing (notably Firefox <130) and silently drops decode work.
+
+const LATE_FRAME_GRACE_SEC = 0.005; // 5 ms slack for browser rAF jitter
+
+let _audioListenerCtx = null;          // AudioContext, lazy
+let _audioListenerBroadcasterId = null;
+let _audioListenerBroadcastParams = null;
+// _audioListenerActiveDecoder is { dec, pending, nextTs, epoch } or
+// null. Each decoder instance owns its own `pending` Map so flush()
+// output from a drained-but-not-yet-closed decoder can never collide
+// with timestamps issued by a fresh replacement (codex round-N
+// concurrency case: leave + rejoin can otherwise reuse timestamps from
+// the old decoder's still-pending output and schedule stale audio
+// against new metadata).
+let _audioListenerActiveDecoder = null;
+// Bumped on every chart-time-breaking event (chart pause / seek / song
+// change / 4408 recovery / cleanup / new-broadcaster takeover). Each
+// decoder wrapper captures the current epoch at creation; output
+// handler drops its AudioData if the wrapper's epoch is no longer
+// current. This catches the case where a graceful flush() of a
+// broadcast_stop'd decoder is still in flight when chart-time gets
+// invalidated — without the epoch check, those late outputs would
+// schedule stale audio against the new chart timeline.
+let _audioListenerEpoch = 0;
+let _audioListenerGain = null;         // GainNode → destination
+const _audioListenerScheduledSources = new Set();
+let _audioListenerWebCodecsWarned = false;
+// Sticky "this browser cannot decode our Opus stream" flag. Set on the
+// first AudioDecoder.configure() failure; subsequent inbound frames take
+// the cheap silent-no-op path instead of constructing + closing a fresh
+// AudioDecoder per frame (browsers that expose AudioDecoder but lack
+// Opus support throw on every configure). Reset only on _cleanup so
+// reattaching to a new browser process is the only way to re-test.
+let _audioListenerOpusUnsupported = false;
+
+function _audioListenerHasWebCodecs() {
+    return typeof AudioDecoder !== 'undefined'
+        && typeof EncodedAudioChunk !== 'undefined';
+}
+
+function _audioListenerWarnOnceMissingWebCodecs() {
+    if (_audioListenerWebCodecsWarned) return;
+    _audioListenerWebCodecsWarned = true;
+    console.warn('[MP] WebCodecs AudioDecoder unavailable; peer audio playback disabled in this browser.');
+}
+
+function _audioListenerEnsureContext() {
+    if (_audioListenerCtx) return _audioListenerCtx;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return null;
+    // sampleRate matches the v1 broadcast format so AudioBuffers from the
+    // decoder don't need resampling on insert.
+    _audioListenerCtx = new Ctor({ sampleRate: SMAU_V1_SAMPLE_RATE, latencyHint: 'interactive' });
+    _audioListenerGain = _audioListenerCtx.createGain();
+    _audioListenerGain.gain.value = 1.0;
+    _audioListenerGain.connect(_audioListenerCtx.destination);
+    // Best-effort resume — Chrome/Firefox in active tabs usually create
+    // contexts in 'running' state, but on autoplay-restricted browsers
+    // (Safari, sometimes Chrome) the context may be 'suspended' until
+    // a user gesture. _audioListenerMaybeResumeContext() retries
+    // opportunistically from chart play / broadcast-toggle paths so
+    // peer audio comes online as soon as the user interacts. For
+    // non-host listeners who never trigger those paths themselves,
+    // also install a document-level user-gesture handler that calls
+    // resume() the next time the user interacts with the page.
+    _audioListenerMaybeResumeContext();
+    _audioListenerInstallResumeGesture();
+    return _audioListenerCtx;
+}
+
+let _audioListenerResumeGestureHandler = null;
+
+function _audioListenerInstallResumeGesture() {
+    if (_audioListenerResumeGestureHandler) return;
+    _audioListenerResumeGestureHandler = () => _audioListenerMaybeResumeContext();
+    // Capture phase + listed gesture types match what browsers
+    // recognize as user activation for Web Audio resume(). Idempotent;
+    // remains live until _audioListenerCleanup tears it down.
+    document.addEventListener('pointerdown', _audioListenerResumeGestureHandler, true);
+    document.addEventListener('keydown', _audioListenerResumeGestureHandler, true);
+    document.addEventListener('touchstart', _audioListenerResumeGestureHandler, true);
+}
+
+function _audioListenerUninstallResumeGesture() {
+    if (!_audioListenerResumeGestureHandler) return;
+    document.removeEventListener('pointerdown', _audioListenerResumeGestureHandler, true);
+    document.removeEventListener('keydown', _audioListenerResumeGestureHandler, true);
+    document.removeEventListener('touchstart', _audioListenerResumeGestureHandler, true);
+    _audioListenerResumeGestureHandler = null;
+}
+
+function _audioListenerMaybeResumeContext() {
+    const ctx = _audioListenerCtx;
+    if (!ctx || ctx.state !== 'suspended' || typeof ctx.resume !== 'function') return;
+    // Suppress unhandled-rejection noise on browsers where resume()
+    // requires a user gesture and the current call site isn't one
+    // (we'll get another chance on the next chart play).
+    try {
+        const p = ctx.resume();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch (e) { /* */ }
+}
+
+function _audioListenerHandleDecodedAudio(audioData, wrapper) {
+    try {
+        const ctx = _audioListenerCtx;
+        if (!ctx) return;
+        // AudioContext is suspended (autoplay-restricted browsers,
+        // notably Safari/iOS and some Chrome cases without a user
+        // gesture). ctx.currentTime is effectively frozen, so any
+        // schedule we'd compute would either play out of sync once
+        // resume() lands or never become audible. Drop instead;
+        // _audioListenerMaybeResumeContext() will pick the context
+        // back up on the next user-gesture transport interaction,
+        // and subsequent frames will schedule normally.
+        if (ctx.state !== 'running') {
+            _audioRxRecordDrop('context_suspended');
+            return;
+        }
+        // Epoch gate: if chart-time has been invalidated (chart pause /
+        // seek / song change / 4408 / cleanup) since this wrapper was
+        // created, its pending metadata refers to a chart timeline
+        // that's no longer in effect — drop instead of scheduling stale
+        // audio against the new timeline. This is the path that catches
+        // late outputs from a still-flushing decoder after broadcast_stop.
+        if (wrapper.epoch !== _audioListenerEpoch) return;
+        const meta = wrapper.pending.get(audioData.timestamp);
+        wrapper.pending.delete(audioData.timestamp);
+        if (!meta) return; // stale or torn down
+
+        const numFrames = audioData.numberOfFrames;
+        const channels = audioData.numberOfChannels || 1;
+        if (numFrames <= 0) return;
+
+        const buffer = ctx.createBuffer(channels, numFrames, audioData.sampleRate || SMAU_V1_SAMPLE_RATE);
+        for (let ch = 0; ch < channels; ch++) {
+            const out = buffer.getChannelData(ch);
+            audioData.copyTo(out, { planeIndex: ch, format: 'f32-planar' });
+        }
+
+        const audio = document.getElementById('audio');
+        if (!audio || audio.paused) {
+            // Listener is paused or has no chart audio yet. Drop the
+            // decoded interval — it'd schedule into the past once
+            // playback resumes anyway, and the chart pause hook will
+            // walk pending sources next.
+            _audioRxRecordDrop('listener_paused');
+            return;
+        }
+        // Effective-speed re-check — see _audioListenerHandleFrame for
+        // why we use audio.playbackRate with 0.01 tolerance (covers
+        // drift correction, rejects user-set non-1x speed).
+        const speed = audio.playbackRate || 1.0;
+        if (Math.abs(speed - 1.0) > 0.01) {
+            // v1 limitation: peer audio assumes both ends at 1.0x.
+            _audioRxRecordDrop('listener_speed');
+            return;
+        }
+
+        const targetChart = meta.chartTimeStart + (meta.chartTimeEnd - meta.chartTimeStart);
+        const chartNow = audio.currentTime;
+        const deltaSec = targetChart - chartNow;
+        if (deltaSec < -LATE_FRAME_GRACE_SEC) {
+            _audioRxFramesLate++;
+            return;
+        }
+
+        const startAt = ctx.currentTime + Math.max(0, deltaSec);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(_audioListenerGain);
+        source.onended = () => { _audioListenerScheduledSources.delete(source); };
+        _audioListenerScheduledSources.add(source);
+        try {
+            source.start(startAt);
+            _audioRxFramesScheduled++;
+        } catch (e) {
+            _audioListenerScheduledSources.delete(source);
+        }
+    } finally {
+        // AudioData is a transferable owning a chunk of decoder memory; close
+        // it on every output to release that backing store.
+        try { audioData.close(); } catch (e) { /* */ }
+    }
+}
+
+function _audioListenerOnDecoderError(err, wrapper) {
+    // Decoder errors usually mean the configuration didn't match the
+    // stream. Tear the pipeline down so the next inbound frame
+    // rebuilds it cleanly — but ONLY if the error came from the
+    // currently-live decoder. _audioListenerFlushAndCloseDecoder()
+    // leaves an old decoder draining asynchronously while a fresh
+    // replacement may already be live; a late error from the drained
+    // decoder must not kill the replacement.
+    console.error('[MP] AudioDecoder error:', err);
+    _audioRxRecordDrop('decoder_error');
+    if (_audioListenerActiveDecoder === wrapper) {
+        _audioListenerTeardownDecoder();
+    }
+}
+
+function _audioListenerEnsureDecoder() {
+    if (_audioListenerActiveDecoder) return _audioListenerActiveDecoder;
+    if (_audioListenerOpusUnsupported) return null;
+    if (!_audioListenerHasWebCodecs()) {
+        _audioListenerWarnOnceMissingWebCodecs();
+        return null;
+    }
+    // Each decoder instance gets its own per-instance pending map and
+    // timestamp counter (see _audioListenerActiveDecoder doc above) so
+    // late output from a flushing-but-not-yet-closed prior decoder can
+    // never collide with timestamps issued by this new one. The epoch
+    // is captured at creation so the output handler can drop late
+    // AudioData if chart-time has since been broken.
+    const wrapper = { dec: null, pending: new Map(), nextTs: 0, epoch: _audioListenerEpoch };
+    let dec = null;
+    try {
+        dec = new AudioDecoder({
+            output: (ad) => _audioListenerHandleDecodedAudio(ad, wrapper),
+            // Capture `wrapper` in the closure so a late error from a
+            // drained-but-not-yet-closed decoder doesn't tear down
+            // a fresh replacement. See _audioListenerOnDecoderError.
+            error: (err) => _audioListenerOnDecoderError(err, wrapper),
+        });
+        // configure() is synchronous and throws NotSupportedError on
+        // browsers that expose AudioDecoder but lack Opus decode (e.g.
+        // partial WebCodecs implementations). Catch here rather than
+        // letting the exception propagate up through every inbound
+        // frame; degrade to the same silent-no-op path as the
+        // no-WebCodecs branch and remember the failure so we don't
+        // re-throw per inbound frame for the rest of the session.
+        dec.configure({
+            codec: 'opus',
+            sampleRate: SMAU_V1_SAMPLE_RATE,
+            numberOfChannels: SMAU_V1_CHANNEL_COUNT,
+        });
+    } catch (err) {
+        if (dec) {
+            try { dec.close(); } catch (e) { /* */ }
+        }
+        _audioListenerOpusUnsupported = true;
+        if (!_audioListenerWebCodecsWarned) {
+            _audioListenerWebCodecsWarned = true;
+            console.warn('[MP] AudioDecoder Opus configure failed; peer audio playback disabled.', err);
+        }
+        return null;
+    }
+    wrapper.dec = dec;
+    _audioListenerActiveDecoder = wrapper;
+    return wrapper;
+}
+
+function _audioListenerStopAllSources() {
+    for (const src of _audioListenerScheduledSources) {
+        try { src.onended = null; src.stop(); } catch (e) { /* */ }
+        try { src.disconnect(); } catch (e) { /* */ }
+    }
+    _audioListenerScheduledSources.clear();
+}
+
+function _audioListenerTeardownDecoder() {
+    // Hard teardown — used when the chart-time mapping is broken
+    // (chart pause / seek / cleanup / 4408 recovery / broadcaster
+    // takeover) so any pending output would schedule into garbage.
+    // Drops in-flight decode work along with the decoder.
+    const wrapper = _audioListenerActiveDecoder;
+    _audioListenerActiveDecoder = null;
+    if (!wrapper) return;
+    if (wrapper.dec) {
+        try { wrapper.dec.close(); } catch (e) { /* */ }
+    }
+    wrapper.pending.clear();
+}
+
+function _audioListenerFlushAndCloseDecoder() {
+    // Graceful drain — used on broadcast_stop / broadcaster_changed-null
+    // so the broadcaster's last-emitted intervals (which may still be
+    // sitting in the AudioDecoder pipeline) get a chance to schedule
+    // before the decoder shuts down. Per-wrapper pending metadata stays
+    // alive in the closure for the output handler to consume during
+    // flush() and is released when the wrapper is garbage-collected
+    // after close().
+    const wrapper = _audioListenerActiveDecoder;
+    if (!wrapper || !wrapper.dec) return;
+    _audioListenerActiveDecoder = null;
+    const dec = wrapper.dec;
+    Promise.resolve()
+        .then(() => dec.flush())
+        .catch(() => { /* drain best-effort; close anyway */ })
+        .finally(() => {
+            try { dec.close(); } catch (e) { /* */ }
+            // wrapper.pending and wrapper.nextTs are local to this
+            // wrapper and become unreachable once dec is closed; they
+            // are NOT touched here. Any new decoder created in the
+            // meantime carries its own independent state.
+        });
+}
+
+function _audioListenerHandleFrame(header, opus) {
+    // Pre-decode short-circuit: if the listener can't play this frame
+    // anyway (chart paused, or non-1.0x effective playback rate), drop
+    // it before paying for the opus copy + decode + AudioBuffer
+    // expansion. The same checks run again post-decode in case state
+    // changes mid-decode (paranoia layer; the common case is the
+    // cheap path).
+    //
+    // Speed gate uses audio.playbackRate (the effective speed) rather
+    // than _room.speed, since mpSetSpeed() updates audio.playbackRate
+    // synchronously while the server-echoed _room.speed lags by one
+    // round trip. The 0.01 tolerance is wider than _onHeartbeat()'s
+    // ±0.002 drift-correction band (so routine sync nudges pass
+    // through) but narrower than any plausible user-set speed
+    // (the slider's smallest non-1x detent is well above 1%).
+    const audio = document.getElementById('audio');
+    if (!audio || audio.paused) {
+        _audioRxRecordDrop('listener_paused');
+        return;
+    }
+    const speed = audio.playbackRate || 1.0;
+    if (Math.abs(speed - 1.0) > 0.01) {
+        _audioRxRecordDrop('listener_speed');
+        return;
+    }
+    // Build the listener pipeline lazily on first valid frame so
+    // listeners-with-no-active-broadcast aren't holding an AudioContext open
+    // (Chrome warns about unused autoplay-blocked contexts; some browsers
+    // also rate-limit how many can exist).
+    const ctx = _audioListenerEnsureContext();
+    if (!ctx) return;
+    const wrapper = _audioListenerEnsureDecoder();
+    if (!wrapper) return;
+
+    const ts = wrapper.nextTs++;
+    wrapper.pending.set(ts, {
+        chartTimeStart: header.chartTimeStart,
+        chartTimeEnd: header.chartTimeEnd,
+        sampleCount: header.sampleCount,
+        intervalIndex: header.intervalIndex,
+    });
+    try {
+        // Copy opus into a fresh ArrayBuffer because EncodedAudioChunk takes
+        // ownership of its buffer view; the original Uint8Array aliases the
+        // WebSocket message and may be reused. (Also detaches in some
+        // implementations once the chunk is queued.)
+        const data = new Uint8Array(opus.byteLength);
+        data.set(opus);
+        const chunk = new EncodedAudioChunk({
+            type: 'key',
+            timestamp: ts,
+            data: data,
+        });
+        wrapper.dec.decode(chunk);
+    } catch (e) {
+        wrapper.pending.delete(ts);
+        _audioRxRecordDrop('decode_call_failed');
+    }
+}
+
+function _audioListenerOnControlSet(broadcasterId, params) {
+    if (!broadcasterId) {
+        _audioListenerOnControlClear();
+        return;
+    }
+    if (_audioListenerBroadcasterId === broadcasterId) {
+        // Re-announcement of the current broadcaster (e.g. duplicate
+        // broadcaster_changed under reconnection); just refresh params.
+        _audioListenerBroadcastParams = params || _audioListenerBroadcastParams;
+        return;
+    }
+    // Switching broadcasters — drop everything from the previous pipeline.
+    // Bumping the epoch invalidates any still-flushing OLD wrapper from a
+    // graceful broadcast_stop that's racing this broadcast_start: without
+    // it, the old broadcaster's tail intervals could schedule after the
+    // new broadcaster has been announced. The graceful stop→drain path
+    // only matters when no new broadcaster takes over, so bumping here
+    // doesn't cost the broadcast-tail behavior.
+    _audioListenerEpoch++;
+    _audioListenerStopAllSources();
+    _audioListenerTeardownDecoder();
+    _audioListenerBroadcasterId = broadcasterId;
+    _audioListenerBroadcastParams = params || null;
+    // The pipeline (decoder, source nodes) is rebuilt lazily on first
+    // valid frame in _audioListenerHandleFrame. AudioContext is reused.
+}
+
+function _audioListenerOnControlClear() {
+    if (_audioListenerBroadcasterId === null) return;
+    // PROTOCOL.md "Lifecycle §5 Stop": broadcast end is graceful —
+    // flush() the active decoder so any opus packets we already handed
+    // off but haven't yet received as AudioData reach the output
+    // handler and get scheduled. Sources already on the AudioContext
+    // clock self-remove via onended. v1 limitation: late SMAU frames
+    // arriving over /audio AFTER 'broadcaster_changed: null' on the
+    // highway WS are dropped with reason 'no_broadcaster' (since the
+    // two endpoints are unordered relative to each other and we can't
+    // safely accept "unannounced" frames without misattributing a new
+    // broadcaster's first frames as the previous broadcaster's tail).
+    // The most common case — decoder-internal latency from the last
+    // already-fed interval — is handled by flush().
+    _audioListenerFlushAndCloseDecoder();
+    _audioListenerBroadcasterId = null;
+    _audioListenerBroadcastParams = null;
+}
+
+function _audioListenerOnChartPause() {
+    // Listener paused / seeked. Anything already scheduled on the
+    // AudioContext clock would now play out of sync with the new chart
+    // position; drop it. The active decoder's pending map is cleared
+    // along with the decoder via _audioListenerTeardownDecoder — a
+    // fresh decoder is built lazily on the next valid frame after
+    // chart playback resumes. Bumping the epoch ensures any output
+    // from a still-flushing OLD wrapper (from a previous broadcast_stop)
+    // also drops, since their captured epoch is now stale.
+    _audioListenerEpoch++;
+    _audioListenerStopAllSources();
+    _audioListenerTeardownDecoder();
+}
+
+function _audioListenerCleanup() {
+    // Full teardown — the listener is leaving the room. Unlike a normal
+    // broadcast stop, we're tearing the AudioContext itself down, so
+    // scheduled sources can't drain. Stop them explicitly. Bumping the
+    // epoch invalidates any still-flushing OLD wrappers' outputs.
+    _audioListenerEpoch++;
+    _audioListenerUninstallResumeGesture();
+    _audioListenerStopAllSources();
+    _audioListenerTeardownDecoder();
+    _audioListenerBroadcasterId = null;
+    _audioListenerBroadcastParams = null;
+    if (_audioListenerGain) {
+        try { _audioListenerGain.disconnect(); } catch (e) { /* */ }
+        _audioListenerGain = null;
+    }
+    if (_audioListenerCtx) {
+        try { _audioListenerCtx.close(); } catch (e) { /* */ }
+        _audioListenerCtx = null;
+    }
+    // Reset sticky decoder-support state so a future room-join in the
+    // same tab can re-test (the user may have updated the browser, or
+    // the previous failure may have been a transient resource limit).
+    _audioListenerOpusUnsupported = false;
+    _audioListenerWebCodecsWarned = false;
+    // No global decode-timestamp counter to reset: each decoder wrapper
+    // owns its own counter + pending map. Late output from a flushing
+    // old wrapper that survives this cleanup will see _audioListenerCtx
+    // null and early-return without scheduling.
+    _audioRxFramesLate = 0;
+    _audioRxFramesScheduled = 0;
 }
 
 function _mintSessionId() {
@@ -235,6 +722,26 @@ function _onSessionEnded() {
     // so getAudioRxStats() doesn't carry the previous session's frames
     // into the replacement session.
     _audioRxResetStats();
+    // The listener pipeline is also per-session in the same sense: the
+    // server will re-announce broadcaster_id on the new highway WS's
+    // `connected` snapshot so we'd rebuild it cleanly anyway, but old
+    // scheduled sources would otherwise keep firing against stale
+    // chart-time math during the brief reconnect window. We additionally
+    // need to clear _audioListenerBroadcasterId itself: if the audio WS
+    // reattaches BEFORE the highway `connected` snapshot arrives,
+    // inbound frames would otherwise be accepted and scheduled against
+    // stale control-plane state (the broadcast may have stopped, or the
+    // broadcaster may have changed, while we were disconnected).
+    // Stop sources hard rather than draining — the chart-time mapping
+    // is broken until the new `connected` arrives. Bump the epoch so
+    // any still-flushing OLD wrapper from a prior broadcast_stop also
+    // invalidates (matches the chart-time-breaking pattern in
+    // _audioListenerOnChartPause / _audioListenerCleanup).
+    _audioListenerEpoch++;
+    _audioListenerStopAllSources();
+    _audioListenerTeardownDecoder();
+    _audioListenerBroadcasterId = null;
+    _audioListenerBroadcastParams = null;
 }
 
 function _maybeClearResetMarker() {
@@ -368,6 +875,7 @@ function _cleanup() {
     _stopRecording();
     _stopHeartbeat();
     _restorePlaybackControls();
+    _audioListenerCleanup();
     // Set _intentionalClose BEFORE closing either socket so neither close
     // handler triggers a reconnect during teardown.
     _intentionalClose = true;
@@ -597,20 +1105,36 @@ function _connectAudioWs() {
             _audioRxRecordDrop('non_binary');
             return;
         }
-        // Phase 2b: parse + validate the 40-byte SMAU header and bind the
-        // opus payload as a Uint8Array view into the source buffer (no
-        // copy on the hot path). Phase 2c will plug an AudioDecoder +
-        // AudioBufferSourceNode scheduling pipeline into the success
-        // branch; for now we account valid frames and drop reasons so a
-        // misbehaving broadcaster has a visible signal during dev/testing.
+        // Parse + validate the 40-byte SMAU header (Phase 2b) and route
+        // valid frames into the WebCodecs decode + scheduled-playback
+        // pipeline (Phase 2c). Frames whose broadcaster_id doesn't match
+        // the control-plane's announced broadcaster are also dropped here
+        // — the server's single-broadcaster gate normally catches this
+        // but the receiver double-checks since fan-out is byte-for-byte
+        // and the wire format does not name the broadcaster (broadcaster
+        // identity comes from the highway WS).
         const result = _smauDecodeFrame(ev.data);
         if (!result.ok) {
             _audioRxRecordDrop(result.reason);
             return;
         }
+        if (!_audioListenerBroadcasterId) {
+            // No active broadcaster announced (or it's the local player).
+            // Drop pre-announce / post-tear-down frames so they don't get
+            // scheduled with stale chart-time metadata. v1 limitation
+            // (codex multi-round): we deliberately do NOT keep a drain
+            // grace window here because the highway WS and /audio WS
+            // are unordered — accepting frames during a drain window
+            // can misattribute a new broadcaster's first frame as the
+            // previous broadcaster's tail. The flushAndClose path
+            // already drains decoder-internal pending opus, which
+            // handles the common case where the decoder has unflushed
+            // work for an already-fed-but-not-yet-output interval.
+            _audioRxRecordDrop('no_broadcaster');
+            return;
+        }
         _audioRxFramesValid++;
-        // No-op success branch; Phase 2c will route result.opus +
-        // result.header into the listener pipeline.
+        _audioListenerHandleFrame(result.header, result.opus);
     };
 
     ws.onclose = (ev) => {
@@ -691,6 +1215,14 @@ function _handleMessage(msg) {
             _renderQueue();
             _updateControls();
             _doClockSync();
+            // PROTOCOL.md "Lifecycle §4 Listen": late joiners see an active
+            // broadcast via the connected snapshot's broadcaster_id; treat
+            // it equivalently to a fresh broadcaster_changed event.
+            if (_room && _room.broadcaster_id && _room.broadcaster_id !== _playerId) {
+                _audioListenerOnControlSet(_room.broadcaster_id, _room.broadcast_params || null);
+            } else {
+                _audioListenerOnControlClear();
+            }
             // Highway side of the recovery is confirmed. _maybeClearResetMarker
             // only clears the dedupe marker once the audio side has ALSO
             // reattached — see _resetMarker comment for the race this guards.
@@ -783,6 +1315,11 @@ function _handleMessage(msg) {
                 _room.time = 0;
                 _renderQueue();
                 _updateNowPlaying();
+                // Chart timeline just changed under any in-flight peer-audio
+                // schedule. Drop it so already-queued sources don't keep
+                // playing on top of the new song; a `playback_state` update
+                // will start the new schedule once the new song is loaded.
+                _audioListenerOnChartPause();
                 // Host already called _loadSong in mpLoadSong — skip to avoid double-load
                 if (!_isHost && msg.queue_item) _loadSong(msg.queue_item);
             }
@@ -794,6 +1331,8 @@ function _handleMessage(msg) {
                 _room.state = 'stopped';
                 _renderQueue();
                 _updateNowPlaying();
+                // Chart timeline ended. Same reasoning as song_changed.
+                _audioListenerOnChartPause();
             }
             break;
 
@@ -824,6 +1363,30 @@ function _handleMessage(msg) {
             _cleanup();
             _showLobbyView();
             _showError('Room was closed');
+            break;
+
+        case 'broadcaster_changed':
+            // PROTOCOL.md "Audio control messages — broadcast_start" /
+            // "broadcast_stop": single source of truth for who (if anyone)
+            // is broadcasting in this room. Mirror the room state so a
+            // subsequent reconnect's `connected` snapshot stays in sync,
+            // and route to the listener pipeline. v1: hosts don't listen
+            // to themselves — the broadcaster_id check skips self-loop.
+            if (_room) {
+                _room.broadcaster_id = msg.broadcaster_id || null;
+                _room.broadcast_params = msg.broadcaster_id ? {
+                    interval_beats: msg.interval_beats,
+                    sample_rate: msg.sample_rate,
+                    channel_count: msg.channel_count,
+                    codec: msg.codec,
+                    bitrate: msg.bitrate,
+                } : null;
+            }
+            if (msg.broadcaster_id && msg.broadcaster_id !== _playerId) {
+                _audioListenerOnControlSet(msg.broadcaster_id, _room ? _room.broadcast_params : null);
+            } else {
+                _audioListenerOnControlClear();
+            }
             break;
 
         case 'error':
@@ -904,6 +1467,15 @@ function _onPlaybackState(msg) {
     if (!audio) return;
 
     if (msg.state === 'playing') {
+        // Any in-flight peer-audio scheduling was anchored against the
+        // PREVIOUS chart position; a hard seek invalidates it. Drop the
+        // schedule and let new frames rebuild it organically.
+        _audioListenerOnChartPause();
+        // The same play→audio.play() call site is the user-gesture
+        // window where a previously-suspended listener AudioContext
+        // can resume. Best-effort; no-op if the context is already
+        // running or doesn't yet exist.
+        _audioListenerMaybeResumeContext();
         audio.currentTime = msg.time;
         audio.playbackRate = msg.speed || 1.0;
         audio.play().catch(() => {});
@@ -914,6 +1486,9 @@ function _onPlaybackState(msg) {
         if (mpBtn) mpBtn.textContent = 'Pause';
         _startRecordingNow();
     } else if (msg.state === 'paused') {
+        // Listener paused — schedule must be cleared, future frames will
+        // be dropped with reason 'listener_paused' until play resumes.
+        _audioListenerOnChartPause();
         audio.currentTime = msg.time;
         audio.pause();
         if (typeof isPlaying !== 'undefined') isPlaying = false;
@@ -939,7 +1514,9 @@ function _onHeartbeat(msg) {
     const absDrift = Math.abs(drift);
 
     if (absDrift > 0.5) {
-        // Hard seek
+        // Hard seek — drop scheduled peer audio so it doesn't play out of
+        // sync with the new chart position.
+        _audioListenerOnChartPause();
         audio.currentTime = msg.time;
         if (typeof highway !== 'undefined') highway.setTime(msg.time);
     } else if (absDrift > 0.05) {
@@ -1049,6 +1626,12 @@ function mpTogglePlay() {
     if (!audio || !_ws || !_isHost) return;
 
     if (audio.paused) {
+        // Mirror non-host transport hooks: a host listening to another
+        // player's broadcast also has scheduled peer audio anchored to
+        // the chart timeline, and the host's own play/pause never goes
+        // through _onPlaybackState.
+        _audioListenerOnChartPause();
+        _audioListenerMaybeResumeContext();
         audio.play().catch(() => {});
         if (typeof isPlaying !== 'undefined') isPlaying = true;
         _ws.send(JSON.stringify({
@@ -1062,6 +1645,7 @@ function mpTogglePlay() {
         if (mainBtn) mainBtn.textContent = '\u23F8 Pause';
         _startRecordingNow();
     } else {
+        _audioListenerOnChartPause();
         audio.pause();
         if (typeof isPlaying !== 'undefined') isPlaying = false;
         _ws.send(JSON.stringify({
@@ -1079,6 +1663,9 @@ window.mpTogglePlay = mpTogglePlay;
 function mpSeek(delta) {
     const audio = document.getElementById('audio');
     if (!audio || !_ws || !_isHost) return;
+    // Hard seek invalidates any peer-audio schedule that was anchored
+    // against the previous chart position.
+    _audioListenerOnChartPause();
     audio.currentTime = Math.max(0, audio.currentTime + delta);
     _ws.send(JSON.stringify({
         type: 'seek',
@@ -1091,6 +1678,12 @@ function mpSetSpeed(val) {
     const audio = document.getElementById('audio');
     if (!audio || !_ws || !_isHost) return;
     const speed = parseFloat(val) / 100;
+    // Speed change to non-1.0x invalidates any in-flight peer-audio
+    // schedule (we don't time-stretch in v1; future frames will be
+    // dropped via the listener_speed gate until speed returns to 1.0).
+    if (Math.abs(speed - 1.0) > 0.01) {
+        _audioListenerOnChartPause();
+    }
     audio.playbackRate = speed;
     _ws.send(JSON.stringify({
         type: 'set_speed',
@@ -2065,6 +2658,16 @@ window.mpMixerExport = async function () {
 
 window.slopsmithMultiplayerDebug = {
     getAudioRxStats: _audioGetRxStats,
+    getListenerState: () => ({
+        broadcasterId: _audioListenerBroadcasterId,
+        params: _audioListenerBroadcastParams,
+        scheduledCount: _audioListenerScheduledSources.size,
+        pendingDecodeCount: _audioListenerActiveDecoder
+            ? _audioListenerActiveDecoder.pending.size
+            : 0,
+        hasContext: _audioListenerCtx !== null,
+        hasDecoder: _audioListenerActiveDecoder !== null,
+    }),
 };
 
 // ── Screen show/hide hook ──────────────────────────────────────────────
