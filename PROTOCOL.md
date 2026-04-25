@@ -57,6 +57,13 @@ async def audio_ws(websocket: WebSocket, code: str, player_id: str = ""):
     # ... normal session ...
 ```
 
+**Implementation note (client side).** A direct consequence of accept-then-close is that **the audio WS `open` event is NOT proof that authentication succeeded.** A rejected socket fires `open` first and only then `close` with code `4401`. Clients MUST therefore wait for one of:
+
+- a successful first message exchange (e.g. starting to receive binary frames after the broadcaster begins streaming, or completing an application-level handshake), OR
+- a short post-`open` grace window (e.g. 250 ms) with no `close` event,
+
+before treating the audio WS as "ready" — for example, before enabling broadcast UI or starting a send loop. Treating `open` alone as "auth succeeded" will mis-handle rejected connections.
+
 ---
 
 ## Audio control messages (Highway WS)
