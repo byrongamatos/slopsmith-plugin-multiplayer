@@ -1607,9 +1607,19 @@ def setup(app, context):
                     # Bad magic or version mismatch: drop, keep connection.
                     continue
 
-                # Verdict "ok": fan out byte-for-byte to every other audio
-                # subscriber in the same room. The Opus payload is never
-                # touched — only header validation happened above.
+                # Single-broadcaster gate (PROTOCOL.md "v1 enforces a single
+                # broadcaster per room"). The control plane published an
+                # active broadcaster_id via broadcast_start; the data plane
+                # MUST drop frames from anyone else, otherwise a listener
+                # or buggy client could inject audio that peers play even
+                # though no broadcast_start was accepted for them.
+                if room.get("broadcaster_id") != player_id:
+                    continue
+
+                # Verdict "ok" + sender is the active broadcaster: fan out
+                # byte-for-byte to every other audio subscriber in the same
+                # room. The Opus payload is never touched — only header
+                # validation happened above.
                 #
                 # Each peer has its own bounded send queue drained by a single
                 # worker bound to that peer's audio_ws. _enqueue_audio_frame
@@ -1722,6 +1732,8 @@ def setup(app, context):
         elif msg_type == "broadcast_start":
             current = room.get("broadcaster_id")
             ws = room["players"][player_id].get("ws")
+            sender_session = room.get("sessions", {}).get(player_id)
+            sender_audio_ws = sender_session.get("audio_ws") if sender_session else None
             if current is not None and current != player_id:
                 # v1: single broadcaster per room. Reject the new attempt.
                 if ws is not None:
@@ -1729,6 +1741,21 @@ def setup(app, context):
                         await ws.send_json({
                             "type": "error",
                             "message": "broadcaster_busy",
+                        })
+                    except Exception:
+                        pass
+            elif sender_audio_ws is None:
+                # PROTOCOL.md "Implementation note (client side)": the host
+                # MUST NOT issue broadcast_start before /audio is attached.
+                # If the audio WS was rejected with 4401 or simply not opened
+                # yet, accepting the broadcast would have peers waiting for
+                # frames that can never arrive. Reject with audio_ws_not_open
+                # so the client can retry after opening /audio.
+                if ws is not None:
+                    try:
+                        await ws.send_json({
+                            "type": "error",
+                            "message": "audio_ws_not_open",
                         })
                     except Exception:
                         pass

@@ -43,6 +43,13 @@ def _highway_url(code, player_id, session_id):
     )
 
 
+def _audio_url(code, player_id, session_id):
+    return (
+        f"/ws/plugins/multiplayer/{code}/audio"
+        f"?player_id={player_id}&session_id={session_id}"
+    )
+
+
 _VALID_PARAMS = {
     "interval_beats": 4,
     "sample_rate": 48000,
@@ -72,7 +79,8 @@ def test_broadcast_start_emits_broadcaster_changed_to_peers(client, routes_modul
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
          client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
         host_hw.receive_json()  # 'connected'
         bob_hw.receive_json()
@@ -109,7 +117,8 @@ def test_broadcaster_id_surfaced_to_late_joiner_in_connected_snapshot(client):
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw:
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw:
         host_hw.receive_json()  # 'connected'
         host_hw.send_json({"type": "broadcast_start", **_VALID_PARAMS})
         host_hw.receive_json()  # broadcaster_changed
@@ -131,7 +140,9 @@ def test_second_broadcaster_rejected_with_broadcaster_busy(client, routes_module
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
          client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
         host_hw.receive_json()
         bob_hw.receive_json()
@@ -157,7 +168,8 @@ def test_active_broadcaster_can_re_send_broadcast_start(client, routes_module):
     DIFFERENT player_id triggers broadcaster_busy."""
     code, host_pid = _create_room(client)
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw:
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw:
         host_hw.receive_json()
         host_hw.send_json({"type": "broadcast_start", **_VALID_PARAMS})
         host_hw.receive_json()  # broadcaster_changed
@@ -169,6 +181,23 @@ def test_active_broadcaster_can_re_send_broadcast_start(client, routes_module):
         assert evt["broadcaster_id"] == host_pid
         assert evt["bitrate"] == 64000
         assert routes_module._rooms[code]["broadcast_params"]["bitrate"] == 64000
+
+
+# ── audio_ws_not_open rejection ───────────────────────────────────────────
+
+def test_broadcast_start_rejected_when_audio_ws_not_open(client, routes_module):
+    """Codex round 1 P1 (Phase 1c): broadcast_start MUST be rejected with
+    audio_ws_not_open if the host's session has no live /audio socket.
+    Otherwise peers (and late joiners) would see an active broadcaster
+    even though no audio frames can ever arrive."""
+    code, host_pid = _create_room(client)
+    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw:
+        host_hw.receive_json()  # 'connected'
+        # Audio NOT opened. broadcast_start must reject.
+        host_hw.send_json({"type": "broadcast_start", **_VALID_PARAMS})
+        evt = _drain_until(host_hw, lambda m: m.get("type") == "error")
+        assert evt["message"] == "audio_ws_not_open"
+        assert routes_module._rooms[code]["broadcaster_id"] is None
 
 
 # ── broadcast_start invalid params ────────────────────────────────────────
@@ -187,7 +216,8 @@ def test_broadcast_start_with_invalid_params_returns_error(
     client, routes_module, bad_overrides, expected_field,
 ):
     code, host_pid = _create_room(client)
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw:
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw:
         host_hw.receive_json()
         params = {**_VALID_PARAMS, **bad_overrides}
         host_hw.send_json({"type": "broadcast_start", **params})
@@ -204,7 +234,8 @@ def test_broadcaster_can_stop_their_own_broadcast(client, routes_module):
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
          client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
         host_hw.receive_json()
         bob_hw.receive_json()
@@ -225,7 +256,8 @@ def test_broadcast_stop_from_non_broadcaster_is_silently_ignored(client, routes_
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
          client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
         host_hw.receive_json()
         bob_hw.receive_json()
@@ -254,7 +286,8 @@ def test_audio_quality_forwarded_only_to_broadcaster(client):
     bob_pid = _join_room(client, code, "Bob")
     carol_pid = _join_room(client, code, "Carol")
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
          client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw, \
          client.websocket_connect(_highway_url(code, carol_pid, "carol-sid")) as carol_hw:
         host_hw.receive_json()
@@ -297,7 +330,8 @@ def test_audio_quality_with_stale_broadcaster_id_dropped(client):
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
          client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
         host_hw.receive_json()
         bob_hw.receive_json()
@@ -327,7 +361,8 @@ def test_broadcast_ends_on_grace_expiry(client, routes_module, fast_grace):
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
          client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
         host_hw.receive_json()
         bob_hw.receive_json()
@@ -352,7 +387,8 @@ def test_broadcast_ends_on_leave_room(client, routes_module):
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
          client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
         host_hw.receive_json()
         bob_hw.receive_json()
@@ -378,7 +414,8 @@ def test_broadcast_ends_on_takeover_by_different_session(client, routes_module):
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
-    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw, \
          client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
         host_hw.receive_json()
         bob_hw.receive_json()

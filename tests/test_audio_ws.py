@@ -54,6 +54,28 @@ def _highway_url(code, player_id, session_id):
     return f"/ws/plugins/multiplayer/{code}?player_id={player_id}&session_id={session_id}"
 
 
+def _force_broadcaster(routes_module, code, player_id):
+    """Set room["broadcaster_id"] directly without going through the
+    full broadcast_start handshake.
+
+    Most tests in this file exercise the audio data plane (header
+    validation, fan-out, queue overflow, lifecycle) in isolation from
+    the control-plane handshake covered in test_broadcast_control.py.
+    Phase 1c gates fan-out on `room["broadcaster_id"] == sender_pid`,
+    so without this helper every relay-side test would silently drop
+    its frames. Tests that DO want to exercise the handshake should
+    not use this helper — they're in test_broadcast_control.py.
+    """
+    routes_module._rooms[code]["broadcaster_id"] = player_id
+    routes_module._rooms[code]["broadcast_params"] = {
+        "interval_beats": 4,
+        "sample_rate": 48000,
+        "channel_count": 1,
+        "codec": "opus",
+        "bitrate": 96000,
+    }
+
+
 def _build_audio_frame(opus_payload: bytes, *, magic=_MAGIC, version=_VERSION,
                        interval_index=1, chart_time_start=0.0,
                        chart_time_end=2.0, sample_count=None,
@@ -141,9 +163,10 @@ def test_audio_ws_valid_session_id_accepts(client, routes_module):
 
 # ── Binary fan-out ────────────────────────────────────────────────────────
 
-def test_binary_frame_forwarded_byte_identical_to_other_peer(client):
+def test_binary_frame_forwarded_byte_identical_to_other_peer(client, routes_module):
     code, host_pid = _create_room(client)
     other_pid = _join_room(client, code, "Bob")
+    _force_broadcaster(routes_module, code, host_pid)
 
     # Host opens audio WS, listener opens audio WS.
     with client.websocket_connect(_audio_url(code, host_pid, "host-sid")) as host_audio, \
@@ -157,12 +180,15 @@ def test_binary_frame_forwarded_byte_identical_to_other_peer(client):
         assert received == frame, "Listener must receive the host's frame byte-identical"
 
 
-def test_sender_does_not_receive_own_frame(client):
+def test_sender_does_not_receive_own_frame(client, routes_module):
     """Verify the relay never echoes a frame back to its sender. Uses a second
     player as a canary: if the sender were getting echoes, their FIRST inbound
     frame after sending frame_X would be frame_X. We instead expect frame_Y
     (sent by the other player AFTER) — proving sender's queue is empty until
-    the other player speaks."""
+    the other player speaks. NOTE: in this isolated relay test, both host
+    AND bob are forced as the active broadcaster sequentially, since the
+    Phase 1c single-broadcaster gate only allows the active broadcaster's
+    frames through (test_broadcast_control covers the spec-correct flow)."""
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
@@ -172,14 +198,15 @@ def test_sender_does_not_receive_own_frame(client):
         frame_x = _build_audio_frame(b"\xAA" * 16, interval_index=1)
         frame_y = _build_audio_frame(b"\xBB" * 16, interval_index=2)
 
+        # Phase 1: host is the broadcaster. Send frame_x → bob receives.
+        _force_broadcaster(routes_module, code, host_pid)
         host_audio.send_bytes(frame_x)
-        # Bob receives X — confirms the relay delivered it forward.
         assert bob_audio.receive_bytes() == frame_x
 
-        # Now Bob sends frame_y. If host were also receiving its own echoes,
-        # host's queue would already contain frame_x and that would be the
-        # FIRST receive. The assertion that the FIRST receive is frame_y
-        # therefore proves no echo of X reached host.
+        # Phase 2: bob takes over as broadcaster. Send frame_y → host
+        # receives. If host had been getting echoes earlier, host's queue
+        # would already contain frame_x and that would be the FIRST receive.
+        _force_broadcaster(routes_module, code, bob_pid)
         bob_audio.send_bytes(frame_y)
         first_received_by_host = host_audio.receive_bytes()
         assert first_received_by_host == frame_y, (
@@ -305,6 +332,7 @@ def test_host_read_loop_alive_under_load(client, routes_module):
     with a TimeoutError instead of hanging the entire pytest run."""
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
+    _force_broadcaster(routes_module, code, host_pid)
 
     with client.websocket_connect(_audio_url(code, host_pid, "host-sid")) as host_audio, \
          client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")) as bob_audio:
@@ -335,10 +363,46 @@ def test_host_read_loop_alive_under_load(client, routes_module):
         )
 
 
-def test_two_listeners_both_receive_host_frame(client):
+def test_non_broadcaster_audio_frames_are_dropped(client, routes_module):
+    """Codex round 1 P2 (Phase 1c): the audio data plane MUST drop frames
+    from any sender other than the active broadcaster. Without this
+    enforcement a listener or buggy client could inject audio that other
+    peers play, even though no broadcast_start was accepted for them."""
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
     carol_pid = _join_room(client, code, "Carol")
+    # Host is the active broadcaster.
+    _force_broadcaster(routes_module, code, host_pid)
+
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")) as host_audio, \
+         client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")) as bob_audio, \
+         client.websocket_connect(_audio_url(code, carol_pid, "carol-sid")) as carol_audio:
+
+        # Bob (NOT the broadcaster) sends an otherwise-valid SMAU frame.
+        # Server must drop it — neither host nor carol should receive.
+        rogue = _build_audio_frame(b"ROGUE!", interval_index=1)
+        bob_audio.send_bytes(rogue)
+
+        # Now host (the active broadcaster) sends a legit frame. We use it
+        # as a deterministic terminator: host's frame MUST reach both
+        # listeners, and it MUST be the FIRST audio they see (no rogue
+        # frame ahead of it).
+        legit = _build_audio_frame(b"LEGIT!", interval_index=2)
+        host_audio.send_bytes(legit)
+
+        first_carol = carol_audio.receive_bytes()
+        assert first_carol == legit, (
+            "Carol's first audio frame must be the broadcaster's legit "
+            "frame, not bob's dropped rogue frame"
+        )
+        # Host doesn't receive their own frame (no echo).
+
+
+def test_two_listeners_both_receive_host_frame(client, routes_module):
+    code, host_pid = _create_room(client)
+    bob_pid = _join_room(client, code, "Bob")
+    carol_pid = _join_room(client, code, "Carol")
+    _force_broadcaster(routes_module, code, host_pid)
 
     with client.websocket_connect(_audio_url(code, host_pid, "host")) as host_audio, \
          client.websocket_connect(_audio_url(code, bob_pid, "bob")) as bob_audio, \
@@ -389,9 +453,10 @@ def test_header_body_mismatch_closes_with_1009(client):
         assert excinfo.value.code == 1009
 
 
-def test_bad_magic_dropped_silently(client):
+def test_bad_magic_dropped_silently(client, routes_module):
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
+    _force_broadcaster(routes_module, code, host_pid)
 
     with client.websocket_connect(_audio_url(code, host_pid, "host")) as host_audio, \
          client.websocket_connect(_audio_url(code, bob_pid, "bob")) as bob_audio:
@@ -407,9 +472,10 @@ def test_bad_magic_dropped_silently(client):
         assert received == good
 
 
-def test_bad_version_dropped_silently(client):
+def test_bad_version_dropped_silently(client, routes_module):
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
+    _force_broadcaster(routes_module, code, host_pid)
 
     with client.websocket_connect(_audio_url(code, host_pid, "host")) as host_audio, \
          client.websocket_connect(_audio_url(code, bob_pid, "bob")) as bob_audio:
@@ -424,9 +490,10 @@ def test_bad_version_dropped_silently(client):
         assert received == good
 
 
-def test_non_binary_frame_dropped_silently(client):
+def test_non_binary_frame_dropped_silently(client, routes_module):
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
+    _force_broadcaster(routes_module, code, host_pid)
 
     with client.websocket_connect(_audio_url(code, host_pid, "host")) as host_audio, \
          client.websocket_connect(_audio_url(code, bob_pid, "bob")) as bob_audio:
