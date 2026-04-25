@@ -101,12 +101,21 @@ function _saveSettings() {
     }));
 }
 
+let _lobbyErrorTimer = null;
 function _showError(msg) {
     const el = document.getElementById('mp-lobby-error');
     if (el) {
+        // Cancel any pending hide-timer from a prior error so the new message
+        // gets a fresh 5-second window (otherwise an older error's timer can
+        // hide a new message early — e.g. a takeover notice arriving moments
+        // after a failed join attempt).
+        if (_lobbyErrorTimer !== null) clearTimeout(_lobbyErrorTimer);
         el.textContent = msg;
         el.classList.remove('hidden');
-        setTimeout(() => el.classList.add('hidden'), 5000);
+        _lobbyErrorTimer = setTimeout(() => {
+            el.classList.add('hidden');
+            _lobbyErrorTimer = null;
+        }, 5000);
     }
 }
 
@@ -217,6 +226,14 @@ function _showLobbyView() {
     const lobby = document.getElementById('mp-lobby-view');
     const room = document.getElementById('mp-room-view');
     const mixer = document.getElementById('mp-mixer-view');
+    // If the mixer was open and previewing, stop the preview before hiding it —
+    // otherwise AudioBufferSourceNodes keep playing with no UI to stop them.
+    // _mixerStop is a no-op if no preview is active. Wrapped in a try guard so
+    // that early lobby renders (before the mixer module is wired up) can't
+    // throw and leave the lobby unrendered.
+    if (mixer && !mixer.classList.contains('hidden')) {
+        try { _mixerStop(); } catch (e) { /* ignore */ }
+    }
     if (lobby) lobby.classList.remove('hidden');
     if (room) room.classList.add('hidden');
     if (mixer) mixer.classList.add('hidden');
