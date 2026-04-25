@@ -399,18 +399,20 @@ async def _cleanup_audio_worker(sess):
         await worker
     except asyncio.CancelledError:
         if not worker.cancelled():
-            # Our caller was cancelled, not the worker we cancelled. The
-            # session may keep going (e.g. _grace_then_finalize_endpoint
-            # was cancelled by a same-session reconnect after we'd already
-            # torn down the live audio worker). If the audio_ws is still
-            # alive, install a fresh worker so audio relay isn't silently
-            # broken until /audio reconnects, then re-raise so cancellation
-            # semantics aren't broken.
-            if (
-                sess.get("audio_ws") is not None
-                and sess.get("audio_send_worker") is worker
-            ):
-                _setup_audio_worker(sess)
+            # Our caller was cancelled, not the worker we cancelled. We MUST
+            # NOT restart the worker here even if audio_ws is still alive:
+            # the old worker may not have fully exited from ws.send_bytes
+            # yet (we abandoned the await), and starting a fresh worker on
+            # the same ws would have two concurrent senders, violating
+            # ASGI's one-sender-at-a-time rule and corrupting the relay.
+            #
+            # Clobber the slot to None so fan-out skips this peer (audio
+            # mute) and re-raise to preserve cancellation semantics. The
+            # listener can recover by reconnecting /audio, which spawns a
+            # fresh worker via _setup_audio_worker in _take_session_slot.
+            if sess.get("audio_send_worker") is worker:
+                sess["audio_send_worker"] = None
+                sess["audio_send_queue"] = None
             raise
     except Exception:
         pass
