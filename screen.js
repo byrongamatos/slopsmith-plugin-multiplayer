@@ -75,6 +75,115 @@ const CLOSE_GRACE_EXPIRED = 4408;
 const CLOSE_SUPERSEDED = 4409;
 const CLOSE_REPLACED = 4410;
 
+// ── SMAU audio frame codec (inlined) ─────────────────────────────────────────
+//
+// Source of truth: audio/smau-frame.js (CommonJS, exercised by
+// audio/smau-frame.test.js — `node audio/smau-frame.test.js`). Inlined here
+// because slopsmith core's plugin loader only serves the single screen.js
+// entry point per plugin (see plugins/__init__.py). When changing this
+// codec, change BOTH copies and re-run the Node tests.
+//
+// Wire format defined by PROTOCOL.md "Audio frame format (Audio WS)":
+// 40-byte little-endian header + Opus payload, validated against v1 hard
+// constants (NOT peer-supplied broadcast_start params) so a malicious
+// broadcaster cannot enlarge the bounds.
+const SMAU_HEADER_LEN = 40;
+const SMAU_VERSION = 1;
+const SMAU_MAX_FRAME_BYTES = 262144;   // 256 KB
+const SMAU_V1_SAMPLE_RATE = 48000;
+const SMAU_MAX_INTERVAL_SEC = 32;
+const SMAU_MAX_SLACK_SAMPLES = 480;    // ~10 ms at 48 kHz
+const SMAU_FLAG_TEMPO_CHANGE_AT_END = 0x0001;
+const SMAU_MAGIC_0 = 0x53; // 'S'
+const SMAU_MAGIC_1 = 0x4d; // 'M'
+const SMAU_MAGIC_2 = 0x41; // 'A'
+const SMAU_MAGIC_3 = 0x55; // 'U'
+
+function _smauDecodeFrame(buf) {
+    let bytes;
+    if (buf instanceof Uint8Array) {
+        bytes = buf;
+    } else if (buf instanceof ArrayBuffer) {
+        bytes = new Uint8Array(buf);
+    } else if (buf && ArrayBuffer.isView(buf)) {
+        bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    } else {
+        return { ok: false, reason: 'invalid_buffer' };
+    }
+    const len = bytes.byteLength;
+    if (len < SMAU_HEADER_LEN) return { ok: false, reason: 'too_small' };
+    if (len > SMAU_MAX_FRAME_BYTES) return { ok: false, reason: 'frame_too_big' };
+    if (bytes[0] !== SMAU_MAGIC_0 || bytes[1] !== SMAU_MAGIC_1
+        || bytes[2] !== SMAU_MAGIC_2 || bytes[3] !== SMAU_MAGIC_3) {
+        return { ok: false, reason: 'magic_mismatch' };
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, len);
+    const version = view.getUint16(4, true);
+    if (version !== SMAU_VERSION) return { ok: false, reason: 'version_mismatch' };
+    const flags = view.getUint16(6, true);
+    const intervalIndex = view.getBigUint64(8, true);
+    const chartTimeStart = view.getFloat64(16, true);
+    const chartTimeEnd = view.getFloat64(24, true);
+    const sampleCount = view.getUint32(32, true);
+    const opusSize = view.getUint32(36, true);
+    if (SMAU_HEADER_LEN + opusSize !== len) return { ok: false, reason: 'size_mismatch' };
+    if (!Number.isFinite(chartTimeStart) || !Number.isFinite(chartTimeEnd)) {
+        return { ok: false, reason: 'invalid_chart_time' };
+    }
+    const duration = chartTimeEnd - chartTimeStart;
+    if (!Number.isFinite(duration) || duration <= 0 || duration > SMAU_MAX_INTERVAL_SEC) {
+        return { ok: false, reason: 'invalid_duration' };
+    }
+    const maxSamples = Math.ceil(SMAU_V1_SAMPLE_RATE * duration) + SMAU_MAX_SLACK_SAMPLES;
+    if (sampleCount > maxSamples) return { ok: false, reason: 'sample_count_too_high' };
+
+    const opus = new Uint8Array(bytes.buffer, bytes.byteOffset + SMAU_HEADER_LEN, opusSize);
+    return {
+        ok: true,
+        header: {
+            version: version,
+            flags: flags,
+            intervalIndex: intervalIndex,
+            chartTimeStart: chartTimeStart,
+            chartTimeEnd: chartTimeEnd,
+            sampleCount: sampleCount,
+            opusSize: opusSize,
+            frameLength: len,
+            tempoChangeAtEnd: (flags & SMAU_FLAG_TEMPO_CHANGE_AT_END) !== 0,
+        },
+        opus: opus,
+    };
+}
+
+// Per-session inbound-frame counters. Cleared in _cleanup. The Phase 5
+// listener-side `audio_quality` highway message will read these so the
+// broadcaster can see "N frames dropped due to <reason>" in its UI.
+// Exposed on window for debugging via _audioGetRxStats(); not a public API.
+let _audioRxFramesValid = 0;
+let _audioRxFramesDropped = 0;
+const _audioRxDropReasons = Object.create(null);
+
+function _audioRxRecordDrop(reason) {
+    _audioRxFramesDropped++;
+    _audioRxDropReasons[reason] = (_audioRxDropReasons[reason] || 0) + 1;
+}
+
+function _audioRxResetStats() {
+    _audioRxFramesValid = 0;
+    _audioRxFramesDropped = 0;
+    for (const key of Object.keys(_audioRxDropReasons)) {
+        delete _audioRxDropReasons[key];
+    }
+}
+
+function _audioGetRxStats() {
+    return {
+        valid: _audioRxFramesValid,
+        dropped: _audioRxFramesDropped,
+        dropReasons: Object.assign({}, _audioRxDropReasons),
+    };
+}
+
 function _mintSessionId() {
     // crypto.randomUUID is widely available; fall back through getRandomValues
     // if available, then to Math.random as last resort. Every reference to
@@ -120,6 +229,12 @@ function _onSessionEnded() {
     // complete and clear the dedupe marker. See _maybeClearResetMarker.
     _highwayAuthedAfterReset = false;
     _audioOpenedAfterReset = false;
+    // Audio RX counters are documented as per-session; the new session_id
+    // we just minted is a logically separate session even though no
+    // _cleanup() runs on the 4408 grace-recovery path. Reset the counters
+    // so getAudioRxStats() doesn't carry the previous session's frames
+    // into the replacement session.
+    _audioRxResetStats();
 }
 
 function _maybeClearResetMarker() {
@@ -279,6 +394,7 @@ function _cleanup() {
     _resetMarker = null;
     _highwayAuthedAfterReset = true;
     _audioOpenedAfterReset = true;
+    _audioRxResetStats();
     sessionStorage.removeItem('mp_room');
     sessionStorage.removeItem('mp_player');
     sessionStorage.removeItem(SESSION_STORAGE_KEY);
@@ -463,11 +579,38 @@ function _connectAudioWs() {
     };
 
     ws.onmessage = (ev) => {
-        // Phase 2a: no listener pipeline yet. Phase 2b will parse the SMAU
-        // header and feed frames into the decoder. For now, drop binary
-        // frames silently and ignore any text frames the server might
-        // someday send (spec is binary-only in v1).
-        // Intentionally a no-op.
+        // Stale-socket guard. _connectAudioWs() replaces the live socket
+        // on reconnect / 4408 recovery / leave; in-flight frames already
+        // queued on the old socket can still arrive between our
+        // assignment of the new _audioWs and the OS-level close
+        // handshake completing. Without this check those frames would
+        // be parsed and counted against the current session — see
+        // codex-flagged drift in getAudioRxStats(). Mirrors the same
+        // pattern in onclose.
+        if (ws !== _audioWs) return;
+        // PROTOCOL.md "Audio WS — binary peer-audio relay" makes the audio
+        // WS binary-only in v1. Drop any text frame outright — text frames
+        // are spec-illegal and may indicate a server bug or middlebox
+        // injection; counted under the dedicated 'non_binary' reason so
+        // it's visible if it ever happens.
+        if (typeof ev.data === 'string') {
+            _audioRxRecordDrop('non_binary');
+            return;
+        }
+        // Phase 2b: parse + validate the 40-byte SMAU header and bind the
+        // opus payload as a Uint8Array view into the source buffer (no
+        // copy on the hot path). Phase 2c will plug an AudioDecoder +
+        // AudioBufferSourceNode scheduling pipeline into the success
+        // branch; for now we account valid frames and drop reasons so a
+        // misbehaving broadcaster has a visible signal during dev/testing.
+        const result = _smauDecodeFrame(ev.data);
+        if (!result.ok) {
+            _audioRxRecordDrop(result.reason);
+            return;
+        }
+        _audioRxFramesValid++;
+        // No-op success branch; Phase 2c will route result.opus +
+        // result.header into the listener pipeline.
     };
 
     ws.onclose = (ev) => {
@@ -1913,6 +2056,16 @@ window.mpMixerExport = async function () {
         });
     }
 })();
+
+// ── Debug hook ─────────────────────────────────────────────────────────
+//
+// window.slopsmithMultiplayerDebug surfaces a small, intentionally
+// internal/unstable shape for inspecting the audio WS state from dev
+// tools. Not a public API; subject to change between phases.
+
+window.slopsmithMultiplayerDebug = {
+    getAudioRxStats: _audioGetRxStats,
+};
 
 // ── Screen show/hide hook ──────────────────────────────────────────────
 
