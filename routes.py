@@ -17,15 +17,36 @@ _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 30 chars, no 0/O/1/I/L
 
 _rooms = {}           # code -> room dict
 _cleanup_tasks = {}   # code -> asyncio.Task
+_MP_DIR = None        # set by setup(); used by module-level _cleanup_after_grace
 
 # Session lifecycle constants — see PROTOCOL.md "v1 server policy".
 SESSION_GRACE_SEC = 5.0
+# How long a creator who has never opened any WS keeps the host slot before
+# self-heal will transfer it to the first connected guest. Long enough to
+# absorb a normal page-load + WS-handshake (typically 1–3s); short enough that
+# an abandoned room (creator closed the tab without connecting) doesn't stay
+# permanently hostless once a guest arrives.
+HOST_CREATOR_GRACE_SEC = 30.0
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # Lifecycle close codes; values track PROTOCOL.md.
 _CLOSE_AUTH_FAIL = 4401
 _CLOSE_GRACE_EXPIRED = 4408
 _CLOSE_SUPERSEDED = 4409
 _CLOSE_REPLACED = 4410
+_CLOSE_FRAME_TOO_BIG = 1009
+_CLOSE_NORMAL = 1000
+_CLOSE_INTERNAL_ERROR = 1011
+
+# Audio WS frame format constants — see PROTOCOL.md "Audio frame format".
+_AUDIO_FRAME_MAGIC = b"SMAU"
+_AUDIO_FRAME_VERSION = 1
+_AUDIO_FRAME_HEADER_LEN = 40
+_AUDIO_FRAME_MAX_BYTES = 262144  # 256 KB hard limit (header + payload)
+# Maximum pending audio frames per listener. New frames overwrite the oldest
+# when full, so a chronically slow listener stays bounded in memory and a
+# resumed listener can only fall a fixed number of frames behind. At a
+# typical interval of ~2 s and 96 kbps Opus, 8 frames ≈ 16 s of headroom.
+_AUDIO_SEND_QUEUE_MAX = 8
 
 
 def _gen_code():
@@ -81,9 +102,19 @@ def _connected_count(room):
 
 
 def _promote_host(room):
-    """Promote the first connected player to host."""
+    """Promote the first player with an active highway WS to host.
+
+    Audio-only "connected" players (player["connected"] is True for room
+    liveness, but player["ws"] is None because their highway WS hasn't
+    reattached yet) are NOT eligible — the host needs a control plane to
+    receive `host_changed` and to send host-only commands. Promoting an
+    audio-only player would leave the room without a usable host until
+    that client's highway socket comes back. Falling back to "any
+    connected player" is a no-op vs. returning None: the room genuinely
+    has no usable host until at least one highway WS exists.
+    """
     for pid, p in room["players"].items():
-        if p["connected"]:
+        if p["connected"] and p.get("ws") is not None:
             room["host"] = pid
             return pid
     return None
@@ -112,6 +143,23 @@ def _new_session_record(session_id, highway_ws=None, audio_ws=None):
         "audio_ws": audio_ws,
         "highway_grace_task": None,
         "audio_grace_task": None,
+        # Sticky flags: True the first time the slot is ever filled within
+        # this session, never reset. Used to distinguish "first_attach"
+        # (slot never opened) from "reconnect" (slot was open before, just
+        # temporarily None during a grace window).
+        "highway_ever_opened": highway_ws is not None,
+        "audio_ever_opened": audio_ws is not None,
+        # Per-peer audio relay state. The queue is bounded
+        # (_AUDIO_SEND_QUEUE_MAX) so a slow listener can't accumulate
+        # unbounded memory. The worker is a single asyncio.Task that drains
+        # the queue and serializes send_bytes (ASGI's "one sender at a time"
+        # rule). Both are bound to a specific audio_ws — same-session
+        # reconnects cancel the prior worker + drop the prior queue and
+        # spawn a fresh pair, so stale sends never block a new attached
+        # socket. Both are None whenever audio_ws is None (no slot, or
+        # currently in per-endpoint grace).
+        "audio_send_queue": None,
+        "audio_send_worker": None,
     }
 
 
@@ -123,80 +171,536 @@ def _cancel_grace_tasks(sess):
         sess[k] = None
 
 
-async def _take_highway_slot(websocket, room, player_id, session_id):
-    """Apply PROTOCOL.md connection-arrival rules for the highway endpoint.
-    Returns one of 'new_session', 'reconnect', 'takeover' indicating what
-    transition just occurred. The new websocket is registered in the
-    room's session record on success.
+_HIGHWAY = "highway"
+_AUDIO = "audio"
+
+
+def _other_endpoint(endpoint):
+    return _AUDIO if endpoint == _HIGHWAY else _HIGHWAY
+
+
+def _slot_key(endpoint):
+    return f"{endpoint}_ws"
+
+
+def _grace_key(endpoint):
+    return f"{endpoint}_grace_task"
+
+
+async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
+    """Apply PROTOCOL.md connection-arrival rules for the given endpoint
+    (`_HIGHWAY` or `_AUDIO`). Returns one of:
+
+      'new_session'  — no prior session existed; this endpoint started it.
+      'first_attach' — prior session existed (other endpoint already open) but
+                       THIS slot was empty until now. Distinct from 'reconnect'
+                       so callers (the highway handler in particular) can fire
+                       a peer-visible event when the player only becomes
+                       visible via this endpoint for the first time.
+      'reconnect'    — THIS slot had an existing socket that the new connection
+                       supersedes (4410 emitted to the old socket).
+      'takeover'     — prior session with a DIFFERENT session_id; closes BOTH
+                       slots of the old session with 4409.
+
+    The new websocket is registered in the room's session record on success.
     """
     sessions = room["sessions"]
     existing = sessions.get(player_id)
+    slot = _slot_key(endpoint)
+    grace = _grace_key(endpoint)
 
     if existing is None:
-        sessions[player_id] = _new_session_record(session_id, highway_ws=websocket)
+        rec = _new_session_record(session_id)
+        rec[slot] = websocket
+        rec[f"{endpoint}_ever_opened"] = True
+        sessions[player_id] = rec
+        if endpoint == _AUDIO:
+            _setup_audio_worker(rec)
         return "new_session"
 
     if existing["session_id"] == session_id:
-        # Rule 2: same-session reconnect of this endpoint.
-        old_ws = existing["highway_ws"]
-        existing["highway_ws"] = websocket
-        # Reattach cancels any in-flight grace timer for this endpoint.
-        t = existing.get("highway_grace_task")
+        # Rule 2: matching session_id. Three sub-cases distinguished by the
+        # sticky `<endpoint>_ever_opened` flag plus the current slot value:
+        #   * never opened before → 'first_attach' (peers should see the
+        #     player come online for the first time on the highway side).
+        #   * opened before, slot currently filled → 'reconnect' with 4410
+        #     to the old socket (slot was live; we replaced it).
+        #   * opened before, slot currently None → 'reconnect' silent
+        #     (slot dropped during a grace window and is reattaching).
+        ever_key = f"{endpoint}_ever_opened"
+        ever_opened_before = existing.get(ever_key, False)
+        old_ws = existing[slot]
+        # Snapshot the prior audio worker BEFORE _setup_audio_worker
+        # overwrites the slot, so the audio-side close below can defer
+        # until the cancelled worker has actually exited (avoids the
+        # close-vs-send_bytes race on the same WebSocket).
+        prev_audio_worker = (
+            existing.get("audio_send_worker") if endpoint == _AUDIO else None
+        )
+        existing[slot] = websocket
+        existing[ever_key] = True
+        # Reattach cancels any in-flight grace timer for this endpoint only.
+        t = existing.get(grace)
         if t and not t.done():
             t.cancel()
-        existing["highway_grace_task"] = None
+        existing[grace] = None
+        # Audio reconnect/first_attach gets a fresh worker + queue bound to
+        # the new ws so any tasks left over from the old ws can't block the
+        # newly-attached socket. _setup_audio_worker cancels prev_audio_worker
+        # but does NOT await its exit (cancel only requests; the worker may
+        # still be inside ws.send_bytes on old_ws).
+        if endpoint == _AUDIO:
+            _setup_audio_worker(existing)
+        if not ever_opened_before:
+            return "first_attach"
         if old_ws is not None and old_ws is not websocket:
-            await _safe_close(old_ws, _CLOSE_REPLACED)
+            if endpoint == _AUDIO and prev_audio_worker is not None:
+                # Fire-and-forget the close: _close_audio_after_worker waits
+                # for prev_audio_worker to actually exit, then closes old_ws
+                # with 4410. This is the sole sender on old_ws by the time
+                # close fires.
+                asyncio.create_task(
+                    _close_audio_after_worker(
+                        old_ws, prev_audio_worker, _CLOSE_REPLACED,
+                    )
+                )
+            else:
+                await _safe_close(old_ws, _CLOSE_REPLACED)
         return "reconnect"
 
     # Rule 3: takeover by a different session_id — close BOTH old endpoints.
     # Replace the session record FIRST, then close the old sockets. Each
     # `await _safe_close(...)` yields to the event loop, which lets the OLD
-    # highway handler's finally block run and call `_on_highway_disconnect`.
-    # That helper checks `sess.get("highway_ws") is websocket` against the
-    # CURRENT session record — so by the time it runs, sessions[player_id] is
-    # already the new record and the helper sees `is websocket (old)` → False
-    # and early-returns instead of scheduling a grace task on the orphaned
-    # `existing` dict and transiently nulling out `player["ws"]`.
+    # endpoint handlers' finally blocks run and call _on_endpoint_disconnect.
+    # Those helpers check `sess.get(slot) is websocket` against the CURRENT
+    # session record — so by the time they run, sessions[player_id] is the
+    # new record and they early-return instead of scheduling a grace task on
+    # the orphaned `existing` dict.
     _cancel_grace_tasks(existing)
     old_highway_ws = existing.get("highway_ws")
     old_audio_ws = existing.get("audio_ws")
-    sessions[player_id] = _new_session_record(session_id, highway_ws=websocket)
+    # Swap the session record FIRST, BEFORE awaiting the old worker's
+    # shutdown. _cleanup_audio_worker below yields to the event loop; if
+    # sessions[player_id] still pointed at the OLD record during that yield,
+    # an old endpoint handler's finally block could schedule a grace task
+    # on the soon-to-be-replaced record, and that timer would later resolve
+    # sessions[player_id] to the NEW record and close it with 4408 before
+    # its other endpoint attached. Swapping first makes any concurrent
+    # finally see sessions[player_id] = rec, fail its `is websocket (old)`
+    # check, and early-return cleanly.
+    old_existing = existing
+    rec = _new_session_record(session_id)
+    rec[slot] = websocket
+    rec[f"{endpoint}_ever_opened"] = True
+    sessions[player_id] = rec
+    if endpoint == _AUDIO:
+        _setup_audio_worker(rec)
+    # Clear the player's stale highway-WS reference SYNCHRONOUSLY (before any
+    # await below). After rule 3 the new session's highway_ws is None until
+    # the new tab's highway WS connects; leaving player["ws"] pointing at the
+    # just-superseded old highway during the awaits below would create a
+    # split-routing window: audio fan-out uses sessions[player_id] = rec
+    # (new audio_ws) while _broadcast still targets the OLD highway. The
+    # highway-side caller of _take_session_slot immediately reassigns
+    # player["ws"] = websocket after this returns, so for the highway
+    # endpoint this is a no-op; for the audio endpoint it closes the gap.
+    player = room["players"].get(player_id)
+    if player is not None:
+        player["ws"] = None
+    # Cancel the OLD session's worker. Operates on a detached old_existing
+    # reference (sessions[player_id] no longer points at it), so the
+    # _cleanup_audio_worker reference-check at the end of its body simply
+    # confirms old_existing.audio_send_worker is still its own captured
+    # value and clears the slot on the OLD dict — never touches the new.
+    await _cleanup_audio_worker(old_existing)
     await _safe_close(old_highway_ws, _CLOSE_SUPERSEDED)
     await _safe_close(old_audio_ws, _CLOSE_SUPERSEDED)
     return "takeover"
 
 
-async def _on_highway_disconnect(websocket, room, player_id):
-    """Called from the highway WS handler's finally block.
+async def _on_endpoint_disconnect(websocket, room, player_id, endpoint):
+    """Called from a WS handler's finally block.
 
-    Distinguishes "this socket is still the active highway slot for the
-    session" (start grace timer) from "the server already replaced this
+    Distinguishes "this socket is still the active slot for `endpoint` on
+    this session" (start grace timer) from "the server already replaced this
     socket via 4409/4410" (no further action).
     """
     sess = room.get("sessions", {}).get(player_id)
-    if sess is None or sess.get("highway_ws") is not websocket:
+    if sess is None or sess.get(_slot_key(endpoint)) is not websocket:
         # Server-initiated close already swapped this slot; nothing to do.
         return
-    sess["highway_ws"] = None
-    # Also clear the player's WS reference so _broadcast skips the dead socket
-    # for the duration of the grace window (otherwise it pile-runs send_json
-    # against a closed connection on every broadcast — exceptions are swallowed
-    # but it's wasteful). `connected` stays True: the player is still considered
-    # in the room until the grace timer either expires or is cancelled by a
-    # reattach. _connected_count therefore keeps counting them, which prevents
-    # the 60-second room-empty cleanup from kicking in during a transient drop.
-    player = room["players"].get(player_id)
-    if player is not None:
-        player["ws"] = None
-    # Schedule grace expiry.
-    sess["highway_grace_task"] = asyncio.create_task(
-        _grace_then_finalize(room, player_id)
+    sess[_slot_key(endpoint)] = None
+    # If the highway slot just emptied, also clear the player's WS reference so
+    # _broadcast skips the dead socket during the grace window. The audio slot
+    # has no equivalent on the player object, so nothing to clear there — but
+    # the audio send worker IS bound to the now-closed ws, so cancel it and
+    # drop the queue. A future reattach of the same session will spawn a
+    # fresh worker + queue via _setup_audio_worker.
+    if endpoint == _HIGHWAY:
+        player = room["players"].get(player_id)
+        if player is not None:
+            player["ws"] = None
+    elif endpoint == _AUDIO:
+        await _cleanup_audio_worker(sess, room, player_id)
+    # Schedule per-endpoint grace expiry. Either endpoint expiring ends the
+    # whole session per PROTOCOL.md "Per-endpoint grace".
+    sess[_grace_key(endpoint)] = asyncio.create_task(
+        _grace_then_finalize_endpoint(room, player_id, endpoint)
     )
 
 
-async def _grace_then_finalize(room, player_id):
-    """Wait SESSION_GRACE_SEC; if the highway slot is still empty, end the session."""
+# Backward-compat alias retained for any in-flight callers; new call sites
+# should use _on_endpoint_disconnect directly.
+async def _on_highway_disconnect(websocket, room, player_id):
+    await _on_endpoint_disconnect(websocket, room, player_id, _HIGHWAY)
+
+
+async def _close_audio_after_worker(ws, worker, code):
+    """Wait for `worker` to actually exit, THEN close `ws` with `code`.
+
+    Used by paths that need to close a WebSocket whose worker has been
+    cancelled but may not have fully exited yet (e.g. the Rule 2 audio
+    reconnect path closing old_ws with 4410). The cancelled worker may
+    still be inside an in-flight ws.send_bytes when we abandon it;
+    closing the same ws concurrently would race with that send (ASGI
+    single-sender rule). This helper runs as a fire-and-forget task: it
+    awaits the worker to completion (best effort) and only then closes,
+    so the close is the sole sender.
+    """
+    if worker is not None:
+        try:
+            await worker
+        except (asyncio.CancelledError, Exception):
+            pass
+    await _safe_close(ws, code)
+
+
+async def _restart_audio_worker_after_old(room, player_id, expected_sess, old_worker):
+    """Wait for `old_worker` to exit, then spawn a fresh worker on
+    `expected_sess` IFF the room still references that exact session
+    dict for `player_id`. Used by _cleanup_audio_worker's cancel-
+    propagation branch.
+
+    The room/player_id re-lookup matters: existing teardown paths
+    (Rule 3 takeover, _grace_then_finalize_endpoint, leave_room) drop
+    the session dict from `room["sessions"]` without nulling
+    `sess["audio_ws"]` first. If we restarted blindly on the detached
+    dict, we'd call _setup_audio_worker on a closed/orphaned audio_ws,
+    leaking the new task and the audio_ws+session refs along with it.
+    Comparing `room["sessions"][player_id] is expected_sess` confirms
+    the session is still authoritative before we touch it.
+    """
+    if old_worker is not None:
+        try:
+            await old_worker
+        except (asyncio.CancelledError, Exception):
+            pass
+    if room.get("sessions", {}).get(player_id) is not expected_sess:
+        return
+    if expected_sess.get("audio_ws") is None:
+        return
+    # _cleanup_audio_worker's cancel-propagation branch deliberately
+    # leaves audio_send_worker pointing at the cancelled-but-now-exited
+    # old_worker so concurrent rule-2 audio reconnects could snapshot it
+    # for their deferred close. By the time we get here that snapshot
+    # window is over (we just awaited the worker to completion), so it
+    # is safe — and necessary — to replace the slot with a fresh worker.
+    # If a concurrent reattach via _setup_audio_worker has already
+    # installed a different worker, leave it alone (the new worker is
+    # already running on the same audio_ws).
+    current_worker = expected_sess.get("audio_send_worker")
+    if current_worker is None or current_worker is old_worker:
+        _setup_audio_worker(expected_sess)
+
+
+async def _audio_send_worker(ws, queue):
+    """Drain a per-peer audio send queue, calling ws.send_bytes for each frame.
+
+    Exits cleanly on:
+      - asyncio.CancelledError (e.g. socket replaced via 4410, or session
+        teardown), or
+      - any send_bytes exception (broken socket; the peer's own handler
+        cleans up the rest).
+    Each worker is bound to the exact ws passed in here, so a same-session
+    reconnect that spawns a fresh worker + queue pair never has the old
+    worker contending with the new socket.
+    """
+    try:
+        while True:
+            payload = await queue.get()
+            try:
+                await ws.send_bytes(payload)
+            except Exception:
+                return
+    except asyncio.CancelledError:
+        return
+
+
+async def _cleanup_audio_worker(sess, room=None, player_id=None):
+    """Cancel the audio worker (if any), wait for it to actually exit, and
+    clear the queue — but only if the slot still references the worker we
+    captured. Safe to call on a session that has no worker (no-op).
+
+    `room` and `player_id` are optional. They are used only on the cancel-
+    propagation branch (external cancel of our caller) to safely schedule
+    a background restart of the audio worker if the session is still
+    authoritative. Callers who can't provide them (or for which a restart
+    isn't desired) may omit them — the cancel-propagation branch then
+    falls through without scheduling a restart.
+
+    Why async / awaits the cancelled task: cancel() only REQUESTS
+    cancellation. If the worker is currently inside `await ws.send_bytes(...)`
+    when we cancel it, the next caller of `audio_ws.close(...)` would race
+    against the still-running send and the close can fail silently (ASGI
+    forbids concurrent senders on the same WebSocket). Awaiting the
+    cancelled task here guarantees the worker has fully exited before we
+    return.
+
+    Why we capture the worker reference and re-check before clobbering:
+    the `await` below yields to the event loop. During that yield, a
+    reattach via `_take_session_slot` can install a FRESH worker into
+    `sess["audio_send_worker"]`. If we unconditionally cleared
+    `sess["audio_send_worker"] = None` on resume, we'd silently drop the
+    new worker and the reattached client would be muted. Re-checking that
+    the slot still points at our captured worker preserves a fresh worker
+    installed concurrently.
+
+    Why we re-raise CancelledError when worker.cancelled() is False: if
+    OUR task is being cancelled externally (e.g. `_grace_then_finalize_endpoint`
+    is cancelled by a same-session reconnect while we're awaiting worker
+    teardown), `await worker` raises CancelledError but the worker may
+    have completed normally. We must propagate that cancellation so the
+    grace timer doesn't continue popping the session.
+    """
+    worker = sess.get("audio_send_worker")
+    if worker is None:
+        return
+    if worker.done():
+        if sess.get("audio_send_worker") is worker:
+            sess["audio_send_worker"] = None
+            sess["audio_send_queue"] = None
+        return
+    worker.cancel()
+    # Distinguish "worker cancelled" from "caller cancelled" cleanly:
+    # asyncio.gather(worker, return_exceptions=True) captures the worker's
+    # CancelledError as a return value rather than re-raising it. The
+    # only way `await asyncio.gather(...)` itself raises CancelledError
+    # is if OUR task is being cancelled externally — at which point we
+    # MUST propagate. This avoids the Py-version-specific
+    # Task.cancelling() check entirely and works correctly on Python
+    # 3.8+. (Suggested by Copilot during PR #3 round 12 review.)
+    try:
+        await asyncio.gather(worker, return_exceptions=True)
+    except asyncio.CancelledError:
+        # OUR caller was cancelled. We MUST NOT restart the worker here
+        # even if audio_ws is still alive: the old worker may not have
+        # fully exited from ws.send_bytes yet (we abandoned the gather),
+        # and starting a fresh worker on the same ws would have two
+        # concurrent senders, violating ASGI's one-sender-at-a-time rule
+        # and corrupting the relay.
+        #
+        # Synchronously clear the queue so fan-out immediately skips
+        # this peer, but leave the existing /audio WebSocket open. If
+        # the cancelled worker is still the active one, we only schedule
+        # a deferred worker restart that waits for that worker to
+        # actually exit before replacing it; we do not close the same
+        # ws here. Closing would emit a misleading close code (the
+        # session is typically still alive — our cleanup was interrupted
+        # by an external cancel like a same-session reconnect of the
+        # OTHER endpoint, not by a real teardown), so we let the relay
+        # self-heal silently.
+        #
+        # All slot mutations (worker, queue) are gated on our captured
+        # worker still being the active one. If a same-session reattach
+        # has run during our await, _setup_audio_worker synchronously
+        # installed a fresh worker AND a fresh audio_ws in the same
+        # atomic block — `is worker` returns False, and we leave the
+        # new state untouched (otherwise we'd orphan its new worker).
+        if sess.get("audio_send_worker") is worker:
+            # Clear the QUEUE so fan-out skips this peer (no pushes to a
+            # queue with no live consumer), but leave audio_send_worker
+            # pointing at the cancelled worker so concurrent rule-2
+            # audio reconnects in _take_session_slot can still snapshot
+            # `prev_audio_worker = sess["audio_send_worker"]` and route
+            # their old-ws close through _close_audio_after_worker —
+            # which awaits the cancelled worker before close, avoiding
+            # the ASGI single-sender race. The audio_send_worker slot
+            # itself will be replaced by either:
+            #   (a) the deferred restart helper below, after the
+            #       cancelled worker has actually exited, or
+            #   (b) a concurrent reattach via _setup_audio_worker.
+            sess["audio_send_queue"] = None
+            if (
+                room is not None
+                and player_id is not None
+                and sess.get("audio_ws") is not None
+            ):
+                asyncio.create_task(
+                    _restart_audio_worker_after_old(
+                        room, player_id, sess, worker,
+                    )
+                )
+        raise
+    # Normal completion path: gather returned (worker exited, possibly
+    # via the cancellation we requested). Clear the slots if our worker
+    # is still what's there.
+    if sess.get("audio_send_worker") is worker:
+        sess["audio_send_worker"] = None
+        sess["audio_send_queue"] = None
+
+
+def _setup_audio_worker(sess):
+    """Spawn a fresh queue + worker bound to sess['audio_ws']. Cancels and
+    drops any prior worker/queue so stale sends on a replaced socket can't
+    block the new socket.
+
+    Caller must have already set sess['audio_ws'] to the new WebSocket.
+    """
+    prev_worker = sess.get("audio_send_worker")
+    if prev_worker is not None and not prev_worker.done():
+        prev_worker.cancel()
+    queue = asyncio.Queue(maxsize=_AUDIO_SEND_QUEUE_MAX)
+    sess["audio_send_queue"] = queue
+    sess["audio_send_worker"] = asyncio.create_task(
+        _audio_send_worker(sess["audio_ws"], queue)
+    )
+
+
+def _enqueue_audio_frame(sess, payload):
+    """Push a frame onto a peer's bounded send queue. On overflow the OLDEST
+    frame is dropped — newer audio is more useful to a recovering listener
+    than stale audio. Caller must have already verified audio_ws is non-None.
+    """
+    queue = sess.get("audio_send_queue")
+    if queue is None:
+        return
+    while True:
+        try:
+            queue.put_nowait(payload)
+            return
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()  # drop oldest
+            except asyncio.QueueEmpty:
+                # Race with a worker that drained between full and get_nowait.
+                # Retry put.
+                continue
+
+
+def _classify_audio_frame(data):
+    """Validate the 40-byte SMAU header on an audio WS binary frame.
+
+    Returns one of:
+      "ok"            — frame passes server-side safety checks; safe to fan out.
+      "size_violation"  — frame_length < 40, > MAX, or header/body mismatch.
+                          Caller MUST drop and SHOULD close the sender's
+                          audio WS with 1009 per PROTOCOL.md.
+      "drop"          — magic mismatch or version mismatch. Caller MUST drop
+                          (no close — this is a benign protocol-version skew
+                          that the spec lets the receiver handle silently).
+    """
+    if data is None:
+        return "drop"
+    n = len(data)
+    if n > _AUDIO_FRAME_MAX_BYTES or n < _AUDIO_FRAME_HEADER_LEN:
+        return "size_violation"
+    if data[:4] != _AUDIO_FRAME_MAGIC:
+        return "drop"
+    # Bytes 4-5: u16 little-endian version.
+    version = data[4] | (data[5] << 8)
+    if version != _AUDIO_FRAME_VERSION:
+        return "drop"
+    # Bytes 36-39: u32 little-endian opus_size; total frame must equal header + payload.
+    opus_size = data[36] | (data[37] << 8) | (data[38] << 16) | (data[39] << 24)
+    if _AUDIO_FRAME_HEADER_LEN + opus_size != n:
+        return "size_violation"
+    return "ok"
+
+
+def _start_cleanup(code):
+    """Start the 60-second grace period before destroying a room.
+
+    Module-level (not inside setup()) so module-level coroutines like
+    `_grace_then_finalize_endpoint` can reach it without a NameError when the
+    only-player-just-disconnected branch fires.
+    """
+    # `_rooms` is canonically keyed by uppercase code (see _gen_code() and the
+    # `code = code.upper()` normalization at every WS handler entry). Normalize
+    # here too so a stray lower-case caller can't park the cleanup task under a
+    # case-mismatched key, which would later look up _rooms[lowercase] → None
+    # and leak the room dict + room-dir files.
+    code = code.upper()
+    if code in _cleanup_tasks:
+        return
+    _cleanup_tasks[code] = asyncio.ensure_future(_cleanup_after_grace(code))
+
+
+async def _cleanup_after_grace(code, seconds=60):
+    code = code.upper()
+    await asyncio.sleep(seconds)
+    room = _rooms.get(code)
+    if room and _connected_count(room) == 0:
+        # Cancel any session-grace tasks AND audio workers before discarding
+        # the room so they don't fire / stay parked against a deleted room
+        # dict. Snapshot the values list FIRST: _cleanup_audio_worker awaits
+        # the worker's exit, which yields to the event loop. Other tasks
+        # (grace finalizers, leave paths) can pop entries from
+        # room["sessions"] during that yield, which would raise
+        # RuntimeError: dictionary changed size during iteration if we were
+        # iterating the live view.
+        sessions_snapshot = list(room.get("sessions", {}).values())
+        for sess in sessions_snapshot:
+            _cancel_grace_tasks(sess)
+            await _cleanup_audio_worker(sess)
+        # Same for the one-shot creator-grace timer.
+        cgt = room.get("creator_grace_task")
+        if cgt and not cgt.done():
+            cgt.cancel()
+        del _rooms[code]
+        if _MP_DIR is not None:
+            room_dir = _MP_DIR / code
+            if room_dir.exists():
+                shutil.rmtree(str(room_dir), ignore_errors=True)
+        print(f"[Multiplayer] Room {code} destroyed after grace period")
+    _cleanup_tasks.pop(code, None)
+
+
+async def _creator_grace_timer(code, creator_pid):
+    """Fires HOST_CREATOR_GRACE_SEC after a room is created. If the creator
+    has not opened the highway / control-plane WebSocket by then (their
+    `ever_attached` flag stays False — audio-only attaches intentionally
+    do not flip it because audio alone can't perform host duties) AND
+    another player is connected, transfer the host slot to the first
+    eligible connected guest. This is the time-driven half of the
+    abandoned-creator self-heal — the highway-attach branch in
+    multiplayer_ws covers the case where the guest arrives AFTER grace,
+    this timer covers the case where the guest is already connected
+    when grace expires."""
+    try:
+        await asyncio.sleep(HOST_CREATOR_GRACE_SEC)
+    except asyncio.CancelledError:
+        return
+    room = _rooms.get(code)
+    if room is None:
+        return
+    if room.get("host") != creator_pid:
+        return  # Host changed by some other path; nothing to do.
+    creator = room["players"].get(creator_pid)
+    if creator is None or creator.get("ever_attached"):
+        return  # Creator left or actually showed up.
+    new_host = _promote_host(room)
+    if new_host is not None and new_host != creator_pid:
+        await _broadcast(room, {
+            "type": "host_changed",
+            "new_host_id": new_host,
+        })
+
+
+async def _grace_then_finalize_endpoint(room, player_id, endpoint):
+    """Wait SESSION_GRACE_SEC; if `endpoint`'s slot is still empty, end the
+    entire session (close the OTHER endpoint with 4408 if it's still alive,
+    drop the session record, fire player_disconnected, run room cleanup if
+    appropriate)."""
     try:
         await asyncio.sleep(SESSION_GRACE_SEC)
     except asyncio.CancelledError:
@@ -206,14 +710,25 @@ async def _grace_then_finalize(room, player_id):
     sess = sessions.get(player_id)
     if sess is None:
         return
-    if sess.get("highway_ws") is not None:
+    if sess.get(_slot_key(endpoint)) is not None:
         # Reattached during the grace window.
         return
 
-    # Grace expired with no reattach: end the session.
-    audio_ws = sess.get("audio_ws")
+    # Grace expired with no reattach: end the session. Cancel + AWAIT the
+    # audio worker BEFORE the close below so the worker isn't still mid-
+    # send_bytes when we close the same ws (ASGI requires one sender at a
+    # time; otherwise the close races with an in-flight send and may fail
+    # silently). This also prevents the worker leak the audio handler's
+    # finally would skip on sess-is-None early return.
+    # Pass room/player_id so a cancel-propagation (a same-session
+    # endpoint reconnect cancelling this grace task) can schedule a
+    # background restart of the audio worker — the session is alive in
+    # that case and audio shouldn't go silently mute.
+    await _cleanup_audio_worker(sess, room, player_id)
+    other = _slot_key(_other_endpoint(endpoint))
+    other_ws = sess.get(other)
     sessions.pop(player_id, None)
-    await _safe_close(audio_ws, _CLOSE_GRACE_EXPIRED)
+    await _safe_close(other_ws, _CLOSE_GRACE_EXPIRED)
 
     player = room["players"].get(player_id)
     if player is not None:
@@ -230,6 +745,12 @@ def setup(app, context):
     config_dir = context["config_dir"]
     STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
     MP_DIR = config_dir / "multiplayer"
+    # Make MP_DIR reachable from module-level coroutines (e.g.
+    # _cleanup_after_grace runs the room-destroy path, which deletes files
+    # from this dir). Stored at module level so it survives across the
+    # closures here.
+    global _MP_DIR
+    _MP_DIR = MP_DIR
     _get_dlc_dir = context.get("get_dlc_dir")
 
     # ── Room CRUD ──────────────────────────────────────────────────────
@@ -250,6 +771,16 @@ def setup(app, context):
                     "connected": False,
                     "ws": None,
                     "last_seen": time.monotonic(),
+                    # Sticky flag: True the first time this player opens the
+                    # highway/control-plane WS. Audio-only WS attachment
+                    # does NOT set this — the host self-heal cares about
+                    # control-plane presence (sending host commands /
+                    # receiving host_changed), which only the highway WS
+                    # provides. Used to distinguish "creator hasn't
+                    # connected yet" (never_attached, keep host) from
+                    # "host connected once and then expired"
+                    # (attached_then_gone, self-heal).
+                    "ever_attached": False,
                 }
             },
             "queue": [],
@@ -262,8 +793,15 @@ def setup(app, context):
             "mixdown_path": None,
             "skip_votes": set(),
             "sessions": {},
+            "creator_grace_task": None,
         }
         _rooms[code] = room
+        # Schedule the one-shot creator-grace timer. If the creator never
+        # opens any WS within HOST_CREATOR_GRACE_SEC, this transfers host
+        # to the first connected guest. See _creator_grace_timer.
+        room["creator_grace_task"] = asyncio.create_task(
+            _creator_grace_timer(code, player_id)
+        )
         return {"code": code, "player_id": player_id, "is_host": True}
 
     @app.post("/api/plugins/multiplayer/rooms/{code}/join")
@@ -279,6 +817,7 @@ def setup(app, context):
             "connected": False,
             "ws": None,
             "last_seen": time.monotonic(),
+            "ever_attached": False,
         }
         await _broadcast(room, {
             "type": "player_joined",
@@ -321,11 +860,17 @@ def setup(app, context):
         # User-initiated leave uses RFC 6455 1000 (normal closure) on the audio
         # slot — 4408 means "grace expired / timed out" and would mislead a
         # client into auto-reconnecting with a fresh session_id when in fact
-        # the user has explicitly left.
+        # the user has explicitly left. Also tear down the audio worker
+        # explicitly: closing the audio_ws makes the handler's finally block
+        # see `sess is None` (we just popped) and early-return without
+        # cancelling the worker, leaking it.
         sess = room.get("sessions", {}).pop(player_id, None)
         if sess is not None:
             _cancel_grace_tasks(sess)
-            await _safe_close(sess.get("audio_ws"), 1000)
+            # Await worker shutdown BEFORE close to avoid the race where the
+            # worker's in-flight send_bytes overlaps with our close.
+            await _cleanup_audio_worker(sess)
+            await _safe_close(sess.get("audio_ws"), _CLOSE_NORMAL)
 
         del room["players"][player_id]
         await _broadcast(room, {"type": "player_left", "player_id": player_id})
@@ -763,17 +1308,86 @@ def setup(app, context):
         # for this player_id with 4410 (same-session reconnect) or 4409
         # (different-session takeover) before this socket's "connected" frame
         # is sent. The WebSocket upgrade itself was already accepted above.
-        transition = await _take_highway_slot(websocket, room, player_id, session_id)
+        transition = await _take_session_slot(
+            websocket, room, player_id, session_id, _HIGHWAY,
+        )
 
         player = room["players"][player_id]
         player["ws"] = websocket
         player["connected"] = True
         player["last_seen"] = time.monotonic()
+        player["ever_attached"] = True
 
         # Cancel pending room-empty cleanup if any (e.g. last player just rejoined).
         task = _cleanup_tasks.pop(code, None)
         if task:
             task.cancel()
+
+        # Self-heal the host slot. _promote_host requires an active highway WS
+        # (not just connected=True), so the room can end up with `room["host"]`
+        # pointing at a player who can no longer hold host duties — either
+        # because they left (leave_room removed their player record) OR
+        # because their session expired beyond grace and was finalized
+        # (room["sessions"][host_id] was popped, player["connected"]=False,
+        # player["ws"]=None). Re-run the election now that this highway
+        # attach made the candidate set non-empty.
+        #
+        # Four conditions trigger self-heal away from the current host:
+        #   1. host_id missing.
+        #   2. host's player record is gone (left via leave_room).
+        #   3. host has ever attached a WS in this room AND no longer has an
+        #      active session (they connected, dropped, grace expired).
+        #   4. host has NEVER attached a WS AND the creator-grace window has
+        #      already passed (room is older than HOST_CREATOR_GRACE_SEC).
+        #
+        # Cases (3) and (4) together catch every "host can't fulfill duties"
+        # state without stealing host from a slow-but-arriving creator:
+        #   - Slow creator (within HOST_CREATOR_GRACE_SEC): never_attached
+        #     but room is young → no self-heal, creator keeps host slot.
+        #   - Abandoned creator (past HOST_CREATOR_GRACE_SEC): never_attached
+        #     and room is old → self-heal, guest takes over.
+        #   - Connected-then-dropped: ever_attached + no session → self-heal
+        #     immediately on next guest highway attach.
+        #
+        # Transient-grace protection: during a per-endpoint grace window the
+        # session record IS present (only the endpoint slot is None), so
+        # condition (3) doesn't fire and the host keeps their slot.
+        #
+        # We update room["host"] BEFORE sending the 'connected' snapshot so
+        # the new client sees the corrected host_id immediately, then
+        # broadcast host_changed to OTHER peers AFTER sending 'connected'
+        # so messages stay properly ordered.
+        host_id = room.get("host")
+        host_player = room["players"].get(host_id) if host_id else None
+        host_session = room.get("sessions", {}).get(host_id) if host_id else None
+        room_age = time.monotonic() - room.get("created_at", time.monotonic())
+        host_truly_gone = (
+            host_id is None
+            or host_player is None
+            or (host_player.get("ever_attached") and host_session is None)
+            or (
+                host_player is not None
+                and not host_player.get("ever_attached")
+                and room_age > HOST_CREATOR_GRACE_SEC
+            )
+        )
+        host_was_self_healed = False
+        if host_truly_gone:
+            new_host = _promote_host(room)
+            if new_host is not None and new_host != host_id:
+                host_was_self_healed = True
+
+        # Once the current host has a live highway WS, the one-shot
+        # creator-grace timer is no longer load-bearing: it would either
+        # find ever_attached=True (slow-creator path resolved) or find
+        # the host has changed (self-heal already happened). Cancelling
+        # here avoids leaving an idle 30s sleep task in flight for the
+        # lifetime of every healthy room. The cgt slot is also cleared so
+        # _cleanup_after_grace doesn't try to cancel it again.
+        if player_id == room.get("host"):
+            cgt = room.pop("creator_grace_task", None)
+            if cgt is not None and not cgt.done():
+                cgt.cancel()
 
         await websocket.send_json({
             "type": "connected",
@@ -781,10 +1395,19 @@ def setup(app, context):
             "server_time": time.monotonic() * 1000,
         })
 
-        # On a fresh session (new_session) peers learn the player is here;
-        # on reconnect/takeover the player_id was already visible to peers,
-        # so no new player_connected event is emitted.
-        if transition == "new_session":
+        if host_was_self_healed:
+            await _broadcast(room, {
+                "type": "host_changed",
+                "new_host_id": room["host"],
+            }, exclude=player_id)
+
+        # Peers see player_connected when this is the FIRST highway attach for
+        # this player_id — whether the session is brand-new ('new_session') or
+        # the audio endpoint already opened the session before highway joined
+        # ('first_attach'). On 'reconnect' (replacing a still-live highway slot)
+        # and 'takeover' (different session_id, but same player_id was already
+        # visible to peers), no new player_connected event is needed.
+        if transition in ("new_session", "first_attach"):
             await _broadcast(room, {
                 "type": "player_connected",
                 "player_id": player_id,
@@ -800,7 +1423,125 @@ def setup(app, context):
         except Exception as e:
             print(f"[Multiplayer] WS error for {player_id}: {e}")
         finally:
-            await _on_highway_disconnect(websocket, room, player_id)
+            await _on_endpoint_disconnect(websocket, room, player_id, _HIGHWAY)
+
+    @app.websocket("/ws/plugins/multiplayer/{code}/audio")
+    async def multiplayer_audio_ws(
+        websocket: WebSocket,
+        code: str,
+        player_id: str = "",
+        session_id: str = "",
+    ):
+        # Accept-then-close pattern (PROTOCOL.md "Implementation note (server
+        # side)"): always accept the upgrade so the close-code reaches the
+        # browser as a `close` event with `event.code === 4401`. Closing
+        # before accept yields HTTP 403 in Starlette and the browser only
+        # sees a generic WebSocket error.
+        await websocket.accept()
+
+        code = code.upper()
+        room = _rooms.get(code)
+        if not room or player_id not in room["players"]:
+            await websocket.close(code=_CLOSE_AUTH_FAIL)
+            return
+        if not _is_valid_session_id(session_id):
+            await websocket.close(code=_CLOSE_AUTH_FAIL)
+            return
+
+        # Apply rules 1/2/3 for the audio slot. Same close-code semantics as
+        # the highway slot (4410 / 4409 on takeover/replace). The bounded
+        # send queue + worker for THIS audio_ws is set up inside
+        # _take_session_slot before the rule returns, so by the time other
+        # peers' read loops can see this audio_ws on the room's session map,
+        # its queue/worker are already in place — no race window where a
+        # new attach drops the first frames.
+        await _take_session_slot(websocket, room, player_id, session_id, _AUDIO)
+
+        # An audio attach keeps the room alive even when no highway WS is
+        # currently open — for example during a recovery where /audio reconnects
+        # before /ws. Without this, _connected_count would stay 0 and a pending
+        # 60-second room cleanup would delete the room while audio is still
+        # flowing, leaving listeners stranded with a 404 on their next HTTP
+        # action. The legacy `connected` flag tracks "any live endpoint exists";
+        # `player["ws"]` stays whatever the highway handler last set (None when
+        # highway is closed) so _broadcast still skips this player on JSON
+        # control-plane messages it can't deliver.
+        #
+        # Importantly, audio alone must NOT mark the player as "ever attached"
+        # for host self-heal purposes. That sticky flag is reserved for the
+        # highway WS — the control plane is what actually lets a player do
+        # host duties (receive host_changed, send play/pause/etc). A creator
+        # who only opens /audio without /ws should still be considered
+        # abandoned-from-the-control-plane and lose the host slot to a
+        # connected highway peer once the creator-grace window expires.
+        player = room["players"][player_id]
+        player["connected"] = True
+        player["last_seen"] = time.monotonic()
+        task = _cleanup_tasks.pop(code, None)
+        if task:
+            task.cancel()
+
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+
+                # Self-check: if this socket has been superseded by a same-
+                # session reconnect (Rule 2) or different-session takeover
+                # (Rule 3) since we entered the loop, our slot in the session
+                # record now points at a NEW ws. Continuing to forward frames
+                # from THIS (old) ws would put two senders on the same
+                # player_id and violate the single-active-slot invariant
+                # PROTOCOL.md guarantees. Exit the loop; the deferred close
+                # already scheduled by Rule 2 / takeover will close us
+                # cleanly with 4410 / 4409.
+                live_sess = room.get("sessions", {}).get(player_id)
+                if live_sess is None or live_sess.get("audio_ws") is not websocket:
+                    break
+
+                payload = message.get("bytes")
+                if payload is None:
+                    # Non-binary frame on the audio WS — drop silently per
+                    # PROTOCOL.md "binary frames only". Servers MAY also close;
+                    # v1 implementation chooses to drop and keep the connection.
+                    continue
+
+                verdict = _classify_audio_frame(payload)
+                if verdict == "size_violation":
+                    # Frame too big / truncated header / body length mismatch:
+                    # drop and close with 1009 per PROTOCOL.md "Frame size
+                    # budget and bounds".
+                    await _safe_close(websocket, _CLOSE_FRAME_TOO_BIG)
+                    break
+                if verdict == "drop":
+                    # Bad magic or version mismatch: drop, keep connection.
+                    continue
+
+                # Verdict "ok": fan out byte-for-byte to every other audio
+                # subscriber in the same room. The Opus payload is never
+                # touched — only header validation happened above.
+                #
+                # Each peer has its own bounded send queue drained by a single
+                # worker bound to that peer's audio_ws. _enqueue_audio_frame
+                # is non-blocking: on overflow it drops the OLDEST queued
+                # frame so a slow peer stays bounded in memory and a recovering
+                # peer falls at most _AUDIO_SEND_QUEUE_MAX frames behind. The
+                # sender's read loop never awaits any send, so a slow peer
+                # cannot head-of-line-block forwarding to others OR stall the
+                # next inbound frame.
+                for pid, peer_sess in list(room.get("sessions", {}).items()):
+                    if pid == player_id:
+                        continue
+                    if peer_sess.get("audio_ws") is None:
+                        continue
+                    _enqueue_audio_frame(peer_sess, payload)
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            print(f"[Multiplayer] Audio WS error for {player_id}: {e}")
+        finally:
+            await _on_endpoint_disconnect(websocket, room, player_id, _AUDIO)
 
     async def _handle_message(room, player_id, data):
         msg_type = data.get("type", "")
@@ -931,24 +1672,5 @@ def setup(app, context):
                 "now_playing": -1,
             })
 
-    def _start_cleanup(code):
-        """Start 60s grace period before destroying a room."""
-        if code in _cleanup_tasks:
-            return
-        _cleanup_tasks[code] = asyncio.ensure_future(_cleanup_after_grace(code))
-
-    async def _cleanup_after_grace(code, seconds=60):
-        await asyncio.sleep(seconds)
-        room = _rooms.get(code)
-        if room and _connected_count(room) == 0:
-            # Cancel any session-grace tasks before discarding the room so the
-            # tasks don't fire against a deleted room dict.
-            for sess in room.get("sessions", {}).values():
-                _cancel_grace_tasks(sess)
-            del _rooms[code]
-            # Clean up files
-            room_dir = MP_DIR / code
-            if room_dir.exists():
-                shutil.rmtree(str(room_dir), ignore_errors=True)
-            print(f"[Multiplayer] Room {code} destroyed after grace period")
-        _cleanup_tasks.pop(code, None)
+    # _start_cleanup and _cleanup_after_grace live at module level (above)
+    # so module-level coroutines can call them — see comment there.
