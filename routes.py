@@ -256,18 +256,30 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
     # new record and they early-return instead of scheduling a grace task on
     # the orphaned `existing` dict.
     _cancel_grace_tasks(existing)
-    # Cancel the prior session's audio worker too — the new session's
-    # _setup_audio_worker (if endpoint is audio) installs a fresh one bound
-    # to the new ws.
-    await _cleanup_audio_worker(existing)
     old_highway_ws = existing.get("highway_ws")
     old_audio_ws = existing.get("audio_ws")
+    # Swap the session record FIRST, BEFORE awaiting the old worker's
+    # shutdown. _cleanup_audio_worker below yields to the event loop; if
+    # sessions[player_id] still pointed at the OLD record during that yield,
+    # an old endpoint handler's finally block could schedule a grace task
+    # on the soon-to-be-replaced record, and that timer would later resolve
+    # sessions[player_id] to the NEW record and close it with 4408 before
+    # its other endpoint attached. Swapping first makes any concurrent
+    # finally see sessions[player_id] = rec, fail its `is websocket (old)`
+    # check, and early-return cleanly.
+    old_existing = existing
     rec = _new_session_record(session_id)
     rec[slot] = websocket
     rec[f"{endpoint}_ever_opened"] = True
     sessions[player_id] = rec
     if endpoint == _AUDIO:
         _setup_audio_worker(rec)
+    # Cancel the OLD session's worker. Operates on a detached old_existing
+    # reference (sessions[player_id] no longer points at it), so the
+    # _cleanup_audio_worker reference-check at the end of its body simply
+    # confirms old_existing.audio_send_worker is still its own captured
+    # value and clears the slot on the OLD dict — never touches the new.
+    await _cleanup_audio_worker(old_existing)
     # Clear the player's stale highway-WS reference. After rule 3 the new
     # session's highway_ws is None until the new tab's highway WS connects;
     # leaving player["ws"] pointing at the just-closed old highway makes
@@ -347,25 +359,54 @@ async def _audio_send_worker(ws, queue):
 
 async def _cleanup_audio_worker(sess):
     """Cancel the audio worker (if any), wait for it to actually exit, and
-    clear the queue. Safe to call on a session that has no worker (no-op).
+    clear the queue — but only if the slot still references the worker we
+    captured. Safe to call on a session that has no worker (no-op).
 
-    Why this is async / awaits the cancelled task: cancel() only REQUESTS
+    Why async / awaits the cancelled task: cancel() only REQUESTS
     cancellation. If the worker is currently inside `await ws.send_bytes(...)`
     when we cancel it, the next caller of `audio_ws.close(...)` would race
     against the still-running send and the close can fail silently (ASGI
     forbids concurrent senders on the same WebSocket). Awaiting the
     cancelled task here guarantees the worker has fully exited before we
-    return, so any subsequent close on the same ws is the sole sender.
+    return.
+
+    Why we capture the worker reference and re-check before clobbering:
+    the `await` below yields to the event loop. During that yield, a
+    reattach via `_take_session_slot` can install a FRESH worker into
+    `sess["audio_send_worker"]`. If we unconditionally cleared
+    `sess["audio_send_worker"] = None` on resume, we'd silently drop the
+    new worker and the reattached client would be muted. Re-checking that
+    the slot still points at our captured worker preserves a fresh worker
+    installed concurrently.
+
+    Why we re-raise CancelledError when worker.cancelled() is False: if
+    OUR task is being cancelled externally (e.g. `_grace_then_finalize_endpoint`
+    is cancelled by a same-session reconnect while we're awaiting worker
+    teardown), `await worker` raises CancelledError but the worker may
+    have completed normally. We must propagate that cancellation so the
+    grace timer doesn't continue popping the session.
     """
     worker = sess.get("audio_send_worker")
-    if worker is not None and not worker.done():
-        worker.cancel()
-        try:
-            await worker
-        except (asyncio.CancelledError, Exception):
-            pass
-    sess["audio_send_worker"] = None
-    sess["audio_send_queue"] = None
+    if worker is None:
+        return
+    if worker.done():
+        if sess.get("audio_send_worker") is worker:
+            sess["audio_send_worker"] = None
+            sess["audio_send_queue"] = None
+        return
+    worker.cancel()
+    try:
+        await worker
+    except asyncio.CancelledError:
+        if not worker.cancelled():
+            # Our caller was cancelled, not the worker we cancelled.
+            # Propagate so cancellation semantics aren't broken.
+            raise
+    except Exception:
+        pass
+    if sess.get("audio_send_worker") is worker:
+        sess["audio_send_worker"] = None
+        sess["audio_send_queue"] = None
 
 
 def _setup_audio_worker(sess):
