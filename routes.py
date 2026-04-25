@@ -1119,10 +1119,17 @@ def setup(app, context):
         # `player["ws"]` stays whatever the highway handler last set (None when
         # highway is closed) so _broadcast still skips this player on JSON
         # control-plane messages it can't deliver.
+        #
+        # Importantly, audio alone must NOT mark the player as "ever attached"
+        # for host self-heal purposes. That sticky flag is reserved for the
+        # highway WS — the control plane is what actually lets a player do
+        # host duties (receive host_changed, send play/pause/etc). A creator
+        # who only opens /audio without /ws should still be considered
+        # abandoned-from-the-control-plane and lose the host slot to a
+        # connected highway peer once the creator-grace window expires.
         player = room["players"][player_id]
         player["connected"] = True
         player["last_seen"] = time.monotonic()
-        player["ever_attached"] = True
         task = _cleanup_tasks.pop(code, None)
         if task:
             task.cancel()
@@ -1154,17 +1161,23 @@ def setup(app, context):
                 # Verdict "ok": fan out byte-for-byte to every other audio
                 # subscriber in the same room. The Opus payload is never
                 # touched — only header validation happened above.
+                #
+                # Sends run concurrently via asyncio.gather so a slow peer
+                # can't head-of-line-block forwarding to other listeners or
+                # stall the read loop on the next inbound frame from this
+                # sender. Exceptions are returned (return_exceptions=True)
+                # and silently dropped — dead sockets' own handlers will
+                # clean themselves up.
+                send_coros = []
                 for pid, sess in list(room.get("sessions", {}).items()):
                     if pid == player_id:
                         continue
                     other_audio = sess.get("audio_ws")
                     if other_audio is None:
                         continue
-                    try:
-                        await other_audio.send_bytes(payload)
-                    except Exception:
-                        # Skip dead sockets; their own handler will clean up.
-                        pass
+                    send_coros.append(other_audio.send_bytes(payload))
+                if send_coros:
+                    await asyncio.gather(*send_coros, return_exceptions=True)
         except WebSocketDisconnect:
             pass
         except Exception as e:

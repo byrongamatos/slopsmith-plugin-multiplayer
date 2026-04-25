@@ -513,6 +513,37 @@ def fast_creator_grace(routes_module):
     yield 0.3
 
 
+def test_audio_only_creator_does_not_set_ever_attached(client, routes_module, fast_creator_grace):
+    """Codex round 4 P2: a creator who opens ONLY /audio (never /ws) must NOT
+    flip ever_attached. The host self-heal logic uses ever_attached to mean
+    "showed up on the control plane"; audio alone is irrelevant for host
+    duties. Without this gate, an audio-only creator would be considered
+    'attached' and the abandoned-creator timer wouldn't fire."""
+    code, host_pid = _create_room(client)
+    other_pid = _join_room(client, code, "Bob")
+    room = routes_module._rooms[code]
+
+    # Creator opens ONLY /audio, never /ws.
+    with client.websocket_connect(_audio_url(code, host_pid, "host-sid")), \
+         client.websocket_connect(_highway_url(code, other_pid, "bob-sid")) as bob_hw:
+        bob_hw.receive_json()
+        # Despite the audio attach, ever_attached must still be False on the
+        # host record — the abandoned-creator semantics only care about
+        # control-plane presence.
+        assert room["players"][host_pid]["ever_attached"] is False, (
+            "audio-only attach must NOT flip ever_attached; that flag is "
+            "reserved for highway WS attach (control-plane presence)"
+        )
+
+        # Wait past the (shrunk) creator-grace window. The timer must fire
+        # because the creator is still considered abandoned (no control-plane
+        # WS), and bob is the eligible guest.
+        time.sleep(fast_creator_grace * 2.5)
+        evt = bob_hw.receive_json()
+        assert evt["type"] == "host_changed"
+        assert evt["new_host_id"] == other_pid
+
+
 def test_abandoned_creator_grace_fires_when_guest_already_connected(client, routes_module, fast_creator_grace):
     """Codex round 6 P1: abandoned-creator self-heal must also fire on a
     timer, not just on a subsequent highway attach. A guest who connected
