@@ -17,7 +17,7 @@ Both endpoints share the same room registry and authentication state: the connec
 ws://<host>/ws/plugins/multiplayer/{code}?player_id={id}&session_id={sid}
 ```
 
-`session_id` is a client-generated random identifier (UUIDv4 recommended; e.g. `crypto.randomUUID()`) that uniquely identifies a single browser tab / app instance for the lifetime of the session. The client mints it when it starts trying to connect and keeps it in `sessionStorage` (or equivalent) so reconnects after a network blip carry the same `session_id`. A different tab gets a different `session_id`. **`session_id` is REQUIRED on the highway WS as of this protocol revision.** Already-shipped clients that pre-date this revision and do not send `session_id` are not the same protocol version and SHOULD be updated; servers MAY accept legacy connections (see "Legacy clients" under Server policy below) but MUST NOT treat them interchangeably with `session_id`-aware clients.
+`session_id` is a client-generated random identifier (UUIDv4 recommended; e.g. `crypto.randomUUID()`) that uniquely identifies a single browser tab / app instance for the lifetime of the session. The client mints it when it starts trying to connect and keeps it in `sessionStorage` (or equivalent) so reconnects after a network blip carry the same `session_id`. A different tab gets a different `session_id`. **`session_id` is REQUIRED.** Connections without `session_id` are rejected with close code `4401` (treated as a malformed-handshake auth failure). Because slopsmith plugins ship client and server code as one unit (the user updates `routes.py` and `screen.js` atomically when they update the plugin), there is no in-the-wild legacy client problem to maintain compatibility for: the audio feature has not shipped, and Phase 1 will land the `session_id` requirement on the highway WS in the same release that introduces the audio WS.
 
 Carries all control messages. The message types used by the audio feature are documented under "Audio control messages" below; the existing playback/queue/recording messages are unchanged.
 
@@ -72,7 +72,7 @@ The two close codes carry the entire required signal — clients MUST branch on 
 
 Why a `session_id` is needed at all: without it, a single tab opening its second endpoint is indistinguishable from a different tab taking over, since both arrive as "a new connection for the same `player_id`." `session_id` lets the server make that distinction deterministically without having to time-window or guess. The two close codes (`4409` vs `4410`) carry the disambiguation back to the closed-out client.
 
-**Legacy clients (no `session_id` supplied).** Already-shipped highway clients pre-date this protocol revision and never send `session_id`. To avoid livelock — where two such tabs each reconnect after every supersession and steal the session back from each other indefinitely — servers handling a connection without `session_id` MUST apply **first-wins** semantics for legacy connections: if a session already exists for this `player_id` (whether legacy or `session_id`-aware), the new legacy connection is rejected with `4409` and is NOT accepted. Legacy clients see `4409` and (by their existing logic) reconnect; the second reject keeps the duplicate from displacing the active session. Legacy support is intended as a transition path; new client builds MUST send `session_id`.
+**Connections without `session_id`** are rejected with close code `4401` (using the accept-then-close pattern documented above on the audio WS, or the existing JSON-error-then-close pattern on the highway WS). Phase 1 ships the server and client changes together, so no transition path or livelock-avoidance is needed — every conformant client of v1.1+ sends `session_id`.
 
 Phase 1 will tighten the existing highway WS handler in `routes.py` to enforce these rules (today it overwrites `player["ws"]` without closing the old socket and accepts duplicate sessions silently; that becomes a bug under the new audio feature).
 
@@ -156,7 +156,13 @@ Server response — broadcast to all peers:
 { "type": "broadcaster_changed", "broadcaster_id": null }
 ```
 
-A disconnect on the audio WS by the broadcaster has the same effect.
+The server also clears `broadcaster_id` (and emits the `broadcaster_changed` null event above) when the broadcaster's **session ends**. A session ends when:
+
+- The broadcaster's audio WS closes for any reason **other than** a `4410` (same-session reconnect — see Endpoints / Server policy). On a `4410`, the slot is being immediately replaced by the same session; the broadcaster_id is preserved across the gap. Servers MUST therefore distinguish "audio WS gone, session still alive (4410 in flight or just completed)" from "audio WS gone, session ended (everything else)" before deciding whether to emit `broadcaster_changed: null`.
+- The broadcaster's highway WS closes for any reason other than a `4410`.
+- The broadcaster's room is torn down (existing 60-second grace period).
+
+In short: a `4410` close is a slot replacement, not a broadcast stop. Listeners should NOT see `broadcaster_changed: null` followed by another `broadcaster_changed: <same-id>` for what was actually a single uninterrupted broadcast.
 
 ### `audio_quality` — listener-reported telemetry (optional)
 
@@ -289,7 +295,7 @@ The helper is currently CommonJS-only because slopsmith core's plugin loader ser
 2. **Audio WS open.** Any time after the highway WS connects, the client opens the audio WS. v1: clients open it eagerly on room join so that broadcasts can start instantly.
 3. **Broadcast.** A user toggles "broadcast my sound." The client sends `broadcast_start` on the highway WS. Server validates, stores `broadcaster_id`, broadcasts `broadcaster_changed` to all peers. The client begins streaming binary frames on the audio WS.
 4. **Listen.** Every other peer's listener pipeline activates when the client first observes a non-null `broadcaster_id` for the room — either via the initial `connected` room snapshot's `broadcaster_id` field (for clients joining mid-broadcast — late joiners) or via a fresh `broadcaster_changed` event with non-null id (for clients in the room when the broadcast starts). Both signals are treated equivalently. The listener reads binary frames on the audio WS, decodes, and schedules playback using the frame's authoritative interval duration: the next-interval start is `chart_time_end` (and the playable duration is `chart_time_end − chart_time_start`). Listeners MUST NOT compute the interval boundary from `interval_beats × 60 / bpm`, because that calculation breaks when a tempo change occurs inside or at the boundary of an interval; the frame header is the single source of truth.
-5. **Stop.** Broadcaster sends `broadcast_stop` (or disconnects audio WS). Server clears `broadcaster_id`, broadcasts `broadcaster_changed` with `null`. Listeners drain pending intervals and tear down their audio graph.
+5. **Stop.** Broadcaster sends `broadcast_stop`, OR the broadcaster's session ends (audio or highway WS closes for any reason other than a `4410` same-session reconnect). Server clears `broadcaster_id`, broadcasts `broadcaster_changed` with `null`. Listeners drain pending intervals and tear down their audio graph. A `4410` slot-replacement is NOT a stop — see "broadcast_stop" above.
 6. **Pause/seek (existing host control).** Existing playback semantics apply: when the host pauses, all clients pause. Listeners must `.stop()` any in-flight `AudioBufferSourceNode`s when the chart pauses, and rebuild the playback queue against the new chart time when playback resumes (since pending buffers may now schedule into the past or future incorrectly).
 7. **Room teardown.** Existing 60-second grace period applies to both WS endpoints. Audio subscribers are dropped on player disconnect; if the dropped player was the broadcaster, the room is updated and peers notified.
 
