@@ -150,10 +150,20 @@ async def _take_highway_slot(websocket, room, player_id, session_id):
         return "reconnect"
 
     # Rule 3: takeover by a different session_id — close BOTH old endpoints.
+    # Replace the session record FIRST, then close the old sockets. Each
+    # `await _safe_close(...)` yields to the event loop, which lets the OLD
+    # highway handler's finally block run and call `_on_highway_disconnect`.
+    # That helper checks `sess.get("highway_ws") is websocket` against the
+    # CURRENT session record — so by the time it runs, sessions[player_id] is
+    # already the new record and the helper sees `is websocket (old)` → False
+    # and early-returns instead of scheduling a grace task on the orphaned
+    # `existing` dict and transiently nulling out `player["ws"]`.
     _cancel_grace_tasks(existing)
-    await _safe_close(existing.get("highway_ws"), _CLOSE_SUPERSEDED)
-    await _safe_close(existing.get("audio_ws"), _CLOSE_SUPERSEDED)
+    old_highway_ws = existing.get("highway_ws")
+    old_audio_ws = existing.get("audio_ws")
     sessions[player_id] = _new_session_record(session_id, highway_ws=websocket)
+    await _safe_close(old_highway_ws, _CLOSE_SUPERSEDED)
+    await _safe_close(old_audio_ws, _CLOSE_SUPERSEDED)
     return "takeover"
 
 
@@ -751,7 +761,8 @@ def setup(app, context):
 
         # Apply PROTOCOL.md connection-arrival rules. May close prior sockets
         # for this player_id with 4410 (same-session reconnect) or 4409
-        # (different-session takeover) before accepting this one.
+        # (different-session takeover) before this socket's "connected" frame
+        # is sent. The WebSocket upgrade itself was already accepted above.
         transition = await _take_highway_slot(websocket, room, player_id, session_id)
 
         player = room["players"][player_id]
