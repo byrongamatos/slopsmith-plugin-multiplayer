@@ -686,11 +686,15 @@ def setup(app, context):
                     "connected": False,
                     "ws": None,
                     "last_seen": time.monotonic(),
-                    # Sticky flag: True the first time this player opens any
-                    # WS (highway or audio). Used by the host self-heal
-                    # logic to distinguish "creator hasn't connected yet"
-                    # (never_attached, keep host) from "host connected
-                    # once and then expired" (attached_then_gone, self-heal).
+                    # Sticky flag: True the first time this player opens the
+                    # highway/control-plane WS. Audio-only WS attachment
+                    # does NOT set this — the host self-heal cares about
+                    # control-plane presence (sending host commands /
+                    # receiving host_changed), which only the highway WS
+                    # provides. Used to distinguish "creator hasn't
+                    # connected yet" (never_attached, keep host) from
+                    # "host connected once and then expired"
+                    # (attached_then_gone, self-heal).
                     "ever_attached": False,
                 }
             },
@@ -1287,6 +1291,18 @@ def setup(app, context):
             new_host = _promote_host(room)
             if new_host is not None and new_host != host_id:
                 host_was_self_healed = True
+
+        # Once the current host has a live highway WS, the one-shot
+        # creator-grace timer is no longer load-bearing: it would either
+        # find ever_attached=True (slow-creator path resolved) or find
+        # the host has changed (self-heal already happened). Cancelling
+        # here avoids leaving an idle 30s sleep task in flight for the
+        # lifetime of every healthy room. The cgt slot is also cleared so
+        # _cleanup_after_grace doesn't try to cancel it again.
+        if player_id == room.get("host"):
+            cgt = room.pop("creator_grace_task", None)
+            if cgt is not None and not cgt.done():
+                cgt.cancel()
 
         await websocket.send_json({
             "type": "connected",

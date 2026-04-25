@@ -248,12 +248,56 @@ def test_audio_worker_cleaned_up_on_grace_expiry(client, routes_module, fast_gra
     assert worker.done() or worker.cancelled()
 
 
-def test_send_queue_drops_oldest_on_overflow(client, routes_module):
-    """Codex round 5 P1: a slow listener's queue must be bounded. The sender
-    pushes more than _AUDIO_SEND_QUEUE_MAX frames before the listener has
-    drained anything; the OLDEST frames must be dropped, the newest
-    _AUDIO_SEND_QUEUE_MAX must be preserved, and the sender's read loop
-    must not have stalled."""
+async def test_enqueue_audio_frame_bounded_queue(routes_module):
+    """Direct unit test of `_enqueue_audio_frame`'s drop-oldest-on-overflow.
+
+    The previous version of this test went through TestClient sockets and
+    relied on `bob_audio.receive_bytes(timeout=...)` — but Starlette's
+    WebSocketTestSession.receive_bytes() doesn't accept a timeout kwarg,
+    so the call raised TypeError immediately and the broad `except` made
+    the test pass vacuously regardless of bound enforcement. Codex
+    correctly flagged that as a false positive.
+
+    This unit test exercises the helper directly without any sockets:
+    construct a bounded asyncio.Queue, push 3× capacity into it via
+    `_enqueue_audio_frame`, and assert the queue retained exactly the
+    most recent _AUDIO_SEND_QUEUE_MAX frames (drop-oldest semantics).
+    """
+    import asyncio
+
+    sess = {
+        "audio_send_queue": asyncio.Queue(maxsize=routes_module._AUDIO_SEND_QUEUE_MAX),
+        "audio_send_worker": None,  # no worker draining; pure-bound test
+    }
+    max_frames = routes_module._AUDIO_SEND_QUEUE_MAX
+    n_sent = max_frames * 3
+
+    for i in range(n_sent):
+        routes_module._enqueue_audio_frame(sess, f"frame-{i}".encode())
+
+    queue = sess["audio_send_queue"]
+    assert queue.qsize() == max_frames, (
+        f"queue size {queue.qsize()} != _AUDIO_SEND_QUEUE_MAX={max_frames}; "
+        f"_enqueue_audio_frame must cap the queue at the configured maximum"
+    )
+
+    # Drain and verify the retained frames are the MOST RECENT max_frames
+    # sent (drop-OLDEST policy, not drop-newest).
+    retained = []
+    while not queue.empty():
+        retained.append(queue.get_nowait())
+    expected = [f"frame-{i}".encode() for i in range(n_sent - max_frames, n_sent)]
+    assert retained == expected, (
+        "drop-oldest policy violated: queue retained the wrong frames"
+    )
+
+
+def test_send_queue_does_not_deadlock_under_load(client, routes_module):
+    """Smoke test that the audio relay stays alive when the sender pushes
+    more frames than the queue can hold. Validates the read loop doesn't
+    stall on a slow peer (per the fire-and-forget design); the strict
+    bound assertion lives in test_enqueue_audio_frame_bounded_queue
+    above (a deterministic unit test)."""
     code, host_pid = _create_room(client)
     bob_pid = _join_room(client, code, "Bob")
 
@@ -261,44 +305,20 @@ def test_send_queue_drops_oldest_on_overflow(client, routes_module):
          client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")) as bob_audio:
 
         max_frames = routes_module._AUDIO_SEND_QUEUE_MAX
-        n_sent = max_frames * 3  # send 3× capacity
+        n_sent = max_frames * 3
 
-        # Stuff frames in fast without bob receiving — the test client may
-        # actually pull behind the scenes, but we lean on the server-side
-        # bounded queue + drop-oldest semantics.
         for i in range(n_sent):
             payload = f"FRAME-{i:04d}".encode().ljust(40, b".")
             host_audio.send_bytes(_build_audio_frame(payload, interval_index=i))
 
-        # Confirm sender wasn't stalled — drive a deterministic round-trip
-        # through the audio relay by sending a marker frame from bob and
-        # reading it on host. The relay should have processed all sender
-        # frames already (or dropped overflow) by the time bob's marker
-        # shows up.
+        # Drive a deterministic round-trip through the audio relay: bob
+        # sends a marker frame, server fans out to host. Host receiving
+        # the marker proves the read loop didn't deadlock under the
+        # earlier load.
         marker = _build_audio_frame(b"MARKER", interval_index=99999)
         bob_audio.send_bytes(marker)
-        # Host receives bob's marker — confirms the relay is still alive
-        # and the sender's read loop didn't deadlock.
         first_host_recv = host_audio.receive_bytes()
         assert first_host_recv == marker
-
-        # Bob now drains whatever the queue retained. In the worst case
-        # (overflow) bob receives only the most recent _AUDIO_SEND_QUEUE_MAX
-        # frames — never more, possibly fewer if the worker was draining
-        # concurrently. The CRITICAL invariant: bob's queue did not grow
-        # unboundedly to all n_sent frames.
-        received = []
-        # Read non-blockingly using a generous bounded loop.
-        for _ in range(n_sent + 5):
-            try:
-                received.append(bob_audio.receive_bytes(timeout=0.05))
-            except Exception:
-                break
-        assert len(received) <= max_frames + 2, (
-            f"bob received {len(received)} frames; expected at most "
-            f"_AUDIO_SEND_QUEUE_MAX (={max_frames}) plus a small concurrency "
-            f"slop. The bounded queue did not drop overflow."
-        )
 
 
 def test_two_listeners_both_receive_host_frame(client):
