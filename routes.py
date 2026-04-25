@@ -90,9 +90,19 @@ def _connected_count(room):
 
 
 def _promote_host(room):
-    """Promote the first connected player to host."""
+    """Promote the first player with an active highway WS to host.
+
+    Audio-only "connected" players (player["connected"] is True for room
+    liveness, but player["ws"] is None because their highway WS hasn't
+    reattached yet) are NOT eligible — the host needs a control plane to
+    receive `host_changed` and to send host-only commands. Promoting an
+    audio-only player would leave the room without a usable host until
+    that client's highway socket comes back. Falling back to "any
+    connected player" is a no-op vs. returning None: the room genuinely
+    has no usable host until at least one highway WS exists.
+    """
     for pid, p in room["players"].items():
-        if p["connected"]:
+        if p["connected"] and p.get("ws") is not None:
             room["host"] = pid
             return pid
     return None
@@ -121,6 +131,12 @@ def _new_session_record(session_id, highway_ws=None, audio_ws=None):
         "audio_ws": audio_ws,
         "highway_grace_task": None,
         "audio_grace_task": None,
+        # Sticky flags: True the first time the slot is ever filled within
+        # this session, never reset. Used to distinguish "first_attach"
+        # (slot never opened) from "reconnect" (slot was open before, just
+        # temporarily None during a grace window).
+        "highway_ever_opened": highway_ws is not None,
+        "audio_ever_opened": audio_ws is not None,
     }
 
 
@@ -173,24 +189,32 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
     if existing is None:
         rec = _new_session_record(session_id)
         rec[slot] = websocket
+        rec[f"{endpoint}_ever_opened"] = True
         sessions[player_id] = rec
         return "new_session"
 
     if existing["session_id"] == session_id:
-        # Rule 2: matching session_id. Either the same endpoint is reconnecting
-        # over its prior socket (true 'reconnect'), or this slot was empty and
-        # the new connection is the first attach for THIS endpoint of an
-        # already-existing session ('first_attach').
+        # Rule 2: matching session_id. Three sub-cases distinguished by the
+        # sticky `<endpoint>_ever_opened` flag plus the current slot value:
+        #   * never opened before → 'first_attach' (peers should see the
+        #     player come online for the first time on the highway side).
+        #   * opened before, slot currently filled → 'reconnect' with 4410
+        #     to the old socket (slot was live; we replaced it).
+        #   * opened before, slot currently None → 'reconnect' silent
+        #     (slot dropped during a grace window and is reattaching).
+        ever_key = f"{endpoint}_ever_opened"
+        ever_opened_before = existing.get(ever_key, False)
         old_ws = existing[slot]
         existing[slot] = websocket
+        existing[ever_key] = True
         # Reattach cancels any in-flight grace timer for this endpoint only.
         t = existing.get(grace)
         if t and not t.done():
             t.cancel()
         existing[grace] = None
-        if old_ws is None:
+        if not ever_opened_before:
             return "first_attach"
-        if old_ws is not websocket:
+        if old_ws is not None and old_ws is not websocket:
             await _safe_close(old_ws, _CLOSE_REPLACED)
         return "reconnect"
 
@@ -207,6 +231,7 @@ async def _take_session_slot(websocket, room, player_id, session_id, endpoint):
     old_audio_ws = existing.get("audio_ws")
     rec = _new_session_record(session_id)
     rec[slot] = websocket
+    rec[f"{endpoint}_ever_opened"] = True
     sessions[player_id] = rec
     await _safe_close(old_highway_ws, _CLOSE_SUPERSEDED)
     await _safe_close(old_audio_ws, _CLOSE_SUPERSEDED)

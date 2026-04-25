@@ -378,6 +378,76 @@ def test_audio_only_session_keeps_room_alive(client, routes_module, fast_grace):
         )
 
 
+def test_highway_reconnect_during_grace_does_not_emit_player_connected(client, fast_grace):
+    """Codex round 2 P2: a same-session_id highway reconnect that lands
+    while the OLD highway is in its grace window (audio still alive) is a
+    'reconnect', NOT a 'first_attach'. Peers must NOT see a fresh
+    player_connected — the player never went offline."""
+    code, host_pid = _create_room(client)
+    bob_pid = _join_room(client, code, "Bob")
+
+    with client.websocket_connect(_highway_url(code, host_pid, "host-sid")) as host_hw:
+        host_hw.receive_json()  # 'connected'
+
+        # Bob attaches BOTH highway and audio; host sees player_connected once.
+        with client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")):
+            with client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw_1:
+                bob_hw_1.receive_json()
+                evt = host_hw.receive_json()
+                assert evt["type"] == "player_connected"
+                assert evt["player_id"] == bob_pid
+            # Bob's highway closed (context exit). Audio still open.
+            # Within grace, bob's highway reconnects with the SAME session_id.
+            with client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw_2:
+                bob_hw_2.receive_json()
+                # Drive a deterministic event from bob_hw_2 the server forwards
+                # to host: set_arrangement → arrangement_changed. If this branch
+                # mistakenly fires another player_connected, host would see it
+                # FIRST, before arrangement_changed.
+                bob_hw_2.send_json({"type": "set_arrangement", "arrangement": "Bass"})
+                evt2 = host_hw.receive_json()
+                assert evt2["type"] == "arrangement_changed", (
+                    f"highway reconnect during grace must not emit a fresh "
+                    f"player_connected; got {evt2['type']!r}"
+                )
+
+
+def test_promote_host_skips_audio_only_players(client, routes_module, fast_grace):
+    """Codex round 2 P2: _promote_host must skip players whose highway WS
+    isn't currently active — they cannot receive host_changed or send
+    host-only commands. Otherwise leaving the host strands the room."""
+    code, host_pid = _create_room(client)
+    bob_pid = _join_room(client, code, "Bob")
+    carol_pid = _join_room(client, code, "Carol")
+    room = routes_module._rooms[code]
+
+    with client.websocket_connect(_highway_url(code, carol_pid, "carol-sid")) as carol_hw, \
+         client.websocket_connect(_audio_url(code, bob_pid, "bob-sid")):
+        carol_hw.receive_json()  # 'connected'
+
+        # Bob attaches highway then drops it → highway slot None, audio alive.
+        # During the grace window, bob is "connected" for room-liveness purposes
+        # but his player["ws"] is None.
+        with client.websocket_connect(_highway_url(code, bob_pid, "bob-sid")) as bob_hw:
+            bob_hw.receive_json()
+            carol_hw.receive_json()  # player_connected for bob (drain)
+        # bob_hw closed; audio still open. Verify the audio-only state.
+        assert room["players"][bob_pid]["connected"] is True
+        assert room["players"][bob_pid]["ws"] is None
+
+        # Simulate the host being removed so _promote_host has to pick from
+        # {bob (audio-only), carol (highway-active)}. Drop the host's record
+        # directly to avoid the leave_room HTTP path's other side effects.
+        del room["players"][host_pid]
+        room["sessions"].pop(host_pid, None)
+
+        new_host = routes_module._promote_host(room)
+        assert new_host == carol_pid, (
+            f"_promote_host must skip audio-only players "
+            f"(bob_pid={bob_pid}, carol_pid={carol_pid}); got {new_host}"
+        )
+
+
 def test_audio_grace_expiry_closes_highway_with_4408(client, routes_module, fast_grace):
     code, pid = _create_room(client)
     sid = "joint-sid"
