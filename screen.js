@@ -1203,6 +1203,12 @@ function _onSessionEnded() {
     if (_captureCtx && _captureRequested) {
         _captureNeedsReissueAfterReset = true;
     }
+    // Refresh broadcast UI so the pill flips from "⏺ Broadcasting"
+    // back to "⏳ Connecting…" immediately while recovery is in
+    // flight (otherwise it stays stale until the post-recovery
+    // broadcaster_changed eventually fires). Spotted by Copilot
+    // review on PR #9.
+    _renderBroadcastUi();
     // Reset the in-flight interval state so the resumed broadcast
     // doesn't send a frame containing pre-reconnect PCM stamped
     // with stale chart_time. _captureChartTimeAtIntervalStart
@@ -2739,11 +2745,26 @@ async function _bootstrapOnConnected() {
         // its previous value (typically true from the most recent
         // successful bootstrap), so recovery isn't permanently
         // gated.
-        if (_bootstrapInFlight === 0 && bootstrapResult !== null) {
-            _lastBootstrapSucceeded = bootstrapResult === true;
-            if (bootstrapResult === true) {
-                _maybeReissueBroadcastAfterRecovery();
+        if (_bootstrapInFlight === 0) {
+            // Only write _lastBootstrapSucceeded when we have a
+            // definitive result (not superseded). If a newer
+            // bootstrap or a non-bootstrap invalidation superseded
+            // us, leave the previous value intact so recovery
+            // gating keeps reflecting the most recent real outcome.
+            if (bootstrapResult !== null) {
+                _lastBootstrapSucceeded = bootstrapResult === true;
             }
+            // Always give recovery a chance to fire when the last
+            // in-flight bootstrap drains, even on supersede. If we
+            // ARE a superseded bootstrap and /audio is already
+            // open, this would otherwise be the only remaining
+            // call site to flush a pending re-issue, leaving
+            // _captureNeedsReissueAfterReset latched.
+            // _maybeReissueBroadcastAfterRecovery internally gates
+            // on _lastBootstrapSucceeded so a (definitively or
+            // transitively) failed bootstrap won't actually re-send.
+            // Spotted by Copilot review on PR #9.
+            _maybeReissueBroadcastAfterRecovery();
         }
     }
 }
