@@ -1,6 +1,7 @@
 """Multiplayer plugin — synced rooms, shared queue, optional mixdown."""
 
 import asyncio
+import logging
 import math
 import re
 import secrets
@@ -20,6 +21,8 @@ _cleanup_tasks = {}   # code -> asyncio.Task
 _MP_DIR = None        # set by setup(); used by module-level _cleanup_after_grace
 
 # Session lifecycle constants — see PROTOCOL.md "v1 server policy".
+_log = logging.getLogger(__name__)
+
 SESSION_GRACE_SEC = 5.0
 # Cap per-peer cleanup time during a broadcaster handoff. A backpressured
 # or stuck ws.send_bytes on one slow listener should not gate the whole
@@ -791,11 +794,20 @@ async def _purge_audio_for_handoff(room, except_player_id=None):
 
     # Parallelize so handoff latency is bounded by the slowest single
     # peer (capped by _PURGE_TIMEOUT_SEC), not the SUM of all peers'
-    # cleanup latencies.
-    await asyncio.gather(
+    # cleanup latencies. Surface unexpected per-peer failures via
+    # logging — return_exceptions=True swallows them by design, but
+    # silent failure here can leave that listener on a stale worker
+    # without anyone noticing. Spotted by Copilot review on PR #7.
+    results = await asyncio.gather(
         *(_purge_one(pid, sess) for pid, sess in snapshot),
         return_exceptions=True,
     )
+    for (pid, _sess), result in zip(snapshot, results):
+        if isinstance(result, BaseException):
+            _log.warning(
+                "audio handoff purge raised for player %s: %s: %s",
+                pid, type(result).__name__, result,
+            )
 
 
 def _enqueue_audio_frame(sess, payload):
@@ -1771,6 +1783,21 @@ def setup(app, context):
                 # or buggy client could inject audio that peers play even
                 # though no broadcast_start was accepted for them.
                 if room.get("broadcaster_id") != player_id:
+                    continue
+
+                # Also drop while a handoff purge is in flight: the
+                # broadcast_start handler claims broadcaster_id BEFORE
+                # awaiting _purge_audio_for_handoff (so concurrent
+                # broadcast_starts serialize correctly), but accepting
+                # broadcaster frames during that window would feed
+                # them into about-to-be-cancelled listener workers
+                # and cause clipped first intervals. PROTOCOL.md
+                # also requires broadcasters to wait for the
+                # broadcaster_changed ack before sending, so a
+                # well-behaved client won't hit this; the gate is
+                # belt-and-suspenders against buggy/malicious
+                # broadcasters. Spotted by Copilot review on PR #7.
+                if room.get("broadcast_handoff_in_progress", 0) > 0:
                     continue
 
                 # Verdict "ok" + sender is the active broadcaster: fan out

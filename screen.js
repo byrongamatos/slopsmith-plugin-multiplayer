@@ -541,10 +541,25 @@ function _audioListenerEnsureDecoder() {
         if (dec) {
             try { dec.close(); } catch (e) { /* */ }
         }
-        _audioListenerOpusUnsupported = true;
+        // Only mark Opus permanently unsupported when the failure is
+        // a clear NotSupportedError. Other errors (transient resource
+        // limits, InvalidStateError from an unlucky lifecycle race)
+        // should be retryable on the next inbound frame — without
+        // this distinction, a single transient failure would mute
+        // peer audio for the rest of the session. Spotted by Copilot
+        // review on PR #7.
+        const sticky = err && err.name === 'NotSupportedError';
+        if (sticky) {
+            _audioListenerOpusUnsupported = true;
+        }
         if (!_audioListenerWebCodecsWarned) {
             _audioListenerWebCodecsWarned = true;
-            console.warn('[MP] AudioDecoder Opus configure failed; peer audio playback disabled.', err);
+            console.warn(
+                sticky
+                    ? '[MP] AudioDecoder Opus configure failed (NotSupportedError); peer audio playback disabled for this session.'
+                    : '[MP] AudioDecoder Opus configure failed transiently; will retry on next frame.',
+                err
+            );
         }
         return null;
     }
@@ -641,6 +656,15 @@ function _audioListenerHandleFrame(header, opus) {
     // also rate-limit how many can exist).
     const ctx = _audioListenerEnsureContext();
     if (!ctx) return;
+    if (ctx.state !== 'running') {
+        // Pre-decode gate. The output handler also drops on suspended
+        // context, but by then we've paid for the opus copy + decode.
+        // Drop here so a long autoplay-restricted window (no user
+        // gesture yet) doesn't burn decoder CPU per inbound frame.
+        // Spotted by Copilot review on PR #7.
+        _audioRxRecordDrop('context_suspended');
+        return;
+    }
     const wrapper = _audioListenerEnsureDecoder();
     if (!wrapper) return;
 
