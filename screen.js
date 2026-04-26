@@ -602,10 +602,14 @@ function _audioQualityRxRender() {
     // PROTOCOL.md). Show the rest of dropped (non-decoder) and the
     // decoder count side-by-side so the broadcaster can distinguish
     // "stream is malformed" from "listener can't keep up", without
-    // double-counting them in the issue total. Spotted by Copilot
-    // review on PR #10.
-    const totalDroppedNonDecoder = Math.max(0, totalDropped - totalUnderruns);
-    const issues = totalLate + totalDropped;
+    // double-counting them in the issue total. A buggy / older
+    // client could report `decoder_underruns > intervals_dropped`
+    // (violating the subset invariant); use Math.max to keep
+    // underruns visible in that case. Spotted by Copilot review
+    // on PR #10 rounds 1 + 4.
+    const effectiveDropped = Math.max(totalDropped, totalUnderruns);
+    const totalDroppedNonDecoder = Math.max(0, effectiveDropped - totalUnderruns);
+    const issues = totalLate + effectiveDropped;
     let txt = `${n} listener${n === 1 ? '' : 's'}`;
     if (issues === 0) {
         txt += ' — no issues';
