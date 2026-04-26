@@ -1717,6 +1717,7 @@ let _captureSourceNode = null;
 let _captureWorkletNode = null;
 let _captureAnalyser = null;
 let _captureAnalyserBuffer = null;
+let _captureSilentSink = null;
 let _captureLevelTimer = null;
 let _captureEncoder = null;
 let _captureEncoderChunks = [];     // EncodedAudioChunk byte payloads accumulated for the current interval
@@ -2051,6 +2052,14 @@ async function _broadcastStart(deviceId) {
         _showError('Audio connection not ready — try again in a moment.');
         return;
     }
+    if (!_ws || _ws.readyState !== WebSocket.OPEN) {
+        // Without a live highway WS, broadcast_start can't be sent
+        // and broadcaster_changed can't arrive — we'd burn CPU on
+        // the encoder pipeline while the toggle sat at "Connecting…"
+        // forever. Spotted by Copilot review on PR #8 round 3.
+        _showError('Connection not ready — try again in a moment.');
+        return;
+    }
     _captureRequested = true;
     _captureBroadcasterAcked = false;
     _captureDeviceId = deviceId || null;
@@ -2119,6 +2128,20 @@ async function _broadcastStart(deviceId) {
     _captureAnalyser = _captureCtx.createAnalyser();
     _captureAnalyser.fftSize = 256;
     _captureSourceNode.connect(_captureAnalyser);
+
+    // Silent sink — connect the analyser through a gain=0 node to
+    // ctx.destination. Web Audio doesn't guarantee that nodes which
+    // are not ultimately connected to destination get pulled/
+    // rendered, which can prevent the analyser from getting fresh
+    // data and (more critically) the worklet's process() callback
+    // from being called at all on some browsers. The gain=0
+    // multiplier means we don't actually output any sound to the
+    // listener's speakers — we just keep the graph "alive". Spotted
+    // by Copilot review on PR #8 round 3.
+    _captureSilentSink = _captureCtx.createGain();
+    _captureSilentSink.gain.value = 0;
+    _captureAnalyser.connect(_captureSilentSink);
+    _captureSilentSink.connect(_captureCtx.destination);
 
     try {
         _captureWorkletNode = new AudioWorkletNode(_captureCtx, 'slopsmith-capture-processor', {
@@ -2202,6 +2225,10 @@ function _broadcastStop(opts) {
         _captureAnalyser = null;
     }
     _captureAnalyserBuffer = null;
+    if (_captureSilentSink) {
+        try { _captureSilentSink.disconnect(); } catch (_) { /* */ }
+        _captureSilentSink = null;
+    }
     if (_captureEncoder) {
         try { _captureEncoder.close(); } catch (_) { /* */ }
         _captureEncoder = null;
@@ -2244,16 +2271,31 @@ function _captureOnBroadcasterChanged(broadcasterId) {
     // whether the server accepted our broadcast_start (ack flips
     // _captureBroadcasterAcked = true so frame send unlocks).
     if (broadcasterId === _playerId) {
-        _captureBroadcasterAcked = true;
-        _renderBroadcastUi();
+        // Only treat this as an ack if we still intend to broadcast.
+        // A stale self-ack (e.g. server re-emitted broadcaster_changed
+        // for a session that we've since stopped locally) shouldn't
+        // flip the pill back to "Broadcasting".
+        if (_captureRequested || _captureCtx) {
+            _captureBroadcasterAcked = true;
+            _renderBroadcastUi();
+        }
         return;
     }
     // Either someone else is broadcasting or the slot was cleared.
+    // Always clear any stale self-ack first so the UI cannot remain
+    // stuck on "Broadcasting" after a local stop followed by a later
+    // server update. Spotted by Copilot review on PR #8 round 3.
+    const hadAck = _captureBroadcasterAcked;
+    _captureBroadcasterAcked = false;
     // If WE thought we were broadcasting, our broadcast was preempted —
     // tear down without sending another broadcast_stop (the server
     // already moved on).
     if (_captureRequested || _captureCtx) {
         _broadcastStop({ silent: true });
+        return;
+    }
+    if (hadAck) {
+        _renderBroadcastUi();
     }
 }
 
