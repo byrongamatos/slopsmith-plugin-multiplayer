@@ -2103,6 +2103,19 @@ async function _broadcastStart(deviceId) {
         return;
     }
     _captureCtx = new Ctor({ sampleRate: SMAU_V1_SAMPLE_RATE, latencyHint: 'interactive' });
+    // Best-effort resume for autoplay-restricted browsers. Newly
+    // created AudioContexts on Safari (and sometimes Chrome) start
+    // suspended until resume() is called from a user gesture; the
+    // toggle click that landed us here qualifies, but we still
+    // need to actually call it. Without this the analyser / worklet
+    // sit idle and the UI gets stuck at "Connecting…". Spotted by
+    // Copilot review on PR #8 round 5.
+    if (_captureCtx.state === 'suspended' && typeof _captureCtx.resume === 'function') {
+        try {
+            const p = _captureCtx.resume();
+            if (p && typeof p.catch === 'function') p.catch(() => {});
+        } catch (_) { /* */ }
+    }
 
     // Inline worklet via Blob URL.
     const blob = new Blob([_CAPTURE_WORKLET_CODE], { type: 'application/javascript' });
