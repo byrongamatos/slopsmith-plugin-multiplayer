@@ -2249,6 +2249,12 @@ async function _doLoadSong(queueItem) {
         }
     }
 
+    // If a newer room/cleanup invalidated us mid-load, suppress the
+    // post-load side effects so a stale load from a previous room
+    // can't pause/seek the user's now-current room. Spotted by
+    // Copilot review on PR #7 round 8 (suppressed/low-confidence).
+    if (_loadGen !== myLoadGen) return;
+
     if (!_isHost) {
         const audio = document.getElementById('audio');
         if (audio) {
