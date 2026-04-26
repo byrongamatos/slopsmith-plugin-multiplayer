@@ -76,6 +76,10 @@ The broadcaster sees a `⚠ Tempo change at this measure` banner when this happe
 
 While broadcasting, the panel shows aggregate listener stats from each peer's listener pipeline (e.g. `2 listeners — 1 late, 0 dropped`). Reports are 30-second rolling deltas from the listener's perspective; "late" means a frame arrived after its scheduled chart-time, "dropped" means decoder/validation failure. Healthy operation reports `no issues`.
 
+#### Testing
+
+Before tagging a release, run through the manual test matrix in [TESTING.md](TESTING.md) — covers two-machine LAN sanity, hotspot/RTT, network drop, pause/seek, refresh on either side, 30-min soak, tempo-change verification, and multi-broadcaster preemption.
+
 ### Mini DAW Mixer
 After recording, the host opens the Mixer to align and export:
 - **Waveform display** for every track (stems in green, recordings in blue)
