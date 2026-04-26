@@ -1944,8 +1944,15 @@ function _captureFlushAndSendIntervalQueued() {
     // accepted in PROTOCOL.md "tempo / pause boundary cases".
     const audio = document.getElementById('audio');
     const chartPlaying = audio && !audio.paused;
-    const driftAhead = chartTimeEnd - chartTimeNow;
-    if (!chartPlaying || driftAhead > 0.5) {
+    const drift = chartTimeEnd - chartTimeNow;
+    // Symmetric drift guard. driftAhead > 0.5 catches "chart paused
+    // mid-interval" or "host running slow"; drift < -0.5 (chart
+    // jumped forward via seek mid-interval) catches the symmetric
+    // case where listeners would receive an interval whose
+    // chartTimeEnd is far behind their current clock and drop it
+    // as 'late' anyway. Skipping locally saves the encoder + ws
+    // work. Spotted by Copilot review on PR #8 round 9.
+    if (!chartPlaying || drift > 0.5 || drift < -0.5) {
         // Drop this interval. Bump the interval index so listeners
         // never see a duplicate interval_index (in case some
         // intervals were sent for this generation already).
