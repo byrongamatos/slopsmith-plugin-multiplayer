@@ -12,6 +12,16 @@
 // up to `chunkSize` samples (default 480 = ~10 ms) and emits one
 // Float32Array per chunk.
 //
+// **Output behaviour.** The processor declares one output (so the node
+// can be connected to a rendered graph — Web Audio doesn't reliably
+// pull on nodes that are not reachable from `ctx.destination`), but
+// `process()` doesn't write to it. Web Audio leaves untouched output
+// channels zero-filled, so the silent output contributes no audio
+// when routed through the main-thread silent-sink (`gain = 0`) to
+// destination. The connection's only purpose is to keep the worklet
+// on the rendered path so its `process()` callback fires reliably
+// across browsers.
+//
 // **Distribution note.** This file is the source of truth for the
 // worklet, but slopsmith core's plugin loader serves only the single
 // `screen.js` entry point per plugin (no generic asset path). The

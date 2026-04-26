@@ -2146,7 +2146,14 @@ async function _broadcastStart(deviceId) {
     try {
         _captureWorkletNode = new AudioWorkletNode(_captureCtx, 'slopsmith-capture-processor', {
             numberOfInputs: 1,
-            numberOfOutputs: 0,
+            // numberOfOutputs:1 (default) plus connect to the silent
+            // sink BELOW. With numberOfOutputs:0 the worklet node
+            // sits off the rendered graph and some browsers stop
+            // calling its process() — see the silent-sink comment
+            // for the analyser. Spotted by Copilot review on PR #8
+            // round 4.
+            numberOfOutputs: 1,
+            outputChannelCount: [SMAU_V1_CHANNEL_COUNT],
             processorOptions: { chunkSize: CAPTURE_PCM_CHUNK_SAMPLES },
         });
     } catch (e) {
@@ -2156,6 +2163,11 @@ async function _broadcastStart(deviceId) {
         return;
     }
     _captureSourceNode.connect(_captureWorkletNode);
+    // Route the worklet's silent output through the gain=0 sink to
+    // ctx.destination so the worklet is on a rendered path. The
+    // worklet's process() leaves outputs[] zero-filled (it captures
+    // input only), so this contributes no audio.
+    _captureWorkletNode.connect(_captureSilentSink);
     _captureWorkletNode.port.onmessage = (ev) => {
         if (ev.data instanceof Float32Array) {
             _captureOnPcmChunk(ev.data);
@@ -2188,20 +2200,35 @@ async function _broadcastStart(deviceId) {
         return;
     }
 
+    // Post-await readiness re-check. Multiple awaits sit between
+    // the entry-point WS checks and here (getUserMedia, addModule,
+    // encoder.configure); the highway or audio WS could have closed
+    // during any of them. If we just silently skipped the
+    // broadcast_start send, the toggle would sit at "Connecting…"
+    // forever while burning encoder CPU. Spotted by Copilot review
+    // on PR #8 round 4.
+    if (
+        !_ws || _ws.readyState !== WebSocket.OPEN
+        || !_audioWs || _audioWs.readyState !== WebSocket.OPEN
+    ) {
+        _captureRequested = false;
+        _showError('Connection dropped while preparing broadcast — try again.');
+        _broadcastStop({ silent: true });
+        return;
+    }
+
     _captureStartLevelMeter();
 
     // Send broadcast_start; the broadcaster_changed ack flips
     // _captureBroadcasterAcked = true and unlocks frame send.
-    if (_ws && _ws.readyState === WebSocket.OPEN) {
-        _ws.send(JSON.stringify({
-            type: 'broadcast_start',
-            interval_beats: _captureIntervalBeats,
-            sample_rate: SMAU_V1_SAMPLE_RATE,
-            channel_count: SMAU_V1_CHANNEL_COUNT,
-            codec: 'opus',
-            bitrate: 96000,
-        }));
-    }
+    _ws.send(JSON.stringify({
+        type: 'broadcast_start',
+        interval_beats: _captureIntervalBeats,
+        sample_rate: SMAU_V1_SAMPLE_RATE,
+        channel_count: SMAU_V1_CHANNEL_COUNT,
+        codec: 'opus',
+        bitrate: 96000,
+    }));
     _renderBroadcastUi();
 }
 
