@@ -446,29 +446,20 @@ function _audioQualitySendReport() {
         decoderUnderruns: _audioQualityDecoderUnderruns(),
         broadcasterId: broadcasterId,
     };
-    // Two transition cases when the snapshot's broadcasterId differs:
-    //   null → broadcasterId: first time we've bound to ANY broadcaster
-    //     since the snapshot reset. The cumulative counters were zero
-    //     at bind time, so we can baseline at zero and the first
-    //     report (this tick or next) will cover everything since the
-    //     bind — no lost first window. Spotted by Copilot review on
-    //     PR #10 round 2.
-    //   A → B: a direct switch to a different broadcaster. The
-    //     cumulative counters carry frames from the previous broadcast
-    //     that we don't want to attribute to B, so reseed at `cur`
-    //     and skip this tick.
+    // Any broadcaster change reseeds the snapshot at the current
+    // cumulative counters and skips this tick. Cumulative RX counters
+    // only reset on session-recovery / room-change (see
+    // _audioRxResetStats), NOT on broadcaster_changed: null. So a
+    // null → broadcaster transition can still carry frames from a
+    // previously-ended broadcast in the same session — baselining at
+    // zero would attribute those historical frames to the new
+    // broadcast. Reseeding at `cur` costs us the first 30 s window
+    // but keeps reports correctly scoped to the active broadcast.
+    // Round 2 of Copilot review on PR #10 caught the regression I
+    // introduced in round 1 by trying to preserve the first window.
     if (_audioQualitySnapshot.broadcasterId !== broadcasterId) {
-        if (_audioQualitySnapshot.broadcasterId !== null) {
-            _audioQualitySnapshot = cur;
-            return;
-        }
-        _audioQualitySnapshot = {
-            scheduled: 0,
-            dropped: 0,
-            late: 0,
-            decoderUnderruns: 0,
-            broadcasterId: broadcasterId,
-        };
+        _audioQualitySnapshot = cur;
+        return;
     }
     const intervalsReceived = cur.scheduled - _audioQualitySnapshot.scheduled;
     const intervalsDropped = cur.dropped - _audioQualitySnapshot.dropped;
@@ -560,13 +551,17 @@ function _audioQualityRxOnReport(msg) {
     // Defensive: ignore reports keyed against a different broadcaster
     // (we already cleared/became broadcaster of a different session).
     if (msg.broadcaster_id && msg.broadcaster_id !== _playerId) return;
+    // Note: msg.report_period_ms is informational metadata in the
+    // protocol but not used here — eviction TTL is fixed at
+    // 3 × AUDIO_QUALITY_REPORT_PERIOD_MS (the broadcaster's local
+    // constant), regardless of what cadence the listener happens to
+    // be reporting at. Spotted by Copilot review on PR #10 round 3.
     _audioQualityRxByListener.set(fromId, {
         receivedAt: Date.now(),
         intervalsReceived: _audioQualitySanitizeCount(msg.intervals_received),
         intervalsLate: _audioQualitySanitizeCount(msg.intervals_late),
         intervalsDropped: _audioQualitySanitizeCount(msg.intervals_dropped),
         decoderUnderruns: _audioQualitySanitizeCount(msg.decoder_underruns),
-        reportPeriodMs: _audioQualitySanitizeCount(msg.report_period_ms),
     });
     _audioQualityRxRender();
 }

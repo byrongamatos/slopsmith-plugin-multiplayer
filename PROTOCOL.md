@@ -217,7 +217,7 @@ Field semantics:
 }
 ```
 
-The broadcaster aggregates the most recent report per `from_player_id`; entries older than `3 × report_period_ms` are evicted so a listener that disconnected without a clean `broadcast_stop` isn't double-counted forever.
+The broadcaster aggregates the most recent report per `from_player_id`; stale entries are evicted using the broadcaster's fixed local TTL (currently 3 × the broadcaster's reporting cadence, ≈ 90 s for the 30 s default) so a listener that disconnected without a clean `broadcast_stop` isn't double-counted forever. `report_period_ms` is telemetry metadata describing the listener's cadence; it is not currently used to compute per-entry eviction deadlines.
 
 ---
 
