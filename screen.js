@@ -2214,8 +2214,29 @@ async function _broadcastStart(deviceId) {
     // Second cancellation check — addModule is async, and the user
     // may have toggled off during it (or another start may have
     // raced past us).
-    if (!_captureRequested || myGen !== _captureGen) {
+    //
+    // Fork the cleanup based on which case we're in:
+    //   - If we're cancelled but still the current generation
+    //     (user toggled off), it's safe to call _broadcastStop —
+    //     the globals we created (_captureCtx, _captureStream)
+    //     are still ours.
+    //   - If a NEWER start has raced past us (myGen !== _captureGen),
+    //     a different _broadcastStart may have already assigned
+    //     _captureCtx / _captureStream. Calling _broadcastStop
+    //     would tear DOWN the newer start's globals AND bump
+    //     _captureGen further, which would in turn invalidate
+    //     the newer start at its own gen check. Just stop our
+    //     local resources without touching globals. Spotted by
+    //     Copilot review on PR #8 round 10.
+    if (!_captureRequested) {
         _broadcastStop({ silent: true });
+        return;
+    }
+    if (myGen !== _captureGen) {
+        // A newer start owns the globals now. Only stop the local
+        // stream we acquired (the AudioContext we created may have
+        // already been torn down + replaced by the newer start).
+        try { stream.getTracks().forEach((t) => t.stop()); } catch (_) { /* */ }
         return;
     }
 
