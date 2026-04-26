@@ -19,7 +19,7 @@ ws://<host>/ws/plugins/multiplayer/{code}?player_id={id}&session_id={sid}
 
 `session_id` is a client-generated random identifier (UUIDv4 recommended; e.g. `crypto.randomUUID()`) that uniquely identifies a single browser tab / app instance for the lifetime of the session. **Wire-format requirement:** any non-empty string matching `[A-Za-z0-9_-]{1,128}` is a valid session_id. Servers MUST accept any value matching this pattern (UUIDv4 satisfies it) and MUST reject only missing or non-conformant values with `4401`. The client mints it when it starts trying to connect and keeps it in `sessionStorage` (or equivalent) so reconnects after a network blip carry the same `session_id`. A different tab gets a different `session_id`.
 
-**Status (as of Phase 2d).** Server-side: `session_id` + per-session takeover/grace lifecycle (`4401` / `4408` / `4409` / `4410`) + `/audio` endpoint with binary fan-out and `SMAU` header validation (`1009`) + broadcast control plane (`broadcast_start` / `broadcast_stop` / `broadcaster_changed` / `broadcaster_busy` / `audio_quality`) + `broadcaster_id` / `broadcast_params` room state. Exercised by `tests/test_session_lifecycle.py` + `tests/test_audio_ws.py` + `tests/test_broadcast_control.py`. Client-side: `screen.js` opens `/audio` alongside the highway WS using the same `session_id`, handles all lifecycle close codes (4401 / 4408 / 4409 / 4410 / 1009 / 1011) with independent per-endpoint reconnect cadence, parses the 40-byte SMAU header on every inbound binary frame, decodes the Opus payload via WebCodecs `AudioDecoder` and schedules an `AudioBufferSourceNode` per interval to start at `chartTimeStart + intervalDuration` translated into `AudioContext.currentTime` via the listener's chart audio element. Listener pipeline activates from either the `connected` snapshot's `broadcaster_id` (late joiners) or a fresh `broadcaster_changed` event, drops scheduled sources on chart pause / hard seek / 4408 grace recovery, and refuses frames when chart is paused or `playbackRate != 1.0` (counted under `listener_paused` / `listener_speed`). v1 limitation: peer audio assumes both ends are at 1.0x; speed changes warp the chart→AudioContext mapping. Source of truth `audio/smau-frame.js`; inlined into `screen.js` because the plugin loader serves only the single `screen.js` entry point. Broadcast capture pipeline now live: `getUserMedia` (no AGC/NS/AEC, 48 kHz mono), inlined `AudioWorkletProcessor` (loaded via Blob URL because the plugin loader serves only one entry point), level meter via `AnalyserNode`, WebCodecs `AudioEncoder` configured for Opus 96 kbps, interval slicing keyed on the chart's BPM via the inlined `selectInterval` helper, SMAU frame build via the inlined encoder (mirror of `audio/smau-frame.js`), and frame send over the audio WS. Frame send is gated on a `broadcaster_changed` ack with the broadcaster's own `player_id` (so frames never leave the page before the server-side single-broadcaster check has accepted us). UI: "Broadcast my sound" toggle + input device dropdown + level meter + status pill, with a `beforeunload` handler that tears down capture + sends `broadcast_stop` on tab close. Phase 2e is polish (pause/seek interaction, late-join from connected snapshot, tempo-change handling, error states).
+**Status (as of Phase 2c).** Server-side: `session_id` + per-session takeover/grace lifecycle (`4401` / `4408` / `4409` / `4410`) + `/audio` endpoint with binary fan-out and `SMAU` header validation (`1009`) + broadcast control plane (`broadcast_start` / `broadcast_stop` / `broadcaster_changed` / `broadcaster_busy` / `audio_quality`) + `broadcaster_id` / `broadcast_params` room state. Exercised by `tests/test_session_lifecycle.py` + `tests/test_audio_ws.py` + `tests/test_broadcast_control.py`. Client-side: `screen.js` opens `/audio` alongside the highway WS using the same `session_id`, handles all lifecycle close codes (4401 / 4408 / 4409 / 4410 / 1009 / 1011) with independent per-endpoint reconnect cadence, parses the 40-byte SMAU header on every inbound binary frame, decodes the Opus payload via WebCodecs `AudioDecoder` and schedules an `AudioBufferSourceNode` per interval to start at `chartTimeStart + intervalDuration` translated into `AudioContext.currentTime` via the listener's chart audio element. Listener pipeline activates from either the `connected` snapshot's `broadcaster_id` (late joiners) or a fresh `broadcaster_changed` event, drops scheduled sources on chart pause / hard seek / 4408 grace recovery, and refuses frames when chart is paused or `playbackRate != 1.0` (counted under `listener_paused` / `listener_speed`). v1 limitation: peer audio assumes both ends are at 1.0x; speed changes warp the chart→AudioContext mapping. Source of truth `audio/smau-frame.js`; inlined into `screen.js` because the plugin loader serves only the single `screen.js` entry point. Broadcast capture + UI (getUserMedia, AudioWorklet, WebCodecs Opus encode, broadcast toggle) still pending in Phase 2d.
 
 Carries all control messages. The message types used by the audio feature are documented under "Audio control messages" below; the existing playback/queue/recording messages are unchanged.
 
@@ -212,7 +212,7 @@ Every audio WS binary frame consists of a fixed-size header followed by the Opus
 
 ### Payload
 
-The byte range `[40, 40 + opus_size)` (half-open — offset 40 inclusive, `40 + opus_size` exclusive) is a **length-prefixed sequence of Opus packets** produced by the WebCodecs `AudioEncoder` configured as:
+The byte range `[40, 40 + opus_size)` (half-open — offset 40 inclusive, `40 + opus_size` exclusive) is an Opus-encoded chunk produced by the WebCodecs `AudioEncoder` configured as:
 
 ```js
 {
@@ -224,21 +224,7 @@ The byte range `[40, 40 + opus_size)` (half-open — offset 40 inclusive, `40 + 
 }
 ```
 
-Per RFC 6716, an individual Opus packet covers **at most 120 ms of audio** — a multi-second interval cannot be represented as a single packet. The encoder is `flush()`ed at each interval boundary and emits one or more `EncodedAudioChunk`s; each becomes one length-prefixed packet record in the SMAU opus payload:
-
-```
-[u32 LE packet_count]
-( [u32 LE packet_size] [packet_size bytes] ){packet_count}
-```
-
-All multi-byte integers are little-endian. Receivers MUST decode each packet independently (one `EncodedAudioChunk` per record fed to `AudioDecoder`) and accumulate the resulting `AudioData` outputs into a single playback buffer for the interval.
-
-**Receiver validation of records.** Receivers MUST drop the entire SMAU frame when:
-
-- `opus_size < 4` (no room for the packet count prefix);
-- `packet_count == 0` or `packet_count > 4096` (a 32 s interval at typical 20 ms Opus packetization is ~1,600 packets; even 32 s at 5 ms packetization is ~6,400 — but Opus emits 5 ms frames only when explicitly configured, and v1 broadcasters use the default 20 ms. 4096 is a defensive ceiling that comfortably covers v1 interval bands without conflicting with `MAX_INTERVAL_SEC`);
-- any `packet_size == 0` or `packet_size > 8192` (the spec's typical Opus packet is well under 1.5 KB; 8 KB is a defensive ceiling against adversarial inputs);
-- the record sequence runs past `40 + opus_size` (truncation).
+The chunk is the entire interval (not a sequence of small frames). Encoder is `flush()`ed at each interval boundary so a single `EncodedAudioChunk` represents the whole interval.
 
 ### Frame size budget and bounds
 
