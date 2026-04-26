@@ -181,6 +181,99 @@ function _smauDecodeFrame(buf) {
     };
 }
 
+// SMAU encoder, mirror of audio/smau-frame.js. Used by the broadcast
+// path (Phase 2d) to build outbound binary frames. Throws on invalid
+// input — strict at the source so we never put a frame on the wire
+// that _smauDecodeFrame above (or peer receivers) would discard. When
+// changing this codec, update both this inlined copy AND
+// audio/smau-frame.js + audio/smau-frame.test.js.
+const SMAU_U64_MAX = (1n << 64n) - 1n;
+const SMAU_U32_MAX = 0xffffffff;
+
+function _smauToBigUint64(value, fieldName) {
+    let bi;
+    if (typeof value === 'bigint') {
+        bi = value;
+    } else if (typeof value === 'number') {
+        if (!Number.isInteger(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+            throw new RangeError(fieldName + ' must be a non-negative integer ≤ Number.MAX_SAFE_INTEGER, or a BigInt');
+        }
+        bi = BigInt(value);
+    } else {
+        throw new TypeError(fieldName + ' must be a BigInt or non-negative integer Number');
+    }
+    if (bi < 0n || bi > SMAU_U64_MAX) {
+        throw new RangeError(fieldName + ' out of u64 range');
+    }
+    return bi;
+}
+
+function _smauEncodeFrame(fields) {
+    if (!fields || typeof fields !== 'object') {
+        throw new TypeError('_smauEncodeFrame: fields object required');
+    }
+    const intervalIndex = _smauToBigUint64(fields.intervalIndex, 'intervalIndex');
+    const chartTimeStart = fields.chartTimeStart;
+    const chartTimeEnd = fields.chartTimeEnd;
+    const sampleCount = fields.sampleCount;
+    const flags = fields.flags == null ? 0 : fields.flags;
+    const opus = fields.opus;
+
+    if (!(typeof chartTimeStart === 'number' && Number.isFinite(chartTimeStart))) {
+        throw new RangeError('chartTimeStart must be a finite number');
+    }
+    if (!(typeof chartTimeEnd === 'number' && Number.isFinite(chartTimeEnd))) {
+        throw new RangeError('chartTimeEnd must be a finite number');
+    }
+    const duration = chartTimeEnd - chartTimeStart;
+    if (!Number.isFinite(duration) || duration <= 0) {
+        throw new RangeError('chartTimeEnd must be strictly greater than chartTimeStart');
+    }
+    if (duration > SMAU_MAX_INTERVAL_SEC) {
+        throw new RangeError('interval duration ' + duration + 's exceeds SMAU_MAX_INTERVAL_SEC');
+    }
+    if (!(Number.isInteger(sampleCount) && sampleCount >= 0 && sampleCount <= SMAU_U32_MAX)) {
+        throw new RangeError('sampleCount must be a u32 integer');
+    }
+    // Mirror the receiver's sample_count cap so encode/decode round-
+    // trips never produce a frame the receiver would discard with
+    // sample_count_too_high.
+    const maxSamples = Math.ceil(SMAU_V1_SAMPLE_RATE * duration) + SMAU_MAX_SLACK_SAMPLES;
+    if (sampleCount > maxSamples) {
+        throw new RangeError('sampleCount ' + sampleCount + ' exceeds receiver cap ' + maxSamples);
+    }
+    if (!(Number.isInteger(flags) && flags >= 0 && flags <= 0xffff)) {
+        throw new RangeError('flags must be a u16 integer');
+    }
+    if (!(opus instanceof Uint8Array)) {
+        throw new TypeError('opus must be a Uint8Array');
+    }
+    if (opus.byteLength > SMAU_U32_MAX) {
+        throw new RangeError('opus payload size out of u32 range');
+    }
+    const frameLen = SMAU_HEADER_LEN + opus.byteLength;
+    if (frameLen > SMAU_MAX_FRAME_BYTES) {
+        throw new RangeError('frame length ' + frameLen + ' exceeds SMAU_MAX_FRAME_BYTES');
+    }
+
+    const buf = new ArrayBuffer(frameLen);
+    const bytes = new Uint8Array(buf);
+    const view = new DataView(buf);
+    bytes[0] = SMAU_MAGIC_0;
+    bytes[1] = SMAU_MAGIC_1;
+    bytes[2] = SMAU_MAGIC_2;
+    bytes[3] = SMAU_MAGIC_3;
+    view.setUint16(4, SMAU_VERSION, true);
+    view.setUint16(6, flags, true);
+    view.setBigUint64(8, intervalIndex, true);
+    view.setFloat64(16, chartTimeStart, true);
+    view.setFloat64(24, chartTimeEnd, true);
+    view.setUint32(32, sampleCount, true);
+    view.setUint32(36, opus.byteLength, true);
+    bytes.set(opus, SMAU_HEADER_LEN);
+    return buf;
+}
+
 // Per-session inbound-frame counters. Cleared in _cleanup. The Phase 5
 // listener-side `audio_quality` highway message will read these so the
 // broadcaster can see "N frames dropped due to <reason>" in its UI.
@@ -391,82 +484,116 @@ function _audioListenerHandleDecodedAudio(audioData, wrapper) {
         if (wrapper.epoch !== _audioListenerEpoch) return;
         const meta = wrapper.pending.get(audioData.timestamp);
         wrapper.pending.delete(audioData.timestamp);
-        if (!meta) return; // stale or torn down
+        if (!meta || !meta.acc) return; // stale or torn down
+        const acc = meta.acc;
+        if (acc.finalized) return;
+        if (acc.epoch !== _audioListenerEpoch) {
+            // Chart-time was invalidated after the interval was queued
+            // for decode. Drop without scheduling.
+            acc.finalized = true;
+            return;
+        }
 
         const numFrames = audioData.numberOfFrames;
         const channels = audioData.numberOfChannels || 1;
-        if (numFrames <= 0) return;
-        // Defense against a malicious or buggy broadcaster: the
-        // validator already capped header.sampleCount against
-        // ceil(V1_SAMPLE_RATE * duration) + MAX_SLACK_SAMPLES, but
-        // the Opus payload itself is opaque and could decode to a
-        // much longer frame. Recompute the same bound from the
-        // validated chart-time duration and drop oversized output —
-        // that way a peer can't make us allocate / play arbitrarily
-        // long AudioBuffers or drift across interval boundaries.
-        const duration = meta.chartTimeEnd - meta.chartTimeStart;
-        const maxFrames = Math.ceil(SMAU_V1_SAMPLE_RATE * duration) + SMAU_MAX_SLACK_SAMPLES;
-        if (numFrames > maxFrames) {
-            _audioRxRecordDrop('decoded_frame_too_long');
-            return;
-        }
-        // Channel count is also bounded: v1 is mono only and the
-        // decoder is configured for numberOfChannels=1, but a
-        // misconfigured / patched browser could still produce
-        // multi-channel output. Reject anything that doesn't match
-        // the v1 invariant.
+        // Channel count is bounded: v1 is mono only and the decoder
+        // is configured for numberOfChannels=1, but a misconfigured /
+        // patched browser could still produce multi-channel output.
         if (channels !== SMAU_V1_CHANNEL_COUNT) {
             _audioRxRecordDrop('decoded_channel_mismatch');
+            acc.finalized = true;
+            return;
+        }
+        // Sample rate is also bounded: the AudioBuffer we build below
+        // hard-codes SMAU_V1_SAMPLE_RATE, so any mismatch from the
+        // decoder (in principle should never happen — we configure
+        // the decoder for 48k — but a future codec/config or a
+        // patched browser could disagree) would play at the wrong
+        // pitch. Spotted by Copilot review on PR #8 round 8.
+        const dataSampleRate = audioData.sampleRate || SMAU_V1_SAMPLE_RATE;
+        if (dataSampleRate !== SMAU_V1_SAMPLE_RATE) {
+            _audioRxRecordDrop('decoded_sample_rate_mismatch');
+            acc.finalized = true;
             return;
         }
 
-        // copyTo() can throw on unsupported conversion formats / internal
-        // decoder quirks. Catch in-place so the exception doesn't bubble
-        // out of this output callback as an unhandled error and
-        // destabilize the decode pipeline. The outer finally still
-        // closes the AudioData. Spotted by Copilot review on PR #7.
-        let buffer;
-        try {
-            buffer = ctx.createBuffer(channels, numFrames, audioData.sampleRate || SMAU_V1_SAMPLE_RATE);
-            for (let ch = 0; ch < channels; ch++) {
-                const out = buffer.getChannelData(ch);
-                audioData.copyTo(out, { planeIndex: ch, format: 'f32-planar' });
+        // Lazy-build the per-interval PCM buffer on the first packet
+        // that contributes samples. Bound it against the validated
+        // chart-time duration + slack so a malicious broadcaster can't
+        // over-allocate by emitting too many or oversize Opus packets.
+        if (!acc.pcmBuffer) {
+            const duration = acc.header.chartTimeEnd - acc.header.chartTimeStart;
+            const maxFrames = Math.ceil(SMAU_V1_SAMPLE_RATE * duration) + SMAU_MAX_SLACK_SAMPLES;
+            acc.pcmBuffer = new Float32Array(maxFrames);
+            acc.maxFrames = maxFrames;
+        }
+
+        if (numFrames > 0) {
+            if (acc.writeOffset + numFrames > acc.maxFrames) {
+                _audioRxRecordDrop('decoded_overflow');
+                acc.finalized = true;
+                return;
             }
-        } catch (_err) {
-            _audioRxRecordDrop('decoded_copy_failed');
+            // copyTo() can throw on unsupported conversion formats /
+            // internal decoder quirks. Catch in-place so the exception
+            // doesn't bubble out of this output callback as an
+            // unhandled error and destabilize the decode pipeline.
+            try {
+                const sub = acc.pcmBuffer.subarray(acc.writeOffset, acc.writeOffset + numFrames);
+                audioData.copyTo(sub, { planeIndex: 0, format: 'f32-planar' });
+            } catch (_err) {
+                _audioRxRecordDrop('decoded_copy_failed');
+                acc.finalized = true;
+                return;
+            }
+            acc.writeOffset += numFrames;
+        }
+        acc.packetsReceived++;
+
+        if (acc.packetsReceived < acc.packetsExpected) return;
+
+        // All packets for this interval decoded. Build AudioBuffer +
+        // schedule a single source against the chart clock.
+        const totalFrames = acc.writeOffset;
+        if (totalFrames === 0) {
+            acc.finalized = true;
             return;
         }
 
         const audio = document.getElementById('audio');
         if (!audio || audio.paused) {
-            // Listener is paused or has no chart audio yet. Drop the
-            // decoded interval — it'd schedule into the past once
-            // playback resumes anyway, and the chart pause hook will
-            // walk pending sources next.
             _audioRxRecordDrop('listener_paused');
+            acc.finalized = true;
             return;
         }
-        // Effective-speed re-check — see _audioListenerHandleFrame for
-        // why we use audio.playbackRate with 0.01 tolerance (covers
-        // drift correction, rejects user-set non-1x speed).
         const speed = audio.playbackRate || 1.0;
         if (Math.abs(speed - 1.0) > 0.01) {
-            // v1 limitation: peer audio assumes both ends at 1.0x.
             _audioRxRecordDrop('listener_speed');
+            acc.finalized = true;
             return;
         }
 
-        const targetChart = meta.chartTimeStart + (meta.chartTimeEnd - meta.chartTimeStart);
+        const meta_h = acc.header;
+        const targetChart = meta_h.chartTimeStart + (meta_h.chartTimeEnd - meta_h.chartTimeStart);
         const chartNow = audio.currentTime;
         const deltaSec = targetChart - chartNow;
         if (deltaSec < -LATE_FRAME_GRACE_SEC) {
             _audioRxFramesLate++;
-            // Also account in the unified drop-reason map so
-            // getAudioRxStats() reports late frames consistently with
-            // other drop reasons. Spotted by Copilot review on PR #7.
             _audioRxRecordDrop('late');
+            acc.finalized = true;
             return;
         }
+
+        let buffer;
+        try {
+            buffer = ctx.createBuffer(SMAU_V1_CHANNEL_COUNT, totalFrames, SMAU_V1_SAMPLE_RATE);
+            buffer.getChannelData(0).set(acc.pcmBuffer.subarray(0, totalFrames));
+        } catch (_err) {
+            _audioRxRecordDrop('decoded_copy_failed');
+            acc.finalized = true;
+            return;
+        }
+        acc.finalized = true;
 
         const startAt = ctx.currentTime + Math.max(0, deltaSec);
         const source = ctx.createBufferSource();
@@ -711,29 +838,106 @@ function _audioListenerHandleFrame(header, opus) {
         return;
     }
 
-    const ts = wrapper.nextTs++;
-    wrapper.pending.set(ts, {
-        chartTimeStart: header.chartTimeStart,
-        chartTimeEnd: header.chartTimeEnd,
-        sampleCount: header.sampleCount,
-        intervalIndex: header.intervalIndex,
-    });
-    try {
-        // Copy opus into a fresh ArrayBuffer because EncodedAudioChunk takes
-        // ownership of its buffer view; the original Uint8Array aliases the
-        // WebSocket message and may be reused. (Also detaches in some
-        // implementations once the chunk is queued.)
-        const data = new Uint8Array(opus.byteLength);
-        data.set(opus);
-        const chunk = new EncodedAudioChunk({
-            type: 'key',
-            timestamp: ts,
-            data: data,
-        });
-        wrapper.dec.decode(chunk);
-    } catch (e) {
-        wrapper.pending.delete(ts);
-        _audioRxRecordDrop('decode_call_failed');
+    // Parse the SMAU opus payload as a length-prefixed sequence of
+    // Opus packet records:
+    //   [u32 LE packet_count]
+    //   ([u32 LE packet_size][packet_size bytes])*
+    //
+    // Opus packets max out at ~120 ms (RFC 6716), so a multi-second
+    // interval requires multiple packets. Each is fed independently
+    // to AudioDecoder; the per-interval accumulator below collects
+    // their outputs into one AudioBuffer that gets scheduled at the
+    // chart-time anchor specified in the SMAU header. PROTOCOL.md
+    // "Audio frame format / Payload" describes this framing.
+    if (opus.byteLength < 4) {
+        _audioRxRecordDrop('opus_payload_too_small');
+        return;
+    }
+    const opusView = new DataView(opus.buffer, opus.byteOffset, opus.byteLength);
+    const packetCount = opusView.getUint32(0, true);
+    if (packetCount === 0 || packetCount > 4096) {
+        // Hard cap. v1 broadcasters use Opus's default 20 ms frames
+        // and don't configure shorter ones; 4096 covers every
+        // legitimate interval up to MAX_INTERVAL_SEC = 32 even if a
+        // sender used 8 ms frames. Spotted by Copilot review on PR
+        // #8 round 2.
+        _audioRxRecordDrop('opus_packet_count_invalid');
+        return;
+    }
+    const packets = [];
+    let parseOff = 4;
+    for (let i = 0; i < packetCount; i++) {
+        if (parseOff + 4 > opus.byteLength) {
+            _audioRxRecordDrop('opus_truncated');
+            return;
+        }
+        const pktLen = opusView.getUint32(parseOff, true);
+        parseOff += 4;
+        if (pktLen === 0 || pktLen > 8192 || parseOff + pktLen > opus.byteLength) {
+            // 8 KB per Opus packet is well above the spec's max ~1275
+            // byte typical packet — a defensive ceiling against
+            // adversarial inputs.
+            _audioRxRecordDrop('opus_packet_invalid');
+            return;
+        }
+        // Subarray view into the source Uint8Array — copy happens per
+        // packet below before handing to EncodedAudioChunk (which
+        // takes ownership).
+        packets.push(new Uint8Array(opus.buffer, opus.byteOffset + parseOff, pktLen));
+        parseOff += pktLen;
+    }
+    if (parseOff !== opus.byteLength) {
+        // Trailing bytes after the last record indicate a malformed
+        // frame — drop with a distinct reason instead of silently
+        // accepting partial-interval decode. Spotted by Copilot
+        // review on PR #8 round 2.
+        _audioRxRecordDrop('opus_trailing_bytes');
+        return;
+    }
+
+    // Shared accumulator across all packets in this interval. Each
+    // EncodedAudioChunk we feed to the decoder gets a unique
+    // timestamp; pending entries point at the same `acc` so the
+    // output handler can collect every packet's decoded samples
+    // into one AudioBuffer and schedule it once.
+    const acc = {
+        header: {
+            chartTimeStart: header.chartTimeStart,
+            chartTimeEnd: header.chartTimeEnd,
+            sampleCount: header.sampleCount,
+            intervalIndex: header.intervalIndex,
+        },
+        epoch: wrapper.epoch,
+        pcmBuffer: null,
+        maxFrames: 0,
+        writeOffset: 0,
+        packetsExpected: packets.length,
+        packetsReceived: 0,
+        finalized: false,
+    };
+
+    for (const packet of packets) {
+        const ts = wrapper.nextTs++;
+        wrapper.pending.set(ts, { acc });
+        try {
+            // Copy each packet into a fresh ArrayBuffer — EncodedAudioChunk
+            // takes ownership and may detach the source view.
+            const data = new Uint8Array(packet.byteLength);
+            data.set(packet);
+            const chunk = new EncodedAudioChunk({
+                type: 'key',
+                timestamp: ts,
+                data: data,
+            });
+            wrapper.dec.decode(chunk);
+        } catch (e) {
+            wrapper.pending.delete(ts);
+            // Mark accumulator finalized so a partial decode of
+            // earlier packets doesn't schedule with missing audio.
+            acc.finalized = true;
+            _audioRxRecordDrop('decode_call_failed');
+            return;
+        }
     }
 }
 
@@ -1090,6 +1294,12 @@ function _cleanup() {
     _stopHeartbeat();
     _restorePlaybackControls();
     _audioListenerCleanup();
+    // Phase 2d: tear down the capture pipeline (mic stream, encoder,
+    // worklet, AudioContext, level meter rAF). Silent — the server
+    // will clear broadcaster_id via the leave_room path, no need to
+    // send broadcast_stop after we've already kicked the highway WS
+    // closed.
+    _broadcastStop({ silent: true });
     // Set _intentionalClose BEFORE closing either socket so neither close
     // handler triggers a reconnect during teardown.
     _intentionalClose = true;
@@ -1441,6 +1651,888 @@ function _scheduleAudioReconnect() {
         }
     }, delay);
 }
+
+// ── Broadcast capture pipeline (Phase 2d) ─────────────────────────────────
+//
+// The capture path: getUserMedia → AudioContext (48k/mono) → AnalyserNode
+// (level meter) + AudioWorkletNode (drains 480-sample PCM chunks into
+// the main thread). Main thread accumulates chunks into a per-interval
+// Float32 buffer; on each interval boundary, the buffer is fed to a
+// WebCodecs AudioEncoder configured for Opus. The encoder emits one or
+// more EncodedAudioChunks per interval; we concatenate them into a
+// single Opus payload, build a SMAU header, and send as one binary
+// /audio WS frame.
+//
+// PROTOCOL.md "Lifecycle §3 Broadcast" requires the broadcaster to
+// wait for the broadcaster_changed ack on the highway WS before
+// sending frames. We therefore start capture eagerly on broadcast_start
+// (so the worklet + encoder are warm) but gate the actual frame send
+// on `_captureBroadcasterAcked`, which flips true when broadcaster_changed
+// arrives with our own player_id.
+//
+// Worklet code is loaded from a Blob URL because the slopsmith plugin
+// loader serves only a single screen.js entry point per plugin (no
+// generic asset path). audio/audio-capture-worklet.js is the source of
+// truth; the constant below is a functionally equivalent inline copy
+// (excluding comments / formatting). Keep the executable logic in sync
+// when either is edited.
+
+const _CAPTURE_WORKLET_CODE = `
+class CaptureProcessor extends AudioWorkletProcessor {
+    constructor(options) {
+        super();
+        const opts = (options && options.processorOptions) || {};
+        this._chunkSize = opts.chunkSize || 480;
+        this._chunk = new Float32Array(this._chunkSize);
+        this._chunkPos = 0;
+    }
+    process(inputs) {
+        const input = inputs[0];
+        if (!input || input.length === 0 || !input[0]) return true;
+        const src = input[0];
+        let srcPos = 0;
+        while (srcPos < src.length) {
+            const space = this._chunkSize - this._chunkPos;
+            const remaining = src.length - srcPos;
+            const n = space < remaining ? space : remaining;
+            this._chunk.set(src.subarray(srcPos, srcPos + n), this._chunkPos);
+            this._chunkPos += n;
+            srcPos += n;
+            if (this._chunkPos === this._chunkSize) {
+                this.port.postMessage(this._chunk, [this._chunk.buffer]);
+                this._chunk = new Float32Array(this._chunkSize);
+                this._chunkPos = 0;
+            }
+        }
+        return true;
+    }
+}
+registerProcessor('slopsmith-capture-processor', CaptureProcessor);
+`;
+
+// Default interval-selection helper, mirror of audio/select-interval.js.
+// Inlined for the same plugin-loader reason as the SMAU codec.
+const SELECT_INTERVAL_MIN_DURATION_SEC = 1.0;
+const SELECT_INTERVAL_DEFAULT_BEATS = 4;
+const SELECT_INTERVAL_FAST_TEMPO_BEATS = 8;
+function _selectIntervalBeats(bpm) {
+    if (!Number.isFinite(bpm) || bpm <= 0) return SELECT_INTERVAL_DEFAULT_BEATS;
+    const secondsPerBeat = 60 / bpm;
+    if (SELECT_INTERVAL_DEFAULT_BEATS * secondsPerBeat < SELECT_INTERVAL_MIN_DURATION_SEC) {
+        return SELECT_INTERVAL_FAST_TEMPO_BEATS;
+    }
+    return SELECT_INTERVAL_DEFAULT_BEATS;
+}
+
+let _captureCtx = null;
+let _captureStream = null;
+let _captureSourceNode = null;
+let _captureWorkletNode = null;
+let _captureAnalyser = null;
+let _captureAnalyserBuffer = null;
+let _captureSilentSink = null;
+let _captureLevelTimer = null;
+let _captureEncoder = null;
+let _captureEncoderChunks = [];     // EncodedAudioChunk byte payloads accumulated for the current interval
+// Serialize interval flushes. Without this, fire-and-forget flushes
+// for back-to-back intervals can interleave: interval N+1's encode
+// + flush starts while interval N's flush is still draining, and
+// the SHARED _captureEncoderChunks accumulator gets reset out from
+// under interval N's collector — corrupting the SMAU payload built
+// for interval N. Spotted by Copilot review on PR #8 round 1.
+let _captureFlushQueue = Promise.resolve();
+// Generation token. Bumped on every _broadcastStart entry and
+// every _broadcastStop. Each queued interval flush captures the
+// token and bails out if it's no longer current — without this,
+// stale flush tasks from a previous broadcast session could run
+// after a stop+start cycle and feed the NEW encoder with the OLD
+// PCM/interval state. Also used as a re-entrancy guard so two
+// concurrent _broadcastStart calls (e.g. rapid toggle) don't
+// race to wire up parallel mic streams + AudioContexts. Spotted
+// by Copilot review on PR #8 round 6.
+let _captureGen = 0;
+let _captureIntervalBuffer = null;  // Float32Array for the in-flight interval
+let _captureIntervalSampleCount = 0;
+let _captureIntervalIndex = 0n;     // BigInt — monotonic per session
+let _captureIntervalBeats = SELECT_INTERVAL_DEFAULT_BEATS;
+let _captureIntervalLengthSec = 2.0;
+let _captureIntervalSamplesTarget = 96000; // = intervalLengthSec * sampleRate
+let _captureChartTimeAtIntervalStart = 0;
+let _captureBroadcasterAcked = false; // flips true on broadcaster_changed-self
+let _captureRequested = false;        // user toggled broadcast on
+const CAPTURE_DEVICE_STORAGE_KEY = 'mp_broadcast_device_id';
+const CAPTURE_PCM_CHUNK_SAMPLES = 480; // ~10 ms at 48k
+
+function _captureHasWebCodecs() {
+    return typeof AudioEncoder !== 'undefined'
+        && typeof AudioData !== 'undefined';
+}
+
+function _captureChartTime() {
+    const audioEl = document.getElementById('audio');
+    return audioEl ? (audioEl.currentTime || 0) : 0;
+}
+
+function _captureCurrentChartBpm() {
+    // slopsmith core's highway exposes a beats array via getBeats(). We
+    // estimate BPM from the median spacing of the first ~20 beats —
+    // robust to a noisy first beat or a long intro pickup. Returns
+    // null if no beats are available, in which case the caller falls
+    // back to a 120 BPM default.
+    if (typeof window === 'undefined' || !window.highway) return null;
+    if (typeof window.highway.getBeats !== 'function') return null;
+    let beats;
+    try {
+        beats = window.highway.getBeats();
+    } catch (e) { return null; }
+    if (!Array.isArray(beats) || beats.length < 2) return null;
+    const spacings = [];
+    const limit = Math.min(20, beats.length - 1);
+    for (let i = 0; i < limit; i++) {
+        const a = beats[i] && beats[i].time;
+        const b = beats[i + 1] && beats[i + 1].time;
+        if (typeof a === 'number' && typeof b === 'number' && b > a) {
+            spacings.push(b - a);
+        }
+    }
+    if (spacings.length === 0) return null;
+    spacings.sort((x, y) => x - y);
+    const median = spacings[Math.floor(spacings.length / 2)];
+    if (!(median > 0)) return null;
+    return 60 / median;
+}
+
+function _captureSetIntervalParams(bpm) {
+    let safeBpm = (bpm && Number.isFinite(bpm) && bpm > 0) ? bpm : 120;
+    // Clamp to a minimum so very slow tempos don't blow past the
+    // listener's defensive packet_count cap (4096). 30 BPM × 4
+    // beats = 8 s interval ≈ 400 packets at 20 ms — well within
+    // the cap. Lower than 30 BPM is rare in practice and clamping
+    // up means the broadcaster's interval boundaries don't align
+    // perfectly with their chart's beat grid, but Phase 2d's
+    // initial-BPM-only design already accepts that for tempo-
+    // change cases. Spotted by Copilot review on PR #8 round 2.
+    if (safeBpm < 30) safeBpm = 30;
+    _captureIntervalBeats = _selectIntervalBeats(safeBpm);
+    _captureIntervalLengthSec = (60 / safeBpm) * _captureIntervalBeats;
+    _captureIntervalSamplesTarget = Math.round(_captureIntervalLengthSec * SMAU_V1_SAMPLE_RATE);
+    // Slack so a chunk that crosses the boundary doesn't overrun.
+    _captureIntervalBuffer = new Float32Array(_captureIntervalSamplesTarget + CAPTURE_PCM_CHUNK_SAMPLES);
+    _captureIntervalSampleCount = 0;
+}
+
+async function _captureEnumerateInputDevices() {
+    try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        return devices.filter((d) => d.kind === 'audioinput');
+    } catch (e) {
+        return [];
+    }
+}
+
+async function _captureRequestPermissionAndRefreshDevices() {
+    // Browsers hide device labels until the page has been granted at
+    // least one getUserMedia for that kind. Trigger a tiny audio
+    // request, then immediately stop it, so the dropdown can show
+    // device names. The user will see a permission prompt the first
+    // time; subsequent reloads are silent if permission is persisted.
+    try {
+        const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        tempStream.getTracks().forEach((t) => t.stop());
+    } catch (e) {
+        // User denied or no devices — caller will surface the error.
+        return [];
+    }
+    return _captureEnumerateInputDevices();
+}
+
+function _captureStopLevelMeter() {
+    if (_captureLevelTimer) {
+        cancelAnimationFrame(_captureLevelTimer);
+        _captureLevelTimer = null;
+    }
+}
+
+function _captureStartLevelMeter() {
+    _captureStopLevelMeter();
+    if (!_captureAnalyser) return;
+    const buf = _captureAnalyserBuffer || new Uint8Array(_captureAnalyser.fftSize);
+    _captureAnalyserBuffer = buf;
+    const tick = () => {
+        if (!_captureAnalyser) return;
+        _captureAnalyser.getByteTimeDomainData(buf);
+        // Compute peak deviation from 128 (silence midpoint for u8).
+        let peak = 0;
+        for (let i = 0; i < buf.length; i++) {
+            const v = Math.abs(buf[i] - 128);
+            if (v > peak) peak = v;
+        }
+        const level = peak / 128;
+        _renderCaptureLevel(level);
+        _captureLevelTimer = requestAnimationFrame(tick);
+    };
+    _captureLevelTimer = requestAnimationFrame(tick);
+}
+
+function _renderCaptureLevel(level) {
+    const bar = document.getElementById('mp-broadcast-level-fill');
+    if (bar) {
+        const pct = Math.min(100, Math.round(level * 100));
+        bar.style.width = pct + '%';
+    }
+}
+
+function _captureOnEncodedChunk(chunk) {
+    // AudioEncoder.output: copy the chunk's bytes into a Uint8Array
+    // and append to the per-interval accumulator. We don't act on it
+    // until flush() resolves below — multiple chunks can be emitted
+    // per encode() call (Opus's default 20ms frame duration means a
+    // 2s interval typically produces ~100 chunks).
+    const buf = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(buf);
+    _captureEncoderChunks.push(buf);
+}
+
+function _captureOnEncoderError(err) {
+    console.error('[MP] AudioEncoder error:', err);
+    // Tear down — the next broadcast attempt will rebuild the encoder.
+    // Do NOT use silent:true here. If the server already accepted us
+    // as broadcaster, suppressing broadcast_stop would leave its
+    // broadcaster_id stuck on this player until grace expiry, blocking
+    // others. Spotted by Copilot review on PR #8 round 1.
+    _broadcastStop();
+    _showError('Audio encoder failed; broadcast stopped.');
+}
+
+function _captureFlushAndSendIntervalQueued() {
+    // Capture interval state synchronously here (before queueing) so
+    // each queued task encodes the correct interval even if more
+    // boundaries fire while it's pending.
+    const numFrames = _captureIntervalSampleCount;
+    const pcm = _captureIntervalBuffer.slice(0, numFrames);
+    const chartTimeStart = _captureChartTimeAtIntervalStart;
+    const chartTimeNow = _captureChartTime();
+    const chartTimeEnd = chartTimeStart + (numFrames / SMAU_V1_SAMPLE_RATE);
+    const intervalIndex = _captureIntervalIndex;
+    const gen = _captureGen;
+
+    // Roll the interval pointer + buffer NOW so subsequent PCM
+    // chunks belong to interval N+1.
+    _captureIntervalSampleCount = 0;
+    _captureIntervalBuffer = new Float32Array(_captureIntervalSamplesTarget + CAPTURE_PCM_CHUNK_SAMPLES);
+
+    // Re-anchor _captureChartTimeAtIntervalStart to the current
+    // chart clock for the NEXT interval, instead of just continuing
+    // the chartTimeEnd of THIS interval. The previous "compute end
+    // from start + sample count" approach would drift indefinitely
+    // when chart time differs from real time (chart paused, host
+    // seeked, host adjusted speed). Re-anchoring per interval
+    // bounds the drift to one interval at most. Spotted by Copilot
+    // review on PR #8 round 8.
+    _captureChartTimeAtIntervalStart = chartTimeNow;
+
+    // Skip the send if chart isn't currently advancing or if our
+    // computed chartTimeEnd has drifted significantly past the
+    // actual chart clock — sending in those cases would emit
+    // SMAU frames whose chart-time metadata listeners can't
+    // schedule correctly. The drop is silent (the next interval
+    // will re-anchor and resume sending). NOTE: this check uses
+    // the synchronously-known audio.paused state at boundary
+    // time; rapid pause/play during the interval might still
+    // produce one slightly-off interval, which is the v1 design
+    // accepted in PROTOCOL.md "tempo / pause boundary cases".
+    const audio = document.getElementById('audio');
+    const chartPlaying = audio && !audio.paused;
+    const drift = chartTimeEnd - chartTimeNow;
+    // Symmetric drift guard. driftAhead > 0.5 catches "chart paused
+    // mid-interval" or "host running slow"; drift < -0.5 (chart
+    // jumped forward via seek mid-interval) catches the symmetric
+    // case where listeners would receive an interval whose
+    // chartTimeEnd is far behind their current clock and drop it
+    // as 'late' anyway. Skipping locally saves the encoder + ws
+    // work. Spotted by Copilot review on PR #8 round 9.
+    if (!chartPlaying || drift > 0.5 || drift < -0.5) {
+        // Drop this interval. Bump the interval index so listeners
+        // never see a duplicate interval_index (in case some
+        // intervals were sent for this generation already).
+        _captureIntervalIndex = _captureIntervalIndex + 1n;
+        return;
+    }
+
+    _captureIntervalIndex = _captureIntervalIndex + 1n;
+
+    _captureFlushQueue = _captureFlushQueue.then(() => {
+        // Generation gate: a stop+start cycle bumps _captureGen, so a
+        // queued task from a previous broadcast bails out before
+        // touching the NEW encoder / WS.
+        if (gen !== _captureGen) return;
+        return _captureFlushAndSendInterval(pcm, numFrames, chartTimeStart, chartTimeEnd, intervalIndex);
+    }).catch((err) => {
+        console.error('[MP] capture flush failed:', err);
+    });
+}
+
+async function _captureFlushAndSendInterval(pcm, numFrames, chartTimeStart, chartTimeEnd, intervalIndex) {
+    if (numFrames <= 0) return;
+    const encoder = _captureEncoder;
+    if (!encoder) return;
+    _captureEncoderChunks = [];
+
+    let audioData;
+    try {
+        audioData = new AudioData({
+            format: 'f32',
+            sampleRate: SMAU_V1_SAMPLE_RATE,
+            numberOfChannels: SMAU_V1_CHANNEL_COUNT,
+            numberOfFrames: numFrames,
+            // Microsecond timestamps must be unique per AudioData fed
+            // to the encoder. Use chart_time_start * 1e6 — it advances
+            // monotonically with the broadcast.
+            timestamp: Math.round(chartTimeStart * 1e6),
+            data: pcm,
+        });
+    } catch (e) {
+        console.error('[MP] AudioData construct failed:', e);
+        return;
+    }
+
+    try {
+        encoder.encode(audioData);
+    } catch (e) {
+        console.error('[MP] AudioEncoder.encode failed:', e);
+        try { audioData.close(); } catch (_) { /* */ }
+        return;
+    }
+    try { audioData.close(); } catch (_) { /* */ }
+
+    try {
+        await encoder.flush();
+    } catch (e) {
+        // Encoder is still alive; flush() rejecting can happen on
+        // teardown races. Drop this interval.
+        _captureEncoderChunks = [];
+        return;
+    }
+
+    if (encoder !== _captureEncoder) {
+        // Encoder was torn down during the flush — drop.
+        _captureEncoderChunks = [];
+        return;
+    }
+
+    // Build the SMAU opus payload as a length-prefixed sequence of
+    // Opus packet records:
+    //   [u32 LE packet_count]
+    //   ([u32 LE packet_size][packet_size bytes])*
+    //
+    // PROTOCOL.md "Audio frame format / Payload" describes this.
+    // Each Opus packet is at most ~120 ms by spec, so a 2-second
+    // interval typically produces ~10–100 packets. Concatenating
+    // them into one EncodedAudioChunk (the previous behavior) was
+    // not decodable — Opus packets have to be fed independently.
+    // Spotted by Copilot review on PR #8 round 1.
+    const packets = _captureEncoderChunks;
+    _captureEncoderChunks = [];
+    if (packets.length === 0) return;
+
+    let totalSize = 4; // packet_count
+    for (const p of packets) totalSize += 4 + p.byteLength;
+
+    const opus = new Uint8Array(totalSize);
+    const view = new DataView(opus.buffer, opus.byteOffset, totalSize);
+    view.setUint32(0, packets.length, true);
+    let off = 4;
+    for (const p of packets) {
+        view.setUint32(off, p.byteLength, true);
+        off += 4;
+        opus.set(p, off);
+        off += p.byteLength;
+    }
+
+    // Gate on broadcaster_changed ack and audio WS readiness.
+    if (!_captureBroadcasterAcked) return;
+    if (!_audioWs || _audioWs.readyState !== WebSocket.OPEN) return;
+
+    let frame;
+    try {
+        frame = _smauEncodeFrame({
+            intervalIndex: intervalIndex,
+            chartTimeStart: chartTimeStart,
+            chartTimeEnd: chartTimeEnd,
+            sampleCount: numFrames,
+            opus: opus,
+        });
+    } catch (e) {
+        console.error('[MP] SMAU encode failed:', e);
+        return;
+    }
+    try {
+        _audioWs.send(frame);
+    } catch (e) {
+        // WS may have closed concurrently. Listener-side reconnect
+        // logic recovers.
+    }
+}
+
+function _captureOnPcmChunk(chunk) {
+    // Loop because a single PCM chunk (10 ms = 480 samples) can
+    // straddle an interval boundary: write the prefix into the
+    // current interval, fire its flush, then write the remainder
+    // into the freshly-allocated next-interval buffer. Without this
+    // split-and-carry, the post-boundary tail would either be
+    // dropped (drift vs chart_time over long sessions) or merged
+    // into the wrong interval. Spotted by Copilot review on PR #8
+    // round 2.
+    let offset = 0;
+    while (offset < chunk.length && _captureIntervalBuffer) {
+        const need = _captureIntervalSamplesTarget - _captureIntervalSampleCount;
+        const capacity = _captureIntervalBuffer.length - _captureIntervalSampleCount;
+        const writable = Math.min(need, capacity, chunk.length - offset);
+        if (writable <= 0) return;
+        _captureIntervalBuffer.set(
+            chunk.subarray(offset, offset + writable),
+            _captureIntervalSampleCount
+        );
+        _captureIntervalSampleCount += writable;
+        offset += writable;
+        if (_captureIntervalSampleCount === _captureIntervalSamplesTarget) {
+            // Boundary crossed — fire the flush. _captureFlushAndSendIntervalQueued
+            // synchronously snapshots interval state and rolls
+            // _captureIntervalBuffer / _captureIntervalSampleCount /
+            // _captureChartTimeAtIntervalStart over to the next
+            // interval, so the loop continues writing into the
+            // FRESH buffer.
+            _captureFlushAndSendIntervalQueued();
+        }
+    }
+}
+
+async function _broadcastStart(deviceId) {
+    if (_captureCtx) return; // already broadcasting
+    // Re-entrancy / start-in-progress guard. Bump _captureGen on
+    // entry and capture the value; every await checks that no
+    // newer start has bumped past us. Without this, two rapid
+    // toggle clicks could each get past the _captureCtx==null
+    // check (which stays null until late in the async flow) and
+    // race to wire up parallel mic streams + AudioContexts.
+    // Spotted by Copilot review on PR #8 round 6.
+    const myGen = ++_captureGen;
+    // Reset the flush queue so any stale tasks from a previous
+    // broadcast session can't run against THIS session's encoder.
+    _captureFlushQueue = Promise.resolve();
+    if (!_captureHasWebCodecs()) {
+        _showError('Peer audio broadcast requires WebCodecs (Chrome/Edge or Firefox 130+).');
+        return;
+    }
+    if (!_audioWs || _audioWs.readyState !== WebSocket.OPEN) {
+        _showError('Audio connection not ready — try again in a moment.');
+        return;
+    }
+    if (!_ws || _ws.readyState !== WebSocket.OPEN) {
+        // Without a live highway WS, broadcast_start can't be sent
+        // and broadcaster_changed can't arrive — we'd burn CPU on
+        // the encoder pipeline while the toggle sat at "Connecting…"
+        // forever. Spotted by Copilot review on PR #8 round 3.
+        _showError('Connection not ready — try again in a moment.');
+        return;
+    }
+    _captureRequested = true;
+    _captureBroadcasterAcked = false;
+    if (deviceId) {
+        // Persist the user's device choice for next-session restore
+        // (mpRefreshBroadcastDevices reads this back). We don't keep
+        // the value as in-memory state because the dropdown is the
+        // single source of truth for the active selection while
+        // broadcasting.
+        try { localStorage.setItem(CAPTURE_DEVICE_STORAGE_KEY, deviceId); } catch (_) { /* */ }
+    }
+
+    let stream;
+    try {
+        const constraints = {
+            audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+                sampleRate: SMAU_V1_SAMPLE_RATE,
+                channelCount: SMAU_V1_CHANNEL_COUNT,
+            },
+        };
+        if (deviceId) constraints.audio.deviceId = { exact: deviceId };
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (e) {
+        _captureRequested = false;
+        _showError('Microphone access denied or unavailable: ' + (e && e.message || e));
+        return;
+    }
+    // Cancellation check: the user may have toggled broadcast off,
+    // OR triggered another _broadcastStart (re-entrancy), while the
+    // permission prompt was open. Stop the just-acquired tracks and
+    // bail. Spotted by Copilot review on PR #8 rounds 2 + 6.
+    if (!_captureRequested || myGen !== _captureGen) {
+        try { stream.getTracks().forEach((t) => t.stop()); } catch (_) { /* */ }
+        return;
+    }
+    _captureStream = stream;
+
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) {
+        _captureRequested = false;
+        _showError('AudioContext unavailable in this browser.');
+        _broadcastStop({ silent: true });
+        return;
+    }
+    _captureCtx = new Ctor({ sampleRate: SMAU_V1_SAMPLE_RATE, latencyHint: 'interactive' });
+    // Best-effort resume for autoplay-restricted browsers. Newly
+    // created AudioContexts on Safari (and sometimes Chrome) start
+    // suspended until resume() is called from a user gesture; the
+    // toggle click that landed us here qualifies, but we still
+    // need to actually call it. Without this the analyser / worklet
+    // sit idle and the UI gets stuck at "Connecting…". Spotted by
+    // Copilot review on PR #8 round 5.
+    if (_captureCtx.state === 'suspended' && typeof _captureCtx.resume === 'function') {
+        try {
+            const p = _captureCtx.resume();
+            if (p && typeof p.catch === 'function') p.catch(() => {});
+        } catch (_) { /* */ }
+    }
+
+    // Inline worklet via Blob URL.
+    const blob = new Blob([_CAPTURE_WORKLET_CODE], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    try {
+        await _captureCtx.audioWorklet.addModule(url);
+    } catch (e) {
+        URL.revokeObjectURL(url);
+        _captureRequested = false;
+        _showError('Failed to install capture worklet: ' + (e && e.message || e));
+        _broadcastStop({ silent: true });
+        return;
+    }
+    URL.revokeObjectURL(url);
+    // Second cancellation check — addModule is async, and the user
+    // may have toggled off during it (or another start may have
+    // raced past us).
+    //
+    // Fork the cleanup based on which case we're in:
+    //   - If we're cancelled but still the current generation
+    //     (user toggled off), it's safe to call _broadcastStop —
+    //     the globals we created (_captureCtx, _captureStream)
+    //     are still ours.
+    //   - If a NEWER start has raced past us (myGen !== _captureGen),
+    //     a different _broadcastStart may have already assigned
+    //     _captureCtx / _captureStream. Calling _broadcastStop
+    //     would tear DOWN the newer start's globals AND bump
+    //     _captureGen further, which would in turn invalidate
+    //     the newer start at its own gen check. Just stop our
+    //     local resources without touching globals. Spotted by
+    //     Copilot review on PR #8 round 10.
+    if (!_captureRequested) {
+        _broadcastStop({ silent: true });
+        return;
+    }
+    if (myGen !== _captureGen) {
+        // A newer start owns the globals now. Only stop the local
+        // stream we acquired (the AudioContext we created may have
+        // already been torn down + replaced by the newer start).
+        try { stream.getTracks().forEach((t) => t.stop()); } catch (_) { /* */ }
+        return;
+    }
+
+    _captureSourceNode = _captureCtx.createMediaStreamSource(stream);
+    _captureAnalyser = _captureCtx.createAnalyser();
+    _captureAnalyser.fftSize = 256;
+    _captureSourceNode.connect(_captureAnalyser);
+
+    // Silent sink — connect the analyser through a gain=0 node to
+    // ctx.destination. Web Audio doesn't guarantee that nodes which
+    // are not ultimately connected to destination get pulled/
+    // rendered, which can prevent the analyser from getting fresh
+    // data and (more critically) the worklet's process() callback
+    // from being called at all on some browsers. The gain=0
+    // multiplier means we don't actually output any sound to the
+    // listener's speakers — we just keep the graph "alive". Spotted
+    // by Copilot review on PR #8 round 3.
+    _captureSilentSink = _captureCtx.createGain();
+    _captureSilentSink.gain.value = 0;
+    _captureAnalyser.connect(_captureSilentSink);
+    _captureSilentSink.connect(_captureCtx.destination);
+
+    try {
+        _captureWorkletNode = new AudioWorkletNode(_captureCtx, 'slopsmith-capture-processor', {
+            numberOfInputs: 1,
+            // numberOfOutputs:1 (default) plus connect to the silent
+            // sink BELOW. With numberOfOutputs:0 the worklet node
+            // sits off the rendered graph and some browsers stop
+            // calling its process() — see the silent-sink comment
+            // for the analyser. Spotted by Copilot review on PR #8
+            // round 4.
+            numberOfOutputs: 1,
+            outputChannelCount: [SMAU_V1_CHANNEL_COUNT],
+            processorOptions: { chunkSize: CAPTURE_PCM_CHUNK_SAMPLES },
+        });
+    } catch (e) {
+        _captureRequested = false;
+        _showError('Failed to construct capture worklet node: ' + (e && e.message || e));
+        _broadcastStop({ silent: true });
+        return;
+    }
+    _captureSourceNode.connect(_captureWorkletNode);
+    // Route the worklet's silent output through the gain=0 sink to
+    // ctx.destination so the worklet is on a rendered path. The
+    // worklet's process() leaves outputs[] zero-filled (it captures
+    // input only), so this contributes no audio.
+    _captureWorkletNode.connect(_captureSilentSink);
+    _captureWorkletNode.port.onmessage = (ev) => {
+        if (ev.data instanceof Float32Array) {
+            _captureOnPcmChunk(ev.data);
+        }
+    };
+
+    // Compute interval params from chart bpm.
+    const bpm = _captureCurrentChartBpm();
+    _captureSetIntervalParams(bpm);
+    _captureIntervalIndex = 0n;
+    _captureChartTimeAtIntervalStart = _captureChartTime();
+
+    // WebCodecs Opus encoder.
+    try {
+        _captureEncoder = new AudioEncoder({
+            output: (chunk) => _captureOnEncodedChunk(chunk),
+            error: (err) => _captureOnEncoderError(err),
+        });
+        _captureEncoder.configure({
+            codec: 'opus',
+            sampleRate: SMAU_V1_SAMPLE_RATE,
+            numberOfChannels: SMAU_V1_CHANNEL_COUNT,
+            bitrate: 96000,
+            opus: { application: 'audio' },
+        });
+    } catch (e) {
+        _captureRequested = false;
+        _showError('Audio encoder configure failed: ' + (e && e.message || e));
+        _broadcastStop({ silent: true });
+        return;
+    }
+
+    // Post-await readiness re-check. Multiple awaits sit between
+    // the entry-point WS checks and here (getUserMedia, addModule,
+    // encoder.configure); the highway or audio WS could have closed
+    // during any of them. If we just silently skipped the
+    // broadcast_start send, the toggle would sit at "Connecting…"
+    // forever while burning encoder CPU. Spotted by Copilot review
+    // on PR #8 round 4.
+    if (
+        !_ws || _ws.readyState !== WebSocket.OPEN
+        || !_audioWs || _audioWs.readyState !== WebSocket.OPEN
+    ) {
+        _captureRequested = false;
+        _showError('Connection dropped while preparing broadcast — try again.');
+        _broadcastStop({ silent: true });
+        return;
+    }
+
+    _captureStartLevelMeter();
+
+    // Send broadcast_start; the broadcaster_changed ack flips
+    // _captureBroadcasterAcked = true and unlocks frame send. The
+    // send() can still throw if the WS closes between the readiness
+    // re-check above and this call (the close-and-send race is
+    // typically microseconds but real); catch + tear down so the
+    // toggle doesn't stay stuck in "Connecting…". Spotted by
+    // Copilot review on PR #8 round 7.
+    try {
+        _ws.send(JSON.stringify({
+            type: 'broadcast_start',
+            interval_beats: _captureIntervalBeats,
+            sample_rate: SMAU_V1_SAMPLE_RATE,
+            channel_count: SMAU_V1_CHANNEL_COUNT,
+            codec: 'opus',
+            bitrate: 96000,
+        }));
+    } catch (err) {
+        _captureRequested = false;
+        _showError('Connection dropped while starting broadcast — try again.');
+        _broadcastStop({ silent: true });
+        return;
+    }
+    _renderBroadcastUi();
+}
+
+function _broadcastStop(opts) {
+    const silent = opts && opts.silent;
+    const wasRequested = _captureRequested;
+    _captureRequested = false;
+    _captureBroadcasterAcked = false;
+    // Bump the generation token so any queued flush tasks from this
+    // session bail out at their gate before touching the next
+    // session's encoder / WS. Reset the queue too — no point keeping
+    // tasks chained that will all early-return.
+    _captureGen++;
+    _captureFlushQueue = Promise.resolve();
+    _captureStopLevelMeter();
+    if (_captureWorkletNode) {
+        try { _captureWorkletNode.port.onmessage = null; } catch (_) { /* */ }
+        try { _captureWorkletNode.disconnect(); } catch (_) { /* */ }
+        _captureWorkletNode = null;
+    }
+    if (_captureSourceNode) {
+        try { _captureSourceNode.disconnect(); } catch (_) { /* */ }
+        _captureSourceNode = null;
+    }
+    if (_captureAnalyser) {
+        try { _captureAnalyser.disconnect(); } catch (_) { /* */ }
+        _captureAnalyser = null;
+    }
+    _captureAnalyserBuffer = null;
+    if (_captureSilentSink) {
+        try { _captureSilentSink.disconnect(); } catch (_) { /* */ }
+        _captureSilentSink = null;
+    }
+    if (_captureEncoder) {
+        try { _captureEncoder.close(); } catch (_) { /* */ }
+        _captureEncoder = null;
+    }
+    _captureEncoderChunks = [];
+    if (_captureStream) {
+        try { _captureStream.getTracks().forEach((t) => t.stop()); } catch (_) { /* */ }
+        _captureStream = null;
+    }
+    if (_captureCtx) {
+        // AudioContext.close() returns a Promise — async rejections
+        // would otherwise surface as unhandled-rejection warnings
+        // during teardown races. Match the resume() handling.
+        // Spotted by Copilot review on PR #8 round 2.
+        try {
+            const closePromise = _captureCtx.close();
+            if (closePromise && typeof closePromise.catch === 'function') {
+                closePromise.catch(() => {});
+            }
+        } catch (_) { /* */ }
+        _captureCtx = null;
+    }
+    _captureIntervalBuffer = null;
+    _captureIntervalSampleCount = 0;
+    _renderCaptureLevel(0);
+    _renderBroadcastUi();
+    // Tell the server only if we actually owned a broadcast and not
+    // during a forced silent teardown (e.g. encoder error already on
+    // the way to a user-visible error).
+    if (wasRequested && !silent && _ws && _ws.readyState === WebSocket.OPEN) {
+        try {
+            _ws.send(JSON.stringify({ type: 'broadcast_stop' }));
+        } catch (_) { /* */ }
+    }
+}
+
+function _captureOnBroadcasterChanged(broadcasterId) {
+    // Highway dispatch already routes to the listener pipeline. The
+    // capture path observes the broadcaster_changed event to know
+    // whether the server accepted our broadcast_start (ack flips
+    // _captureBroadcasterAcked = true so frame send unlocks).
+    if (broadcasterId === _playerId) {
+        // Only treat this as an ack if we still intend to broadcast.
+        // A stale self-ack (e.g. server re-emitted broadcaster_changed
+        // for a session that we've since stopped locally) shouldn't
+        // flip the pill back to "Broadcasting".
+        if (_captureRequested || _captureCtx) {
+            _captureBroadcasterAcked = true;
+            _renderBroadcastUi();
+        }
+        return;
+    }
+    // Either someone else is broadcasting or the slot was cleared.
+    // Always clear any stale self-ack first so the UI cannot remain
+    // stuck on "Broadcasting" after a local stop followed by a later
+    // server update. Spotted by Copilot review on PR #8 round 3.
+    const hadAck = _captureBroadcasterAcked;
+    _captureBroadcasterAcked = false;
+    // If WE thought we were broadcasting, our broadcast was preempted —
+    // tear down without sending another broadcast_stop (the server
+    // already moved on).
+    if (_captureRequested || _captureCtx) {
+        _broadcastStop({ silent: true });
+        return;
+    }
+    if (hadAck) {
+        _renderBroadcastUi();
+    }
+}
+
+function _renderBroadcastUi() {
+    const toggle = document.getElementById('mp-broadcast-toggle');
+    const pill = document.getElementById('mp-broadcast-pill');
+    const dropdown = document.getElementById('mp-broadcast-device');
+    if (toggle) {
+        toggle.checked = !!_captureRequested;
+    }
+    if (pill) {
+        if (_captureBroadcasterAcked) {
+            pill.classList.remove('hidden');
+            pill.textContent = '⏺ Broadcasting';
+        } else if (_captureRequested) {
+            pill.classList.remove('hidden');
+            pill.textContent = '⏳ Connecting…';
+        } else {
+            pill.classList.add('hidden');
+        }
+    }
+    if (dropdown) {
+        // Disable device picker while broadcasting; switching mid-broadcast
+        // would require teardown + restart and is out of scope for v1.
+        dropdown.disabled = !!_captureRequested;
+    }
+}
+
+window.mpToggleBroadcast = async function () {
+    const toggle = document.getElementById('mp-broadcast-toggle');
+    const wantOn = toggle ? !!toggle.checked : !_captureRequested;
+    if (wantOn && _captureCtx) return; // already on
+    if (!wantOn && !_captureCtx && !_captureRequested) return;
+    if (wantOn) {
+        const dropdown = document.getElementById('mp-broadcast-device');
+        const deviceId = (dropdown && dropdown.value) || null;
+        await _broadcastStart(deviceId);
+        // _broadcastStart may bail out early on permission denial etc.;
+        // sync the toggle to whatever final state we ended up in.
+        _renderBroadcastUi();
+    } else {
+        _broadcastStop({});
+    }
+};
+
+window.mpRefreshBroadcastDevices = async function () {
+    const dropdown = document.getElementById('mp-broadcast-device');
+    if (!dropdown) return;
+    // _captureRequestPermissionAndRefreshDevices swallows getUserMedia
+    // exceptions and returns [] (so this caller doesn't have to know
+    // about specific Permissions API errors). An empty list therefore
+    // means either "permission denied" or "no input devices" — either
+    // way, nothing useful to populate, and the user needs to know.
+    // The previous try/catch was unreachable. Spotted by Copilot
+    // review on PR #8 round 6.
+    const devices = await _captureRequestPermissionAndRefreshDevices();
+    if (!Array.isArray(devices) || devices.length === 0) {
+        _showError('Microphone permission was denied or no input devices are available.');
+        return;
+    }
+    const persisted = (() => {
+        try { return localStorage.getItem(CAPTURE_DEVICE_STORAGE_KEY) || ''; } catch (_) { return ''; }
+    })();
+    dropdown.innerHTML = '';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = 'Default device';
+    dropdown.appendChild(defaultOpt);
+    for (const d of devices) {
+        const opt = document.createElement('option');
+        opt.value = d.deviceId;
+        opt.textContent = d.label || ('Microphone ' + d.deviceId.slice(0, 8));
+        if (d.deviceId === persisted) opt.selected = true;
+        dropdown.appendChild(opt);
+    }
+};
 
 // ── Connected-snapshot recovery ────────────────────────────────────────
 //
@@ -1821,10 +2913,35 @@ function _handleMessage(msg) {
             } else {
                 _audioListenerOnControlClear();
             }
+            // Phase 2d: capture path observes the same event to know
+            // whether the server accepted our broadcast_start. Self ack
+            // unlocks frame send; non-self / null tears down our own
+            // capture if we thought we were broadcasting.
+            _captureOnBroadcasterChanged(msg.broadcaster_id || null);
             break;
 
         case 'error':
             console.error('[MP] Server error:', msg.message);
+            // Capture-side rejection of broadcast_start: if the user
+            // toggled broadcast on but the server refused (another
+            // broadcaster is active, or our /audio WS isn't attached),
+            // tear our local capture pipeline down and surface a
+            // user-facing message. Without this the pill sits at
+            // "Connecting…" forever and the encoder keeps producing
+            // intervals that frame-send drops on the broadcaster_acked
+            // gate. Spotted by Copilot review (suppressed) on PR #8
+            // round 2.
+            if (
+                (_captureRequested || _captureCtx)
+                && (msg.message === 'broadcaster_busy' || msg.message === 'audio_ws_not_open')
+            ) {
+                _broadcastStop({ silent: true });
+                _showError(
+                    msg.message === 'broadcaster_busy'
+                        ? 'Another player is already broadcasting.'
+                        : 'Audio connection not ready. Please try again.'
+                );
+            }
             break;
     }
 }
@@ -3250,5 +4367,18 @@ window.slopsmithMultiplayerDebug = {
         }
     };
 })();
+
+// ── Page unload: tear down the broadcast cleanly ───────────────────────
+//
+// Without this, a tab close mid-broadcast leaves the encoder + mic
+// stream up for the GC and leaves the server-side broadcaster_id stuck
+// until the session grace timer expires. broadcast_stop is best-effort
+// (the highway WS may already be tearing down), but stopping the local
+// capture pipeline immediately releases the mic + encoder resources.
+window.addEventListener('beforeunload', () => {
+    if (_captureCtx || _captureRequested) {
+        _broadcastStop({});
+    }
+});
 
 })();
