@@ -1955,51 +1955,33 @@ def setup(app, context):
                         except Exception:
                             pass
                 else:
-                    # ORDER MATTERS — codex multi-round:
-                    # 1. If this is a real handoff (current broadcaster
-                    #    is None or somehow different), purge each
-                    #    peer's audio worker FIRST. While broadcaster_id
-                    #    is still its previous value (typically None —
-                    #    _clear_broadcaster_if_player will have cleared
-                    #    it), this cancels any in-flight `ws.send_bytes`
-                    #    of a previous-broadcaster frame and drains the
-                    #    per-listener queue. Skipped when the same
-                    #    broadcaster is re-issuing broadcast_start
-                    #    (reconnect / param refresh), since there is no
-                    #    transition and a purge would just create an
-                    #    avoidable gap for buffered listeners.
-                    # 2. Atomically flip broadcaster_id to the new
-                    #    player and emit broadcaster_changed. PROTOCOL.md
-                    #    requires the broadcaster to wait for the ack
-                    #    before sending frames, so frames the listener
-                    #    receives AFTER this event are guaranteed to
-                    #    come from the new broadcaster.
-                    # Doing the purge after the id flip would let new-
-                    # broadcaster frames pile into the OLD listener
-                    # workers (then get dropped on cancel), clipping
-                    # the start of the new broadcast.
-                    # ORDER MATTERS — codex multi-round:
+                    # ORDER MATTERS — codex multi-round, then refined
+                    # in Copilot round 4 of PR #7:
                     # 1. Atomically claim the broadcaster slot BEFORE
                     #    awaiting anything. The check + assignment is
                     #    synchronous (no await between them), so two
                     #    concurrent broadcast_start handlers that both
-                    #    saw current == None will resolve here: only
-                    #    one wins; the other's re-check fails and it
-                    #    bails with broadcaster_busy. This prevents the
-                    #    loser from running _purge_audio_for_handoff
-                    #    against the winner's listener workers and
-                    #    clipping the winner's first intervals.
+                    #    saw current == None resolve here: only one
+                    #    wins; the other's re-check fails and it bails
+                    #    with broadcaster_busy. This prevents the loser
+                    #    from running _purge_audio_for_handoff against
+                    #    the winner's listener workers and clipping the
+                    #    winner's first intervals.
                     # 2. THEN purge old listener workers (drains
                     #    leftover queue entries and cancels in-flight
                     #    sends from the previous broadcaster). Skipped
                     #    when the same broadcaster is re-issuing
                     #    broadcast_start (reconnect / param refresh).
+                    #    Frames sent by the new broadcaster during this
+                    #    purge window are dropped at the /audio fan-out
+                    #    gate (which checks broadcast_handoff_in_progress
+                    #    > 0); a well-behaved broadcaster won't send
+                    #    them anyway because PROTOCOL.md requires
+                    #    waiting for the broadcaster_changed ack.
                     # 3. Emit broadcaster_changed so listeners know to
                     #    treat subsequent /audio frames as belonging
-                    #    to the new broadcaster. PROTOCOL.md requires
-                    #    the broadcaster to wait for this ack before
-                    #    sending frames, so frames the listener
-                    #    receives AFTER this event are guaranteed to
+                    #    to the new broadcaster. Frames listeners
+                    #    receive AFTER this event are guaranteed to
                     #    come from the new broadcaster.
                     pre_claim = room.get("broadcaster_id")
                     if pre_claim is not None and pre_claim != player_id:

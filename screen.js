@@ -2181,11 +2181,15 @@ async function _doLoadSong(queueItem) {
     try {
         // Call global playSong (await to let the full plugin chain set up).
         // If playSong isn't installed (slopsmith core not loaded yet, or
-        // some unexpected page state), treat as a load failure so we
-        // don't poison the cache by marking a never-loaded song as
-        // ready. Spotted by Copilot review on PR #7 round 3.
+        // some unexpected page state), THROW rather than silently
+        // returning — _bootstrapOnConnected and other callers wrap
+        // _loadSong in try/catch and treat exceptions as load
+        // failures (so they abort the rest of bootstrap). A silent
+        // return would let those callers continue applying chart
+        // state and activating the listener for a song that never
+        // loaded. Spotted by Copilot review on PR #7 round 4.
         if (typeof playSong !== 'function') {
-            return;
+            throw new Error('playSong is not available');
         }
         await playSong(queueItem.filename, arrIndex);
         // Give plugins time to finish async setup (stems, highway _onReady, etc.)

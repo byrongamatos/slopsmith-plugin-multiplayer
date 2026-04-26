@@ -532,10 +532,11 @@ def test_handoff_in_progress_blocks_same_player_reentrant_start(client, routes_m
         for hw in (host_hw, bob_hw):
             _drain_until(hw, lambda m: m.get("type") == "connected")
 
-        # First broadcast_start completes normally (no prior broadcaster
-        # so purge is skipped — current == None == player_id is False so
-        # purge runs, but with no prior broadcaster's queue to drain it's
-        # essentially a no-op).
+        # First broadcast_start completes normally. On the initial
+        # None → host_pid transition, the purge path runs (because
+        # current != player_id when current is None), but with no
+        # prior broadcaster's queue to drain it is effectively a
+        # no-op. Reworded after Copilot review on PR #7 round 4.
         host_hw.send_json({"type": "broadcast_start", **_VALID_PARAMS})
         _drain_until(bob_hw, lambda m: m.get("type") == "broadcaster_changed" and m.get("broadcaster_id") == host_pid)
 
