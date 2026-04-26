@@ -1,6 +1,7 @@
 """Multiplayer plugin — synced rooms, shared queue, optional mixdown."""
 
 import asyncio
+import logging
 import math
 import re
 import secrets
@@ -20,7 +21,14 @@ _cleanup_tasks = {}   # code -> asyncio.Task
 _MP_DIR = None        # set by setup(); used by module-level _cleanup_after_grace
 
 # Session lifecycle constants — see PROTOCOL.md "v1 server policy".
+_log = logging.getLogger(__name__)
+
 SESSION_GRACE_SEC = 5.0
+# Cap per-peer cleanup time during a broadcaster handoff. A backpressured
+# or stuck ws.send_bytes on one slow listener should not gate the whole
+# room's broadcast_start; if cleanup takes longer than this we move on
+# and let the client-side handoff_suppress window catch any stragglers.
+_PURGE_TIMEOUT_SEC = 0.5
 # How long a creator who has never opened any WS keeps the host slot before
 # self-heal will transfer it to the first connected guest. Long enough to
 # absorb a normal page-load + WS-handshake (typically 1–3s); short enough that
@@ -198,6 +206,12 @@ async def _clear_broadcaster_if_player(room, player_id):
         "type": "broadcaster_changed",
         "broadcaster_id": None,
     })
+    # Deliberately DO NOT flush per-listener audio queues here. PROTOCOL.md
+    # "Lifecycle §5 Stop" says listeners should drain pending intervals on
+    # stop — slow listeners may still have a few buffered frames behind
+    # broadcaster_changed:null and we want those to play out. Mis-
+    # attribution on rapid handoff is handled in the broadcast_start
+    # path (which does flush + worker restart) instead.
 
 
 async def _safe_close(ws, code):
@@ -644,6 +658,156 @@ def _setup_audio_worker(sess):
     sess["audio_send_worker"] = asyncio.create_task(
         _audio_send_worker(sess["audio_ws"], queue)
     )
+
+
+async def _force_close_stale_audio_ws(ws):
+    """Close an audio WebSocket whose worker is stuck on a non-cancellable
+    `ws.send_bytes`. Used by the broadcaster-handoff purge timeout path:
+    waiting for the stuck worker before closing (via
+    `_close_audio_after_worker`) would just block on the same send_bytes.
+
+    ASGI normally forbids concurrent senders on a WebSocket. In this case
+    the existing sender is permanently stuck (otherwise we wouldn't be
+    here), so the violation is moot — close() either races and unsticks
+    the send (best case) or raises and we ignore it (the peer's
+    connection is already broken; their reconnect logic will recover).
+    """
+    try:
+        await ws.close(code=1011)
+    except Exception:
+        pass
+
+
+async def _purge_audio_for_handoff(room, except_player_id=None):
+    """Cancel in-flight audio sends + restart per-listener workers on a
+    broadcaster handoff so the next broadcaster's frames cannot be tail-
+    mixed with the previous broadcaster's still-buffered or in-flight
+    frames.
+
+    Called from the `broadcast_start` success path when a broadcaster
+    transition happens (None → new, or — after `_clear_broadcaster_if_player`
+    has just cleared the slot — null → new). The per-peer queue + worker
+    pair is replaced atomically:
+
+      1. `_cleanup_audio_worker` cancels the running worker and AWAITS
+         its actual exit (so any `await ws.send_bytes(payload)` already
+         in flight either completes or raises CancelledError before we
+         continue — see the worker's docstring).
+      2. `_setup_audio_worker` then spawns a fresh empty queue + new
+         worker bound to the same audio_ws.
+
+    Step 1 drops anything still in the old queue and stops the next
+    iteration; step 2 gives fan-out a clean slate. A frame that was
+    already handed off to the OS TCP buffer via send_bytes between the
+    cancel request and the worker's await resolution can still arrive
+    at the listener — the listener's epoch invalidation (bumped on
+    control_set) silences it post-decode.
+
+    `except_player_id` skips the broadcaster's own queue (no self-loop;
+    the server's single-broadcaster gate already drops their frames
+    upstream of fan-out).
+    """
+    # Snapshot to a list BEFORE awaiting: _cleanup_audio_worker yields
+    # to the event loop, and another task (player reconnect, leave,
+    # grace expiry) could mutate room["sessions"] mid-iteration. A live
+    # dict iterator would then raise RuntimeError("dictionary changed
+    # size during iteration") and abort broadcast_start mid-handoff,
+    # leaving the room without an active broadcaster.
+    sessions_map = room.get("sessions") or {}
+    snapshot = [(pid, sess) for pid, sess in sessions_map.items() if pid != except_player_id]
+    if not snapshot:
+        return
+
+    async def _purge_one(pid, sess):
+        # Capture the original audio_ws BEFORE awaiting cleanup so the
+        # timeout branch closes the SAME socket that timed out, not
+        # whatever the listener may have reattached during our 500 ms
+        # wait. A same-session reconnect via _take_session_slot can
+        # replace sess["audio_ws"] with a fresh socket while we're
+        # awaiting; we must not tear that fresh socket down.
+        old_audio_ws = sess.get("audio_ws")
+        if old_audio_ws is None:
+            return
+        try:
+            # Bound per-peer cleanup so a single backpressured / stuck
+            # ws.send_bytes can't block the entire handoff. Deliberately
+            # do NOT pass room/player_id here. When wait_for() cancels
+            # _cleanup_audio_worker, its cancel-propagation branch only
+            # schedules a deferred worker restart when given those
+            # arguments. We don't want a restart in the timeout case —
+            # the timeout branch below force-closes the stale ws, and
+            # a concurrent restart would race against that close
+            # (recreating a worker on a socket about to be torn down,
+            # or fanning out new-broadcaster frames over the stale
+            # connection). The slow peer's clean recovery path is
+            # reconnect, not restart.
+            await asyncio.wait_for(
+                _cleanup_audio_worker(sess),
+                timeout=_PURGE_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            # Slow peer's send_bytes is wedged. Force-close the
+            # CAPTURED ws WITHOUT waiting for the stuck worker to
+            # exit (using _close_audio_after_worker would just block
+            # on the same stuck send_bytes the cleanup did). The
+            # captured `old_audio_ws` reference is the stuck socket
+            # specifically — even if the listener has since reattached
+            # a replacement (sess["audio_ws"] != old_audio_ws), the
+            # OLD ws still needs to be closed: a same-session
+            # reattach in _take_session_slot already scheduled a
+            # _close_audio_after_worker(old_audio_ws, prev_worker,
+            # 4410) that's blocked on the same stuck send, so the
+            # old ws/worker would be leaked indefinitely. Closing
+            # `old_audio_ws` here unblocks that path. We never
+            # touch sess["audio_ws"] (which may be a fresh
+            # replacement we'd corrupt by closing).
+            asyncio.create_task(_force_close_stale_audio_ws(old_audio_ws))
+            # If this session slot still points at the stale ws, detach
+            # it instead of spawning a replacement worker on the same
+            # socket. wait_for() only cancelled cleanup; it did NOT
+            # prove the old worker exited (send_bytes is the thing
+            # blocking it). Restarting here could create two concurrent
+            # senders on one WebSocket — an ASGI single-sender
+            # violation. With audio_ws cleared the fan-out skips this
+            # peer cleanly; the peer recovers via reconnect (the
+            # _force_close_stale_audio_ws task will deliver the close
+            # event whenever the stuck send finally yields). Spotted
+            # by Copilot review on PR #7.
+            if sess.get("audio_ws") is old_audio_ws:
+                sess["audio_ws"] = None
+            return
+        # Re-verify that this session is still the authoritative one
+        # for `pid` before restarting. Between cleanup awaits, a
+        # Rule-3 takeover or a leave could have replaced or removed
+        # the session record, leaving our captured `sess` orphaned
+        # with a detached audio_ws. Restarting a worker on the
+        # orphan would leak a task + ws ref.
+        current_sess = (room.get("sessions") or {}).get(pid)
+        if current_sess is not sess:
+            return
+        if (
+            sess.get("audio_ws") is not None
+            and sess.get("audio_send_worker") is None
+            and sess.get("audio_send_queue") is None
+        ):
+            _setup_audio_worker(sess)
+
+    # Parallelize so handoff latency is bounded by the slowest single
+    # peer (capped by _PURGE_TIMEOUT_SEC), not the SUM of all peers'
+    # cleanup latencies. Surface unexpected per-peer failures via
+    # logging — return_exceptions=True swallows them by design, but
+    # silent failure here can leave that listener on a stale worker
+    # without anyone noticing. Spotted by Copilot review on PR #7.
+    results = await asyncio.gather(
+        *(_purge_one(pid, sess) for pid, sess in snapshot),
+        return_exceptions=True,
+    )
+    for (pid, _sess), result in zip(snapshot, results):
+        if isinstance(result, BaseException):
+            _log.warning(
+                "audio handoff purge raised for player %s: %s: %s",
+                pid, type(result).__name__, result,
+            )
 
 
 def _enqueue_audio_frame(sess, payload):
@@ -1621,6 +1785,21 @@ def setup(app, context):
                 if room.get("broadcaster_id") != player_id:
                     continue
 
+                # Also drop while a handoff purge is in flight: the
+                # broadcast_start handler claims broadcaster_id BEFORE
+                # awaiting _purge_audio_for_handoff (so concurrent
+                # broadcast_starts serialize correctly), but accepting
+                # broadcaster frames during that window would feed
+                # them into about-to-be-cancelled listener workers
+                # and cause clipped first intervals. PROTOCOL.md
+                # also requires broadcasters to wait for the
+                # broadcaster_changed ack before sending, so a
+                # well-behaved client won't hit this; the gate is
+                # belt-and-suspenders against buggy/malicious
+                # broadcasters. Spotted by Copilot review on PR #7.
+                if room.get("broadcast_handoff_in_progress", 0) > 0:
+                    continue
+
                 # Verdict "ok" + sender is the active broadcaster: fan out
                 # byte-for-byte to every other audio subscriber in the same
                 # room. The Opus payload is never touched — only header
@@ -1776,13 +1955,107 @@ def setup(app, context):
                         except Exception:
                             pass
                 else:
-                    room["broadcaster_id"] = player_id
-                    room["broadcast_params"] = params_or_err
-                    await _broadcast(room, {
-                        "type": "broadcaster_changed",
-                        "broadcaster_id": player_id,
-                        **params_or_err,
-                    })
+                    # ORDER MATTERS — codex multi-round, then refined
+                    # in Copilot round 4 of PR #7:
+                    # 1. Atomically claim the broadcaster slot BEFORE
+                    #    awaiting anything. The check + assignment is
+                    #    synchronous (no await between them), so two
+                    #    concurrent broadcast_start handlers that both
+                    #    saw current == None resolve here: only one
+                    #    wins; the other's re-check fails and it bails
+                    #    with broadcaster_busy. This prevents the loser
+                    #    from running _purge_audio_for_handoff against
+                    #    the winner's listener workers and clipping the
+                    #    winner's first intervals.
+                    # 2. THEN purge old listener workers (drains
+                    #    leftover queue entries and cancels in-flight
+                    #    sends from the previous broadcaster). Skipped
+                    #    when the same broadcaster is re-issuing
+                    #    broadcast_start (reconnect / param refresh).
+                    #    Frames sent by the new broadcaster during this
+                    #    purge window are dropped at the /audio fan-out
+                    #    gate (which checks broadcast_handoff_in_progress
+                    #    > 0); a well-behaved broadcaster won't send
+                    #    them anyway because PROTOCOL.md requires
+                    #    waiting for the broadcaster_changed ack.
+                    # 3. Emit broadcaster_changed so listeners know to
+                    #    treat subsequent /audio frames as belonging
+                    #    to the new broadcaster. Frames listeners
+                    #    receive AFTER this event are guaranteed to
+                    #    come from the new broadcaster.
+                    pre_claim = room.get("broadcaster_id")
+                    if pre_claim is not None and pre_claim != player_id:
+                        # Lost an idle-race (concurrent broadcast_start
+                        # already claimed the slot during our message
+                        # processing).
+                        if ws is not None:
+                            try:
+                                await ws.send_json({
+                                    "type": "error",
+                                    "message": "broadcaster_busy",
+                                })
+                            except Exception:
+                                pass
+                    elif (
+                        pre_claim == player_id
+                        and room.get("broadcast_handoff_in_progress", 0) > 0
+                    ):
+                        # A SAME-player rapid retry of broadcast_start
+                        # (reconnect / param refresh) is still inside
+                        # _purge_audio_for_handoff. Without this guard,
+                        # this re-entrant request would emit
+                        # broadcaster_changed early — letting the
+                        # broadcaster send frames before the original
+                        # handler's purge completes, so the first
+                        # intervals get clipped against the not-yet-
+                        # cancelled stale workers. Drop silently: the
+                        # original broadcast_start will emit the ack
+                        # when its purge finishes.
+                        # Different-player broadcast_starts are NOT
+                        # blocked here — if pre_claim is None (the
+                        # provisional broadcaster left mid-purge), a
+                        # new player's start should still succeed
+                        # rather than be silently discarded.
+                        # Counter-not-bool semantics: overlapping
+                        # purges (A leaves mid-purge, B starts) are
+                        # tracked independently — A's exit decrements
+                        # without zeroing B's counter.
+                        pass
+                    else:
+                        room["broadcaster_id"] = player_id
+                        room["broadcast_params"] = params_or_err
+                        if current != player_id:
+                            # Counter (not boolean) so overlapping
+                            # purges don't clobber each other's
+                            # active state. A's `finally` decrements
+                            # to whatever B's still-running purge
+                            # incremented to; the in-progress check
+                            # reads `> 0` so the flag stays "true"
+                            # until ALL active purges have completed.
+                            room["broadcast_handoff_in_progress"] = (
+                                room.get("broadcast_handoff_in_progress", 0) + 1
+                            )
+                            try:
+                                await _purge_audio_for_handoff(room, except_player_id=player_id)
+                            finally:
+                                room["broadcast_handoff_in_progress"] = (
+                                    room.get("broadcast_handoff_in_progress", 1) - 1
+                                )
+                        # Re-check ownership before announcing. While
+                        # we awaited the purge, any of broadcast_stop /
+                        # leave_room / grace expiry / takeover could
+                        # have cleared broadcaster_id (or set it to a
+                        # different player). Without this, we'd emit
+                        # a stale broadcaster_changed against a slot
+                        # that's no longer ours, telling listeners a
+                        # broadcast is active when the room state
+                        # disagrees.
+                        if room.get("broadcaster_id") == player_id:
+                            await _broadcast(room, {
+                                "type": "broadcaster_changed",
+                                "broadcaster_id": player_id,
+                                **params_or_err,
+                            })
 
         elif msg_type == "broadcast_stop":
             # Only the active broadcaster can stop their own broadcast.
