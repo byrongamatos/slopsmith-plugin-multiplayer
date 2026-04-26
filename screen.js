@@ -2709,7 +2709,20 @@ async function _bootstrapOnConnected() {
     let bootstrapResult = null;
     try {
         const myGen = ++_bootstrapGen;
-        bootstrapResult = await _bootstrapOnConnectedInner(myGen);
+        try {
+            bootstrapResult = await _bootstrapOnConnectedInner(myGen);
+        } catch (err) {
+            // An unexpected throw inside the inner is a definitive
+            // failure for recovery gating — record it as such and
+            // re-raise so the outer .catch on the call site still
+            // sees the error. Without this, bootstrapResult would
+            // stay null and the finally would skip the write,
+            // leaving _lastBootstrapSucceeded stuck at the previous
+            // (possibly true) value. Spotted by Copilot review on
+            // PR #9.
+            bootstrapResult = false;
+            throw err;
+        }
     } finally {
         // Clamp at 0 so if _cleanup ran during our await (which used
         // to zero the counter — now doesn't), or any future path
