@@ -67,6 +67,37 @@ let _loadingPromise = null;
 // the cache (a later bootstrap into room B would then skip a needed
 // reload thinking room A's song was already loaded).
 let _loadGen = 0;
+// In-flight bootstrap counter. Incremented at every bootstrap
+// entry, decremented in finally. _maybeReissueBroadcastAfterRecovery
+// gates on counter == 0 (no in-flight bootstrap mucking with chart
+// state). A counter handles the case where multiple bootstraps run
+// concurrently without latching: even if the older's finally fires
+// while a newer is still in-flight, the counter only hits 0 when
+// the LAST bootstrap finishes.
+let _bootstrapInFlight = 0;
+// Bootstrap-only generation counter, separate from _bootstrapGen.
+// _bootstrapGen is bumped by both bootstrap entries AND non-
+// bootstrap paths (song_changed, host transport) to invalidate
+// in-flight _loadSong promises. _bootstrapEntryGen is bumped ONLY
+// by bootstrap entries, so the inner can distinguish:
+//   - "another bootstrap superseded me"  (_bootstrapEntryGen
+//     changed → return null, don't write _lastBootstrapSucceeded)
+//   - "non-bootstrap path invalidated my load" (_bootstrapGen
+//     changed but _bootstrapEntryGen didn't → also return null)
+//   - "I genuinely failed" (e.g. _loadSong threw → return false)
+// This split avoids the codex case where non-bootstrap gen bumps
+// would otherwise force the inner to return false and latch
+// _lastBootstrapSucceeded permanently false.
+let _bootstrapEntryGen = 0;
+// Result of the most recently COMPLETED bootstrap (only written
+// when _bootstrapInFlight returns to 0). Initially true so a
+// fresh non-recovery toggle of broadcast doesn't gate on a
+// recovery that never ran. Reset to false in _onSessionEnded.
+// Codex multi-round on PR #8: a previous gen-keyed design could
+// latch false when non-bootstrap paths (song_changed, host
+// transport) bumped _bootstrapGen mid-await; the counter design
+// avoids that.
+let _lastBootstrapSucceeded = true;
 
 // Idempotency guard for _onSessionEnded: when a 4408 (grace expired) close
 // fires, BOTH endpoint handlers see it. Resetting session_id twice would
@@ -1160,6 +1191,43 @@ function _onSessionEnded() {
     // dropped under handoff_suppress for the remainder of the window
     // even though they belong to a new logical session.
     _audioListenerHandoffSuppressUntil = 0;
+    // Capture-side: if WE were broadcasting before the 4408, the
+    // server has cleared our broadcaster_id slot. Drop the stale
+    // ack so the encoder stops emitting frames into a server that
+    // has forgotten us. The new highway WS's 'connected' handler
+    // re-issues broadcast_start (see _bootstrapOnConnected) so a
+    // reconnect doesn't require the user to manually toggle off /
+    // on. Spotted by codex review on PR #8.
+    _captureBroadcasterAcked = false;
+    // Reset the in-flight interval state so the resumed broadcast
+    // doesn't send a frame containing pre-reconnect PCM stamped
+    // with stale chart_time. _captureChartTimeAtIntervalStart
+    // re-anchors via _captureChartTime() when the broadcast
+    // resumes; the buffer + interval index re-init from zero.
+    if (_captureCtx) {
+        _captureIntervalSampleCount = 0;
+        if (_captureIntervalBuffer) {
+            _captureIntervalBuffer = new Float32Array(_captureIntervalSamplesTarget + CAPTURE_PCM_CHUNK_SAMPLES);
+        }
+        _captureChartTimeAtIntervalStart = _captureChartTime();
+    }
+    // Bump the capture generation so any in-flight queued flush
+    // tasks from the previous session bail out at their gate
+    // before touching the post-recovery encoder / WS. Deliberately
+    // do NOT reset _captureFlushQueue here — if a flush is mid-
+    // execution it would race with the new chain via the shared
+    // _captureEncoderChunks accumulator. Spotted by codex on PR #8.
+    _captureGen++;
+    // Deliberately do NOT force _lastBootstrapSucceeded = false on
+    // session reset. If the previous (pre-4408) bootstrap was
+    // successful and a non-bootstrap path (host transport, song
+    // change) bumps _bootstrapGen during the recovery bootstrap,
+    // that bootstrap returns null (superseded) and our finally
+    // doesn't overwrite — so leaving the flag at its previous true
+    // value lets recovery resume on the slightly-stale chart state
+    // (one interval, dropped via the drift guard at worst). The
+    // alternative — forcing false here — would latch recovery off
+    // permanently. Spotted by codex on PR #8.
 }
 
 function _maybeClearResetMarker() {
@@ -1518,6 +1586,12 @@ function _connectAudioWs() {
         // reattached. See _resetMarker comment.
         _audioOpenedAfterReset = true;
         _maybeClearResetMarker();
+        // If we were broadcasting before a 4408 and the highway
+        // already reconnected first, _bootstrapOnConnected couldn't
+        // re-issue broadcast_start yet (server requires /audio
+        // attached). Try here too — whichever endpoint reattaches
+        // last fires the actual send.
+        _maybeReissueBroadcastAfterRecovery();
     };
 
     ws.onmessage = (ev) => {
@@ -1685,11 +1759,35 @@ class CaptureProcessor extends AudioWorkletProcessor {
         this._chunkSize = opts.chunkSize || 480;
         this._chunk = new Float32Array(this._chunkSize);
         this._chunkPos = 0;
+        this._mixScratch = null;
     }
     process(inputs) {
         const input = inputs[0];
         if (!input || input.length === 0 || !input[0]) return true;
-        const src = input[0];
+        // Downmix to mono — some browsers/loopback devices ignore
+        // channelCount:1 and deliver stereo. Pre-allocated scratch
+        // buffer avoids per-quantum allocation on the realtime audio
+        // thread. See audio/audio-capture-worklet.js for full notes.
+        const numChannels = input.length;
+        const numSamples = input[0].length;
+        let src;
+        if (numChannels === 1) {
+            src = input[0];
+        } else {
+            if (!this._mixScratch || this._mixScratch.length !== numSamples) {
+                this._mixScratch = new Float32Array(numSamples);
+            }
+            src = this._mixScratch;
+            const inv = 1 / numChannels;
+            for (let s = 0; s < numSamples; s++) {
+                let sum = 0;
+                for (let c = 0; c < numChannels; c++) {
+                    const ch = input[c];
+                    if (ch && ch.length === numSamples) sum += ch[s];
+                }
+                src[s] = sum * inv;
+            }
+        }
         let srcPos = 0;
         while (srcPos < src.length) {
             const space = this._chunkSize - this._chunkPos;
@@ -2567,7 +2665,41 @@ let _bootstrapGen = 0;
 
 async function _bootstrapOnConnected() {
     if (!_room) return;
-    const myGen = ++_bootstrapGen;
+    _bootstrapInFlight++;
+    // Inner returns:
+    //   true  — bootstrap completed and applied state successfully.
+    //   false — bootstrap genuinely failed (e.g. _loadSong threw).
+    //   null  — superseded (newer bootstrap took over OR non-
+    //           bootstrap path invalidated us mid-load); don't
+    //           overwrite _lastBootstrapSucceeded with our stale
+    //           result.
+    let bootstrapResult = null;
+    try {
+        const myGen = ++_bootstrapGen;
+        const myEntryGen = ++_bootstrapEntryGen;
+        bootstrapResult = await _bootstrapOnConnectedInner(myGen, myEntryGen);
+    } finally {
+        _bootstrapInFlight--;
+        // Only write _lastBootstrapSucceeded when:
+        //   1. No other bootstrap is still in flight (counter 0), AND
+        //   2. We have a definitive result (not superseded).
+        // If a newer bootstrap is in-flight or has already written,
+        // we let it stand. If we were superseded by a non-bootstrap
+        // path bumping _bootstrapGen, _lastBootstrapSucceeded keeps
+        // its previous value (typically true from the most recent
+        // successful bootstrap), so recovery isn't permanently
+        // gated.
+        if (_bootstrapInFlight === 0 && bootstrapResult !== null) {
+            _lastBootstrapSucceeded = bootstrapResult === true;
+            if (bootstrapResult === true) {
+                _maybeReissueBroadcastAfterRecovery();
+            }
+        }
+    }
+}
+
+async function _bootstrapOnConnectedInner(myGen, myEntryGen) {
+    if (!_room) return null;
     // Hard-teardown the listener pipeline ONLY if the snapshot
     // represents a meaningful state change (different broadcaster,
     // different song, or different arrangement). A bare highway
@@ -2650,13 +2782,20 @@ async function _bootstrapOnConnected() {
             // newer call has already done (or will do) its own load + state
             // apply — DON'T touch chart state here against stale _room
             // values that may still be sitting in scope.
-            if (myGen !== _bootstrapGen) return;
-            if (loadFailed) return;
+            // Distinguish supersede from failure:
+            //   - _bootstrapGen changed → some path invalidated us
+            //     (newer bootstrap, or non-bootstrap state change).
+            //     Return null so outer keeps the previous
+            //     _lastBootstrapSucceeded value.
+            //   - loadFailed → genuine error; return false so the
+            //     outer flips _lastBootstrapSucceeded to false.
+            if (myGen !== _bootstrapGen) return null;
+            if (loadFailed) return false;
         }
     }
     // Snapshot may have changed during the await (a 4408 / leave can
-    // null _room). Recheck before touching audio state.
-    if (!_room) return;
+    // null _room). Treat as supersede, not failure.
+    if (!_room) return null;
     if (typeof _room.time === 'number') {
         const audioEl = document.getElementById('audio');
         if (audioEl) {
@@ -2717,6 +2856,76 @@ async function _bootstrapOnConnected() {
     } else {
         _audioListenerOnControlClear();
     }
+    // Capture-side recovery: if we WERE broadcasting before this
+    // (re)connect, the server may have cleared our broadcaster slot
+    // during the 4408 grace window. The actual re-issue is gated
+    // on BOTH highway and /audio being attached (a server-side
+    // 'audio_ws_not_open' rejection would tear our capture down
+    // for good); see _maybeReissueBroadcastAfterRecovery. The outer
+    // _bootstrapOnConnected wrapper also retries from its finally
+    // block once we return true here.
+    _maybeReissueBroadcastAfterRecovery();
+    return true;
+}
+
+// Re-issue broadcast_start after a 4408 session reset, but ONLY
+// when both highway and audio WSs are open (the server requires
+// /audio attached before accepting broadcast_start, returning
+// 'audio_ws_not_open' otherwise — which would tear the local
+// capture down via the error handler in _handleMessage). Called
+// from both the highway 'connected' branch (where the highway
+// just reattached) and the audio WS onopen handler (which fires
+// after the highway one if audio reconnects last). Spotted by
+// codex review on PR #8.
+function _maybeReissueBroadcastAfterRecovery() {
+    if (
+        !_captureRequested
+        || !_captureCtx
+        || _captureBroadcasterAcked
+    ) return;
+    // Key off the post-reset attach markers, NOT raw readyState.
+    // During a 4408 reset both _ws and _audioWs still point at the
+    // OLD session's sockets until the reconnect timers replace
+    // them; their readyState can read OPEN for those stale
+    // sockets and we'd send broadcast_start through the wrong
+    // session. _highwayAuthedAfterReset / _audioOpenedAfterReset
+    // are only flipped true after the NEW session's endpoint
+    // has been confirmed (highway 'connected' message / audio
+    // onopen). Spotted by codex review on PR #8.
+    if (!_highwayAuthedAfterReset || !_audioOpenedAfterReset) return;
+    if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
+    if (!_audioWs || _audioWs.readyState !== WebSocket.OPEN) return;
+    // Gate on bootstrap being fully done. Otherwise we could re-ack
+    // the broadcast while _captureChartTime() is still based on
+    // pre-reconnect chart state (loaded song / time / paused /
+    // speed not yet resynced), and outbound frames would carry
+    // wrong chart positions. _bootstrapOnConnected calls us again
+    // in its finally block once the chart state is ready.
+    // Two-part bootstrap gate:
+    //   1. _bootstrapInFlight > 0 means a bootstrap is mid-run; chart
+    //      state may not be fully resynced. Wait.
+    //   2. _lastBootstrapSucceeded is the most recent COMPLETED
+    //      bootstrap's result. False if it failed (e.g. _loadSong
+    //      threw and the path failed-closed). Recovery would
+    //      otherwise resume broadcasting against unsynced chart
+    //      state.
+    if (_bootstrapInFlight > 0) return;
+    if (!_lastBootstrapSucceeded) return;
+    try {
+        _ws.send(JSON.stringify({
+            type: 'broadcast_start',
+            interval_beats: _captureIntervalBeats,
+            sample_rate: SMAU_V1_SAMPLE_RATE,
+            channel_count: SMAU_V1_CHANNEL_COUNT,
+            codec: 'opus',
+            bitrate: 96000,
+        }));
+    } catch (_err) {
+        // WS could close between the readyState check and send;
+        // tear down the capture rather than leaving the encoder
+        // running silently against a server that's forgotten us.
+        _broadcastStop();
+    }
 }
 
 // ── Message Handling ───────────────────────────────────────────────────
@@ -2730,6 +2939,15 @@ function _handleMessage(msg) {
             _renderQueue();
             _updateControls();
             _doClockSync();
+            // Highway side of the recovery is confirmed. Set this
+            // BEFORE invoking _bootstrapOnConnected — the bootstrap
+            // can run synchronously up to its first await (e.g. when
+            // the chart is dedup-cached and _loadSong is skipped),
+            // and any internal call to _maybeReissueBroadcastAfterRecovery
+            // would gate-fail if _highwayAuthedAfterReset is still
+            // false. Spotted by codex review on PR #8.
+            _highwayAuthedAfterReset = true;
+            _maybeClearResetMarker();
             // The recovery flow (load song, sync chart clock, resume
             // playback, activate listener) is async because _loadSong
             // pauses non-host audio when it completes. Running play()
@@ -2738,11 +2956,6 @@ function _handleMessage(msg) {
             // that awaits the load before applying state and listener
             // setup.
             _bootstrapOnConnected().catch(() => {});
-            // Highway side of the recovery is confirmed. _maybeClearResetMarker
-            // only clears the dedupe marker once the audio side has ALSO
-            // reattached — see _resetMarker comment for the race this guards.
-            _highwayAuthedAfterReset = true;
-            _maybeClearResetMarker();
             break;
 
         case 'clock_sync_response':

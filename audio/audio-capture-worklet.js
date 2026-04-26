@@ -35,12 +35,44 @@ class CaptureProcessor extends AudioWorkletProcessor {
         this._chunkSize = opts.chunkSize || 480;
         this._chunk = new Float32Array(this._chunkSize);
         this._chunkPos = 0;
+        // Pre-allocated scratch buffer for stereo→mono downmix.
+        // process() is called every render quantum (typically 128
+        // samples); allocating a new Float32Array each time would
+        // pin GC pressure on the realtime audio thread. We grow
+        // the scratch buffer lazily on size mismatch (rare —
+        // render quantum is fixed within a session).
+        this._mixScratch = null;
     }
 
     process(inputs) {
         const input = inputs[0];
         if (!input || input.length === 0 || !input[0]) return true;
-        const src = input[0];
+        // Downmix to mono: some browsers / loopback devices ignore the
+        // getUserMedia channelCount:1 hint and deliver a stereo (or
+        // multi-channel) input. Reading only input[0] would silently
+        // drop the right channel for one-sided or true-stereo
+        // sources. Average all channels for an even mix; mirrored
+        // stereo collapses to the original mono signal.
+        const numChannels = input.length;
+        const numSamples = input[0].length;
+        let src;
+        if (numChannels === 1) {
+            src = input[0];
+        } else {
+            if (!this._mixScratch || this._mixScratch.length !== numSamples) {
+                this._mixScratch = new Float32Array(numSamples);
+            }
+            src = this._mixScratch;
+            const inv = 1 / numChannels;
+            for (let s = 0; s < numSamples; s++) {
+                let sum = 0;
+                for (let c = 0; c < numChannels; c++) {
+                    const ch = input[c];
+                    if (ch && ch.length === numSamples) sum += ch[s];
+                }
+                src[s] = sum * inv;
+            }
+        }
         let srcPos = 0;
         while (srcPos < src.length) {
             const space = this._chunkSize - this._chunkPos;
