@@ -177,11 +177,13 @@ In short: server emits `broadcaster_changed: null` exactly once per real broadca
 
 ### `audio_quality` — listener-reported telemetry (optional)
 
-Periodic listener-side report so the broadcaster's UI can display "N late frames in last 30s" etc. Each listener with an active broadcast subscription emits one report per `report_period_ms` window (current implementation: 30 s). Counters are **deltas over the window**, not cumulative-since-page-load — empty windows are not sent at all to save WS bandwidth, but the listener still rolls its internal window pointer forward each tick so consecutive deltas always describe a single window.
+Periodic listener-side report so the broadcaster's UI can display "N late frames in last 30s" etc. Each listener with an active broadcast subscription emits at most one report per `report_period_ms` window (current implementation: 30 s). Counters are **deltas over the window**, not cumulative-since-page-load — empty windows are not sent at all to save WS bandwidth, but the listener still rolls its internal window pointer forward each tick so consecutive deltas always describe a single window.
+
+**Implementation note — first-tick skip after broadcaster change.** The current `screen.js` listener deliberately skips sending on the first reporting tick after initially binding (or rebinding) to a `broadcaster_id`; that tick only reseeds the snapshot for the new broadcaster. As a result, after a broadcaster change the first `audio_quality` report may be delayed up to one full `report_period_ms` window past the change, rather than appearing on the next 30 s boundary. This is a deliberate trade for correct attribution — the listener's cumulative RX counters carry frames from previous broadcasts in the same session, so reseeding at the current cumulative values is the only way to keep deltas scoped to the active broadcast.
 
 Field semantics:
 
-- `intervals_received` — frames that successfully scheduled for playback in the window.
+- `intervals_received` — frames that were successfully scheduled for playback in the window.
 - `intervals_late` — frames whose target chart time had already passed at decode time. These are dropped before scheduling.
 - `intervals_dropped` — frames dropped due to **decoder or validation failures** only (Opus payload malformed, decoder threw, mismatched channel count, etc.). Drops caused by local listener state (paused, non-1.0 playback speed, AudioContext suspended, song still loading, no broadcaster yet bound) are NOT counted here — they aren't quality issues the broadcaster can act on.
 - `decoder_underruns` — subset of `intervals_dropped` attributable specifically to decoder-thrown errors (kept separate so the broadcaster can distinguish "your stream is malformed" from "the listener's hardware can't keep up").
@@ -191,7 +193,7 @@ Field semantics:
 ```json
 {
   "type": "audio_quality",
-  "broadcaster_id": "ab12cd34",
+  "broadcaster_id": "a1b2c3d4e5f60718",
   "intervals_received": 120,
   "intervals_late": 3,
   "intervals_dropped": 0,
@@ -207,8 +209,8 @@ Field semantics:
 ```json
 {
   "type": "audio_quality",
-  "from_player_id": "lf90gh12",
-  "broadcaster_id": "ab12cd34",
+  "from_player_id": "9f8e7d6c5b4a3928",
+  "broadcaster_id": "a1b2c3d4e5f60718",
   "intervals_received": 120,
   "intervals_late": 3,
   "intervals_dropped": 0,
