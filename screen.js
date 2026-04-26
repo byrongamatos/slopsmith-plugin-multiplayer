@@ -656,7 +656,17 @@ function _audioListenerHandleFrame(header, opus) {
     // listeners) even on browsers that can never decode our frames,
     // tripping autoplay-policy warnings and wasting resources. Spotted
     // by Copilot review on PR #7 round 3.
-    if (_audioListenerOpusUnsupported || !_audioListenerHasWebCodecs()) {
+    //
+    // Distinguish the two failure modes (Copilot round 6): WebCodecs
+    // entirely missing vs. WebCodecs present but Opus configure threw
+    // NotSupportedError. The latter sets _audioListenerOpusUnsupported
+    // and is reported with reason 'opus_unsupported' so dropped-frame
+    // triage isn't misled by a generic 'webcodecs_unavailable' label.
+    if (_audioListenerOpusUnsupported) {
+        _audioRxRecordDrop('opus_unsupported');
+        return;
+    }
+    if (!_audioListenerHasWebCodecs()) {
         _audioListenerWarnOnceMissingWebCodecs();
         _audioRxRecordDrop('webcodecs_unavailable');
         return;
