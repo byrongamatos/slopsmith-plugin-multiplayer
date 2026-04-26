@@ -1748,7 +1748,6 @@ let _captureIntervalSamplesTarget = 96000; // = intervalLengthSec * sampleRate
 let _captureChartTimeAtIntervalStart = 0;
 let _captureBroadcasterAcked = false; // flips true on broadcaster_changed-self
 let _captureRequested = false;        // user toggled broadcast on
-let _captureDeviceId = null;
 const CAPTURE_DEVICE_STORAGE_KEY = 'mp_broadcast_device_id';
 const CAPTURE_PCM_CHUNK_SAMPLES = 480; // ~10 ms at 48k
 
@@ -2089,9 +2088,13 @@ async function _broadcastStart(deviceId) {
     }
     _captureRequested = true;
     _captureBroadcasterAcked = false;
-    _captureDeviceId = deviceId || null;
-    if (_captureDeviceId) {
-        try { localStorage.setItem(CAPTURE_DEVICE_STORAGE_KEY, _captureDeviceId); } catch (_) { /* */ }
+    if (deviceId) {
+        // Persist the user's device choice for next-session restore
+        // (mpRefreshBroadcastDevices reads this back). We don't keep
+        // the value as in-memory state because the dropdown is the
+        // single source of truth for the active selection while
+        // broadcasting.
+        try { localStorage.setItem(CAPTURE_DEVICE_STORAGE_KEY, deviceId); } catch (_) { /* */ }
     }
 
     let stream;
@@ -2261,15 +2264,27 @@ async function _broadcastStart(deviceId) {
     _captureStartLevelMeter();
 
     // Send broadcast_start; the broadcaster_changed ack flips
-    // _captureBroadcasterAcked = true and unlocks frame send.
-    _ws.send(JSON.stringify({
-        type: 'broadcast_start',
-        interval_beats: _captureIntervalBeats,
-        sample_rate: SMAU_V1_SAMPLE_RATE,
-        channel_count: SMAU_V1_CHANNEL_COUNT,
-        codec: 'opus',
-        bitrate: 96000,
-    }));
+    // _captureBroadcasterAcked = true and unlocks frame send. The
+    // send() can still throw if the WS closes between the readiness
+    // re-check above and this call (the close-and-send race is
+    // typically microseconds but real); catch + tear down so the
+    // toggle doesn't stay stuck in "Connecting…". Spotted by
+    // Copilot review on PR #8 round 7.
+    try {
+        _ws.send(JSON.stringify({
+            type: 'broadcast_start',
+            interval_beats: _captureIntervalBeats,
+            sample_rate: SMAU_V1_SAMPLE_RATE,
+            channel_count: SMAU_V1_CHANNEL_COUNT,
+            codec: 'opus',
+            bitrate: 96000,
+        }));
+    } catch (err) {
+        _captureRequested = false;
+        _showError('Connection dropped while starting broadcast — try again.');
+        _broadcastStop({ silent: true });
+        return;
+    }
     _renderBroadcastUi();
 }
 
