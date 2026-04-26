@@ -472,13 +472,25 @@ function _audioListenerHandleDecodedAudio(audioData, wrapper) {
         const source = ctx.createBufferSource();
         source.buffer = buffer;
         source.connect(_audioListenerGain);
-        source.onended = () => { _audioListenerScheduledSources.delete(source); };
+        // Release the source's connection + buffer reference once it's
+        // done playing (or failed to start). Without this the ended
+        // sources stay wired into the AudioContext graph and hold
+        // their AudioBuffer references — over long sessions that
+        // accumulates unbounded memory. Spotted by Copilot review on
+        // PR #7 round 7.
+        const cleanupSource = () => {
+            _audioListenerScheduledSources.delete(source);
+            source.onended = null;
+            try { source.disconnect(); } catch (e) { /* */ }
+            try { source.buffer = null; } catch (e) { /* */ }
+        };
+        source.onended = cleanupSource;
         _audioListenerScheduledSources.add(source);
         try {
             source.start(startAt);
             _audioRxFramesScheduled++;
         } catch (e) {
-            _audioListenerScheduledSources.delete(source);
+            cleanupSource();
         }
     } finally {
         // AudioData is a transferable owning a chunk of decoder memory; close
