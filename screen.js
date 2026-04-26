@@ -324,6 +324,14 @@ function _audioRxResetStats() {
     for (const key of Object.keys(_audioRxDropReasons)) {
         delete _audioRxDropReasons[key];
     }
+    // The audio_quality snapshot baselines off the cumulative
+    // counters — when those reset (4408 session recovery, room
+    // change), the snapshot must reset too or the next delta
+    // would be negative or roll the previous session into the
+    // new one. Spotted by codex review on Phase 2e.
+    _audioQualitySnapshot = {
+        scheduled: 0, dropped: 0, late: 0, decoderUnderruns: 0, broadcasterId: null,
+    };
 }
 
 function _audioGetRxStats() {
@@ -334,6 +342,253 @@ function _audioGetRxStats() {
         late: _audioRxFramesLate,
         scheduled: _audioRxFramesScheduled,
     };
+}
+
+// ── Listener-side audio_quality telemetry (Phase 2e) ─────────────────────────
+//
+// Periodic report sent to the broadcaster (via the highway WS, server
+// relays only to the active broadcaster). Reports DELTAS over a
+// fixed window so the broadcaster sees "N late frames in last 30s",
+// not cumulative-since-page-load. Snapshots roll forward EVERY tick
+// (regardless of whether we sent), so a quiet window followed by an
+// active one doesn't cause a multi-window pile-up that would make the
+// broadcaster's stats misrepresent "the last 30 s".
+//
+// `intervals_dropped` counts only "real" failure reasons (decoder /
+// validation errors). Local-state drops (listener_paused,
+// listener_speed, song_loading, context_suspended, no_broadcaster,
+// handoff_suppress) are excluded — they don't represent quality
+// problems the broadcaster can do anything about, and bundling them
+// in would systematically overstate issues. `intervals_late` keeps
+// its own counter; we subtract `late` here to avoid double-counting.
+
+const AUDIO_QUALITY_REPORT_PERIOD_MS = 30000;
+// Drop-reason keys that count as a real decoder/validation failure.
+// Any reason NOT in this set is excluded from the dropped-delta
+// (e.g. listener_paused doesn't reflect a problem with the
+// broadcaster's stream). Includes both SMAU header-validation drops
+// (emitted by _smauDecodeFrame) and downstream decode/validation
+// failures from the listener pipeline. Spotted by codex review on
+// Phase 2e.
+const AUDIO_QUALITY_REAL_DROP_REASONS = new Set([
+    // SMAU frame-validation reasons (parse failures before decode)
+    'invalid_buffer',
+    'too_small',
+    'frame_too_big',
+    'magic_mismatch',
+    'version_mismatch',
+    'size_mismatch',
+    'invalid_chart_time',
+    'invalid_duration',
+    'sample_count_too_high',
+    // Decoder / Opus / payload validation
+    'decoder_error',
+    'decoded_channel_mismatch',
+    'decoded_sample_rate_mismatch',
+    'decoded_overflow',
+    'decoded_copy_failed',
+    'opus_unsupported',
+    'webcodecs_unavailable',
+    'opus_payload_too_small',
+    'opus_packet_count_invalid',
+    'opus_truncated',
+    'opus_packet_invalid',
+    'opus_trailing_bytes',
+    'decode_call_failed',
+    'non_binary',
+]);
+let _audioQualityTimer = null;
+let _audioQualitySnapshot = {
+    scheduled: 0,
+    dropped: 0,
+    late: 0,
+    decoderUnderruns: 0,
+    broadcasterId: null,
+};
+
+function _audioQualityRealDropTotal() {
+    let total = 0;
+    for (const reason of AUDIO_QUALITY_REAL_DROP_REASONS) {
+        total += _audioRxDropReasons[reason] || 0;
+    }
+    return total;
+}
+
+function _audioQualityDecoderUnderruns() {
+    // Treat decoder_error as an underrun signal — the only drop
+    // reason that maps to "the decoder couldn't keep up" semantically.
+    return _audioRxDropReasons.decoder_error || 0;
+}
+
+function _audioQualitySendReport() {
+    if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
+    const broadcasterId = _audioListenerBroadcasterId;
+    if (!broadcasterId || broadcasterId === _playerId) {
+        // No remote broadcaster — reset snapshot so the next active
+        // broadcast starts from zero rather than whatever stats had
+        // accumulated against a previous broadcaster.
+        if (_audioQualitySnapshot.broadcasterId !== null) {
+            _audioQualitySnapshot = {
+                scheduled: 0, dropped: 0, late: 0, decoderUnderruns: 0,
+                broadcasterId: null,
+            };
+        }
+        return;
+    }
+    // Snapshot of the current cumulative counters, computed once so
+    // the post-send roll-forward uses the SAME values that produced
+    // the deltas (otherwise a frame counted between delta-compute
+    // and roll-forward would be lost from the next window).
+    const cur = {
+        scheduled: _audioRxFramesScheduled,
+        dropped: _audioQualityRealDropTotal(),
+        late: _audioRxFramesLate,
+        decoderUnderruns: _audioQualityDecoderUnderruns(),
+        broadcasterId: broadcasterId,
+    };
+    // If broadcaster changed since our last snapshot, reset baseline
+    // so deltas measure THIS broadcast only — no report this tick.
+    if (_audioQualitySnapshot.broadcasterId !== broadcasterId) {
+        _audioQualitySnapshot = cur;
+        return;
+    }
+    const intervalsReceived = cur.scheduled - _audioQualitySnapshot.scheduled;
+    const intervalsDropped = cur.dropped - _audioQualitySnapshot.dropped;
+    const intervalsLate = cur.late - _audioQualitySnapshot.late;
+    const decoderUnderruns = cur.decoderUnderruns - _audioQualitySnapshot.decoderUnderruns;
+    // Roll snapshot forward UNCONDITIONALLY before any early return,
+    // so a quiet window doesn't pile up into the next non-empty one.
+    // Spotted by codex review on Phase 2e.
+    _audioQualitySnapshot = cur;
+    // Skip the WS send when nothing changed — saves bandwidth without
+    // affecting the snapshot rollover.
+    if (
+        intervalsReceived === 0
+        && intervalsDropped === 0
+        && intervalsLate === 0
+        && decoderUnderruns === 0
+    ) return;
+    try {
+        _ws.send(JSON.stringify({
+            type: 'audio_quality',
+            broadcaster_id: broadcasterId,
+            intervals_received: intervalsReceived,
+            intervals_late: intervalsLate,
+            intervals_dropped: intervalsDropped,
+            decoder_underruns: decoderUnderruns,
+            report_period_ms: AUDIO_QUALITY_REPORT_PERIOD_MS,
+        }));
+    } catch (_e) { /* WS could close concurrently; ignore */ }
+}
+
+function _audioQualityStartTimer() {
+    if (_audioQualityTimer) return;
+    _audioQualityTimer = setInterval(_audioQualityOnTick, AUDIO_QUALITY_REPORT_PERIOD_MS);
+}
+
+function _audioQualityStopTimer() {
+    if (_audioQualityTimer) {
+        clearInterval(_audioQualityTimer);
+        _audioQualityTimer = null;
+    }
+    _audioQualitySnapshot = {
+        scheduled: 0, dropped: 0, late: 0, decoderUnderruns: 0, broadcasterId: null,
+    };
+}
+
+// Single timer tick handles both the listener-side send AND the
+// broadcaster-side stale-listener eviction. Without doing both here,
+// a broadcaster whose listeners all stop reporting (or disconnect
+// without a clean broadcast_stop) would never re-render and never
+// evict stale entries — the panel would show a phantom listener
+// indefinitely. Spotted by codex review on Phase 2e.
+function _audioQualityOnTick() {
+    _audioQualitySendReport();
+    if (_audioQualityRxByListener && _audioQualityRxByListener.size > 0) {
+        _audioQualityRxRender();
+    }
+}
+
+// ── Broadcaster-side audio_quality aggregation (Phase 2e) ────────────────────
+//
+// We're the broadcaster. Each listener sends us a 30s-window report
+// (see PROTOCOL.md "audio_quality"); the server adds `from_player_id`
+// before forwarding, so we can key reports per listener. The UI shows
+// aggregate stats over the most recent window across all listeners
+// who have reported recently — stale entries (no report in
+// AUDIO_QUALITY_LISTENER_TTL_MS) are evicted so a listener that
+// disconnected without a stop event isn't double-counted forever.
+
+const AUDIO_QUALITY_LISTENER_TTL_MS = AUDIO_QUALITY_REPORT_PERIOD_MS * 3;
+const _audioQualityRxByListener = new Map();
+
+function _audioQualityRxOnReport(msg) {
+    const fromId = msg.from_player_id;
+    if (!fromId) return;
+    // Defensive: ignore reports keyed against a different broadcaster
+    // (we already cleared/became broadcaster of a different session).
+    if (msg.broadcaster_id && msg.broadcaster_id !== _playerId) return;
+    _audioQualityRxByListener.set(fromId, {
+        receivedAt: Date.now(),
+        intervalsReceived: msg.intervals_received | 0,
+        intervalsLate: msg.intervals_late | 0,
+        intervalsDropped: msg.intervals_dropped | 0,
+        decoderUnderruns: msg.decoder_underruns | 0,
+        reportPeriodMs: msg.report_period_ms | 0,
+    });
+    _audioQualityRxRender();
+}
+
+function _audioQualityRxEvictStale() {
+    const now = Date.now();
+    for (const [id, entry] of _audioQualityRxByListener) {
+        if (now - entry.receivedAt > AUDIO_QUALITY_LISTENER_TTL_MS) {
+            _audioQualityRxByListener.delete(id);
+        }
+    }
+}
+
+function _audioQualityRxRender() {
+    _audioQualityRxEvictStale();
+    const el = document.getElementById('mp-broadcast-stats');
+    if (!el) return;
+    // Show only when we're the broadcaster AND at least one listener
+    // has reported recently. Otherwise hide the line entirely so the
+    // panel stays compact in the common "broadcasting alone" case.
+    const isBroadcasting = _captureBroadcasterAcked
+        && _room && _room.broadcaster_id === _playerId;
+    if (!isBroadcasting || _audioQualityRxByListener.size === 0) {
+        el.classList.add('hidden');
+        el.textContent = '';
+        return;
+    }
+    let totalLate = 0;
+    let totalDropped = 0;
+    let totalUnderruns = 0;
+    for (const entry of _audioQualityRxByListener.values()) {
+        totalLate += entry.intervalsLate;
+        totalDropped += entry.intervalsDropped;
+        totalUnderruns += entry.decoderUnderruns;
+    }
+    const n = _audioQualityRxByListener.size;
+    const issues = totalLate + totalDropped + totalUnderruns;
+    let txt = `${n} listener${n === 1 ? '' : 's'}`;
+    if (issues === 0) {
+        txt += ' — no issues';
+    } else {
+        const parts = [];
+        if (totalLate > 0) parts.push(`${totalLate} late`);
+        if (totalDropped > 0) parts.push(`${totalDropped} dropped`);
+        if (totalUnderruns > 0) parts.push(`${totalUnderruns} decoder`);
+        txt += ` — ${parts.join(', ')}`;
+    }
+    el.textContent = txt;
+    el.classList.remove('hidden');
+}
+
+function _audioQualityRxReset() {
+    _audioQualityRxByListener.clear();
+    _audioQualityRxRender();
 }
 
 // ── Listener pipeline (Phase 2c) ─────────────────────────────────────────────
@@ -1380,6 +1635,8 @@ function _cleanup() {
     _stopHeartbeat();
     _restorePlaybackControls();
     _audioListenerCleanup();
+    _audioQualityStopTimer();
+    _audioQualityRxReset();
     // Phase 2d: tear down the capture pipeline (mic stream, encoder,
     // worklet, AudioContext, level meter rAF). Silent — the server
     // will clear broadcaster_id via the leave_room path, no need to
@@ -1498,6 +1755,10 @@ function _connectWS() {
     ws.onopen = () => {
         _reconnectAttempts = 0;
         if (statusEl) statusEl.textContent = 'Connected';
+        // Listener-side telemetry runs for the lifetime of the highway
+        // WS — the report function gates on "are we listening to a
+        // remote broadcaster" each tick, so an idle 30s timer is cheap.
+        _audioQualityStartTimer();
         // Clock sync starts when we receive 'connected' message
     };
 
@@ -1945,6 +2206,66 @@ function _captureCurrentChartBpm() {
     return 60 / median;
 }
 
+// Returns true iff the chart's beat-spacing changes by more than
+// CAPTURE_TEMPO_CHANGE_THRESHOLD around `boundaryTime` (the chart-time
+// where the just-flushed interval ends and the next one starts).
+//
+// Compares the local spacing on either side of the boundary: for the
+// pair of beats that bracket `boundaryTime`, we look at the spacing
+// immediately before that pair vs. immediately after. If the broadcast
+// has been running long enough to be at the song's tail (or hasn't
+// yet reached enough beats for either side), we conservatively return
+// false — no flag, no UI warning, no false positives.
+//
+// Why this check is here (in v1): the plan explicitly accepts a one-
+// measure misalignment burst at tempo changes. We just need to flag it
+// so the listener can render a brief "tempo change ahead" cue and
+// internally bias their schedule (Phase 2c already wires the
+// `tempo_change_at_end` boolean through to header decode for future
+// use).
+const CAPTURE_TEMPO_CHANGE_THRESHOLD = 0.05; // 5% spacing delta
+
+function _captureBeatsSnapshot() {
+    if (typeof window === 'undefined' || !window.highway) return null;
+    if (typeof window.highway.getBeats !== 'function') return null;
+    try {
+        const beats = window.highway.getBeats();
+        return Array.isArray(beats) ? beats : null;
+    } catch (_e) { return null; }
+}
+
+function _captureTempoChangesAtBoundary(boundaryTime) {
+    const beats = _captureBeatsSnapshot();
+    if (!beats || beats.length < 4) return false;
+    // Find the index of the first beat at or after the boundary.
+    // Linear scan is fine — beats arrays are typically a few hundred
+    // entries and this runs once per interval (~once per 2 s).
+    let nextIdx = -1;
+    for (let i = 0; i < beats.length; i++) {
+        const t = beats[i] && beats[i].time;
+        if (typeof t === 'number' && t >= boundaryTime) {
+            nextIdx = i;
+            break;
+        }
+    }
+    // Need at least two beats on each side of the boundary to compute
+    // a "before" and "after" spacing.
+    if (nextIdx < 2 || nextIdx >= beats.length - 1) return false;
+    const tPrevPrev = beats[nextIdx - 2] && beats[nextIdx - 2].time;
+    const tPrev = beats[nextIdx - 1] && beats[nextIdx - 1].time;
+    const tNext = beats[nextIdx] && beats[nextIdx].time;
+    const tNextNext = beats[nextIdx + 1] && beats[nextIdx + 1].time;
+    if (
+        typeof tPrevPrev !== 'number' || typeof tPrev !== 'number'
+        || typeof tNext !== 'number' || typeof tNextNext !== 'number'
+    ) return false;
+    const spacingBefore = tPrev - tPrevPrev;
+    const spacingAfter = tNextNext - tNext;
+    if (!(spacingBefore > 0) || !(spacingAfter > 0)) return false;
+    const ratio = Math.abs(spacingAfter - spacingBefore) / spacingBefore;
+    return ratio > CAPTURE_TEMPO_CHANGE_THRESHOLD;
+}
+
 function _captureSetIntervalParams(bpm) {
     let safeBpm = (bpm && Number.isFinite(bpm) && bpm > 0) ? bpm : 120;
     // Clamp to a minimum so very slow tempos don't blow past the
@@ -2197,6 +2518,14 @@ async function _captureFlushAndSendInterval(pcm, numFrames, chartTimeStart, char
     if (!_captureBroadcasterAcked) return;
     if (!_audioWs || _audioWs.readyState !== WebSocket.OPEN) return;
 
+    // Detect tempo change at this interval's end boundary so the
+    // listener can render the warning before our next-interval audio
+    // arrives (which is exactly when the misalignment will be most
+    // audible). v1 doesn't time-stretch around the boundary — the
+    // flag is purely informational.
+    const tempoChange = _captureTempoChangesAtBoundary(chartTimeEnd);
+    if (tempoChange) _captureNotifyTempoChangeUi();
+
     let frame;
     try {
         frame = _smauEncodeFrame({
@@ -2205,6 +2534,7 @@ async function _captureFlushAndSendInterval(pcm, numFrames, chartTimeStart, char
             chartTimeEnd: chartTimeEnd,
             sampleCount: numFrames,
             opus: opus,
+            flags: tempoChange ? SMAU_FLAG_TEMPO_CHANGE_AT_END : 0,
         });
     } catch (e) {
         console.error('[MP] SMAU encode failed:', e);
@@ -2559,6 +2889,7 @@ function _broadcastStop(opts) {
     _captureIntervalBuffer = null;
     _captureIntervalSampleCount = 0;
     _renderCaptureLevel(0);
+    _captureClearTempoChangeUi();
     _renderBroadcastUi();
     // Tell the server only if we actually owned a broadcast and not
     // during a forced silent teardown (e.g. encoder error already on
@@ -2582,6 +2913,9 @@ function _captureOnBroadcasterChanged(broadcasterId) {
         // flip the pill back to "Broadcasting".
         if (_captureRequested || _captureCtx) {
             _captureBroadcasterAcked = true;
+            // Fresh broadcast — stale per-listener stats from a previous
+            // broadcast (if any) shouldn't appear under this new run.
+            _audioQualityRxReset();
             _renderBroadcastUi();
         }
         return;
@@ -2592,6 +2926,9 @@ function _captureOnBroadcasterChanged(broadcasterId) {
     // server update. Spotted by Copilot review on PR #8 round 3.
     const hadAck = _captureBroadcasterAcked;
     _captureBroadcasterAcked = false;
+    // We are no longer the broadcaster — drop any aggregated listener
+    // telemetry so the stats line hides itself the next render.
+    _audioQualityRxReset();
     // If WE thought we were broadcasting, our broadcast was preempted —
     // tear down without sending another broadcast_stop (the server
     // already moved on).
@@ -2602,6 +2939,38 @@ function _captureOnBroadcasterChanged(broadcasterId) {
     if (hadAck) {
         _renderBroadcastUi();
     }
+}
+
+// Brief banner shown to the broadcaster when an interval boundary
+// landed on a tempo change. Per the plan: v1 accepts a one-measure
+// misalignment burst at tempo changes; the user should know to expect
+// a brief shift. Shows for ~one interval (the duration over which the
+// listener-side misalignment will play out), then auto-clears.
+let _captureTempoChangeUiTimer = null;
+
+function _captureNotifyTempoChangeUi() {
+    const el = document.getElementById('mp-broadcast-tempo-warning');
+    if (!el) return;
+    el.classList.remove('hidden');
+    if (_captureTempoChangeUiTimer) clearTimeout(_captureTempoChangeUiTimer);
+    // Hold the warning for one interval — long enough for the
+    // listener to actually hear the shift, short enough not to
+    // pile up across consecutive tempo-change measures.
+    const holdMs = Math.max(1000, Math.round(_captureIntervalLengthSec * 1000));
+    _captureTempoChangeUiTimer = setTimeout(() => {
+        const e = document.getElementById('mp-broadcast-tempo-warning');
+        if (e) e.classList.add('hidden');
+        _captureTempoChangeUiTimer = null;
+    }, holdMs);
+}
+
+function _captureClearTempoChangeUi() {
+    if (_captureTempoChangeUiTimer) {
+        clearTimeout(_captureTempoChangeUiTimer);
+        _captureTempoChangeUiTimer = null;
+    }
+    const el = document.getElementById('mp-broadcast-tempo-warning');
+    if (el) el.classList.add('hidden');
 }
 
 function _renderBroadcastUi() {
@@ -3219,6 +3588,13 @@ function _handleMessage(msg) {
             // unlocks frame send; non-self / null tears down our own
             // capture if we thought we were broadcasting.
             _captureOnBroadcasterChanged(msg.broadcaster_id || null);
+            break;
+
+        case 'audio_quality':
+            // Listener-reported telemetry forwarded by the server
+            // (only the broadcaster receives these). Server adds
+            // `from_player_id` so we can key per-listener.
+            _audioQualityRxOnReport(msg);
             break;
 
         case 'error':

@@ -28,6 +28,54 @@ A [Slopsmith](https://github.com/byrongamatos/slopsmith) plugin that lets multip
 - Each player's recording is uploaded to the server when recording stops
 - Uses `getUserMedia` on web, JUCE audio engine on desktop
 
+### Live Audio (Peer Broadcast)
+
+Hear another player's instrument **while playing the same chart**, locked to the chart's beat grid. Open the multiplayer panel, pick your loopback input from the device dropdown, flip on **Broadcast my sound**, and every other player in the room will hear your sound through their browser one measure later.
+
+#### How it sounds — the honest description
+
+Peer audio plays **one interval (typically one measure) delayed**, not "lagged". This isn't network lag — it's a structured offset built into the protocol so every listener gets a perfectly aligned, glitch-free playback regardless of their connection. You'll hear it as: "I'm playing along to the chart, and I can also hear my bandmate playing along to the chart, but their part is one measure behind". The chart audio is the shared anchor — that's what stays in perfect sync.
+
+The model is borrowed from [Ninjam](https://www.cockos.com/ninjam/) and works over any non-pathological internet connection (LAN, home Wi-Fi, tethered phone hotspot — all feel the same).
+
+#### Loopback input setup
+
+Slopsmith does **not** host amp simulation. You run your full signal chain (amp sim → effects → DAW out) into a virtual loopback device, then point the broadcast picker at that device. Per OS:
+
+**Windows — VB-Audio Cable**
+1. Install [VB-Audio Cable](https://vb-audio.com/Cable/) (free).
+2. In your DAW / amp sim, set the audio output to **CABLE Input (VB-Audio Virtual Cable)**.
+3. In the multiplayer panel, pick **CABLE Output** as the broadcast input.
+4. To still hear yourself locally, also set up VB-Audio's "Listen to this device" passthrough or use [VoiceMeeter](https://vb-audio.com/Voicemeeter/) for finer routing.
+
+**macOS — BlackHole**
+1. Install [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole) (free, via Homebrew: `brew install blackhole-2ch`).
+2. In Audio MIDI Setup, create a **Multi-Output Device** combining BlackHole 2ch + your normal output, so you still hear yourself.
+3. In your DAW / amp sim, set the audio output to the Multi-Output Device.
+4. In the multiplayer panel, pick **BlackHole 2ch** as the broadcast input.
+
+**Linux — PipeWire / PulseAudio loopback**
+1. PipeWire (modern distros) ships a `null-sink` you can route to:
+   ```bash
+   pactl load-module module-null-sink sink_name=slopsmith_loop \
+     sink_properties=device.description=SlopsmithLoop
+   ```
+2. In your DAW / amp sim, set the output to **SlopsmithLoop**.
+3. In the multiplayer panel, pick the **Monitor of SlopsmithLoop** input.
+4. To hear yourself locally, route the same source to your normal output via `pactl load-module module-loopback`.
+
+After setup: load any song, hit play, strum your guitar — you should see the level meter move and the **Broadcasting** pill turn red. Other room members will see a corresponding "Live audio: <broadcaster>" indicator and hear your instrument starting one measure after you played it.
+
+#### What to expect at tempo changes
+
+The interval boundaries are anchored to the chart's beat grid using the BPM at broadcast start. When the chart enters a section with a different tempo, the broadcaster's interval boundaries no longer line up perfectly with the chart's beats for **one measure** — listeners may hear a brief shift before alignment recovers automatically on the next measure.
+
+The broadcaster sees a `⚠ Tempo change at this measure` banner when this happens, and the wire format carries a `tempo_change_at_end` flag so future versions can time-stretch around the boundary. v1 just lets the one measure pass through.
+
+#### Telemetry
+
+While broadcasting, the panel shows aggregate listener stats from each peer's listener pipeline (e.g. `2 listeners — 1 late, 0 dropped`). Reports are 30-second rolling deltas from the listener's perspective; "late" means a frame arrived after its scheduled chart-time, "dropped" means decoder/validation failure. Healthy operation reports `no issues`.
+
 ### Mini DAW Mixer
 After recording, the host opens the Mixer to align and export:
 - **Waveform display** for every track (stems in green, recordings in blue)
@@ -43,6 +91,7 @@ After recording, the host opens the Mixer to align and export:
 
 - Slopsmith with WebSocket support (standard)
 - For recording: browser mic access (Chrome/Edge recommended)
+- For peer audio broadcast: WebCodecs (Chrome/Edge or Firefox 130+) and a loopback input device (see "Live Audio" below for OS-specific setup)
 - For stem mixing: sloppak songs with split stems (use the Sloppak Converter plugin)
 - FFmpeg available in the Docker container (included by default)
 
