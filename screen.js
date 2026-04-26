@@ -210,7 +210,7 @@ function _smauToBigUint64(value, fieldName) {
 
 function _smauEncodeFrame(fields) {
     if (!fields || typeof fields !== 'object') {
-        throw new TypeError('encodeSmauFrame: fields object required');
+        throw new TypeError('_smauEncodeFrame: fields object required');
     }
     const intervalIndex = _smauToBigUint64(fields.intervalIndex, 'intervalIndex');
     const chartTimeStart = fields.chartTimeStart;
@@ -1661,8 +1661,9 @@ function _scheduleAudioReconnect() {
 // Worklet code is loaded from a Blob URL because the slopsmith plugin
 // loader serves only a single screen.js entry point per plugin (no
 // generic asset path). audio/audio-capture-worklet.js is the source of
-// truth; the constant below is a verbatim string copy. Keep both in
-// sync when either is edited.
+// truth; the constant below is a functionally equivalent inline copy
+// (excluding comments / formatting). Keep the executable logic in sync
+// when either is edited.
 
 const _CAPTURE_WORKLET_CODE = `
 class CaptureProcessor extends AudioWorkletProcessor {
@@ -1728,6 +1729,16 @@ let _captureEncoderChunks = [];     // EncodedAudioChunk byte payloads accumulat
 // under interval N's collector — corrupting the SMAU payload built
 // for interval N. Spotted by Copilot review on PR #8 round 1.
 let _captureFlushQueue = Promise.resolve();
+// Generation token. Bumped on every _broadcastStart entry and
+// every _broadcastStop. Each queued interval flush captures the
+// token and bails out if it's no longer current — without this,
+// stale flush tasks from a previous broadcast session could run
+// after a stop+start cycle and feed the NEW encoder with the OLD
+// PCM/interval state. Also used as a re-entrancy guard so two
+// concurrent _broadcastStart calls (e.g. rapid toggle) don't
+// race to wire up parallel mic streams + AudioContexts. Spotted
+// by Copilot review on PR #8 round 6.
+let _captureGen = 0;
 let _captureIntervalBuffer = null;  // Float32Array for the in-flight interval
 let _captureIntervalSampleCount = 0;
 let _captureIntervalIndex = 0n;     // BigInt — monotonic per session
@@ -1892,6 +1903,7 @@ function _captureFlushAndSendIntervalQueued() {
     const chartTimeStart = _captureChartTimeAtIntervalStart;
     const chartTimeEnd = chartTimeStart + (numFrames / SMAU_V1_SAMPLE_RATE);
     const intervalIndex = _captureIntervalIndex;
+    const gen = _captureGen;
 
     // Roll the interval pointer NOW so subsequent PCM chunks belong
     // to interval N+1.
@@ -1900,9 +1912,13 @@ function _captureFlushAndSendIntervalQueued() {
     _captureIntervalBuffer = new Float32Array(_captureIntervalSamplesTarget + CAPTURE_PCM_CHUNK_SAMPLES);
     _captureChartTimeAtIntervalStart = chartTimeEnd;
 
-    _captureFlushQueue = _captureFlushQueue.then(
-        () => _captureFlushAndSendInterval(pcm, numFrames, chartTimeStart, chartTimeEnd, intervalIndex)
-    ).catch((err) => {
+    _captureFlushQueue = _captureFlushQueue.then(() => {
+        // Generation gate: a stop+start cycle bumps _captureGen, so a
+        // queued task from a previous broadcast bails out before
+        // touching the NEW encoder / WS.
+        if (gen !== _captureGen) return;
+        return _captureFlushAndSendInterval(pcm, numFrames, chartTimeStart, chartTimeEnd, intervalIndex);
+    }).catch((err) => {
         console.error('[MP] capture flush failed:', err);
     });
 }
@@ -2044,6 +2060,17 @@ function _captureOnPcmChunk(chunk) {
 
 async function _broadcastStart(deviceId) {
     if (_captureCtx) return; // already broadcasting
+    // Re-entrancy / start-in-progress guard. Bump _captureGen on
+    // entry and capture the value; every await checks that no
+    // newer start has bumped past us. Without this, two rapid
+    // toggle clicks could each get past the _captureCtx==null
+    // check (which stays null until late in the async flow) and
+    // race to wire up parallel mic streams + AudioContexts.
+    // Spotted by Copilot review on PR #8 round 6.
+    const myGen = ++_captureGen;
+    // Reset the flush queue so any stale tasks from a previous
+    // broadcast session can't run against THIS session's encoder.
+    _captureFlushQueue = Promise.resolve();
     if (!_captureHasWebCodecs()) {
         _showError('Peer audio broadcast requires WebCodecs (Chrome/Edge or Firefox 130+).');
         return;
@@ -2085,11 +2112,11 @@ async function _broadcastStart(deviceId) {
         _showError('Microphone access denied or unavailable: ' + (e && e.message || e));
         return;
     }
-    // Cancellation check: the user may have toggled broadcast off
-    // while the permission prompt was open. Stop the just-acquired
-    // tracks and bail without bringing up the rest of the pipeline.
-    // Spotted by Copilot review on PR #8 round 2.
-    if (!_captureRequested) {
+    // Cancellation check: the user may have toggled broadcast off,
+    // OR triggered another _broadcastStart (re-entrancy), while the
+    // permission prompt was open. Stop the just-acquired tracks and
+    // bail. Spotted by Copilot review on PR #8 rounds 2 + 6.
+    if (!_captureRequested || myGen !== _captureGen) {
         try { stream.getTracks().forEach((t) => t.stop()); } catch (_) { /* */ }
         return;
     }
@@ -2131,8 +2158,9 @@ async function _broadcastStart(deviceId) {
     }
     URL.revokeObjectURL(url);
     // Second cancellation check — addModule is async, and the user
-    // may have toggled off during it.
-    if (!_captureRequested) {
+    // may have toggled off during it (or another start may have
+    // raced past us).
+    if (!_captureRequested || myGen !== _captureGen) {
         _broadcastStop({ silent: true });
         return;
     }
@@ -2250,6 +2278,12 @@ function _broadcastStop(opts) {
     const wasRequested = _captureRequested;
     _captureRequested = false;
     _captureBroadcasterAcked = false;
+    // Bump the generation token so any queued flush tasks from this
+    // session bail out at their gate before touching the next
+    // session's encoder / WS. Reset the queue too — no point keeping
+    // tasks chained that will all early-return.
+    _captureGen++;
+    _captureFlushQueue = Promise.resolve();
     _captureStopLevelMeter();
     if (_captureWorkletNode) {
         try { _captureWorkletNode.port.onmessage = null; } catch (_) { /* */ }
@@ -2384,11 +2418,16 @@ window.mpToggleBroadcast = async function () {
 window.mpRefreshBroadcastDevices = async function () {
     const dropdown = document.getElementById('mp-broadcast-device');
     if (!dropdown) return;
-    let devices;
-    try {
-        devices = await _captureRequestPermissionAndRefreshDevices();
-    } catch (e) {
-        _showError('Failed to enumerate devices: ' + (e && e.message || e));
+    // _captureRequestPermissionAndRefreshDevices swallows getUserMedia
+    // exceptions and returns [] (so this caller doesn't have to know
+    // about specific Permissions API errors). An empty list therefore
+    // means either "permission denied" or "no input devices" — either
+    // way, nothing useful to populate, and the user needs to know.
+    // The previous try/catch was unreachable. Spotted by Copilot
+    // review on PR #8 round 6.
+    const devices = await _captureRequestPermissionAndRefreshDevices();
+    if (!Array.isArray(devices) || devices.length === 0) {
+        _showError('Microphone permission was denied or no input devices are available.');
         return;
     }
     const persisted = (() => {
