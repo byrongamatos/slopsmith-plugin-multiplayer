@@ -212,7 +212,7 @@ Every audio WS binary frame consists of a fixed-size header followed by the Opus
 
 ### Payload
 
-The byte range `[40, 40 + opus_size)` (half-open — offset 40 inclusive, `40 + opus_size` exclusive) is an Opus-encoded chunk produced by the WebCodecs `AudioEncoder` configured as:
+The byte range `[40, 40 + opus_size)` (half-open — offset 40 inclusive, `40 + opus_size` exclusive) is a **length-prefixed sequence of Opus packets** produced by the WebCodecs `AudioEncoder` configured as:
 
 ```js
 {
@@ -224,7 +224,21 @@ The byte range `[40, 40 + opus_size)` (half-open — offset 40 inclusive, `40 + 
 }
 ```
 
-The chunk is the entire interval (not a sequence of small frames). Encoder is `flush()`ed at each interval boundary so a single `EncodedAudioChunk` represents the whole interval.
+Per RFC 6716, an individual Opus packet covers **at most 120 ms of audio** — a multi-second interval cannot be represented as a single packet. The encoder is `flush()`ed at each interval boundary and emits one or more `EncodedAudioChunk`s; each becomes one length-prefixed packet record in the SMAU opus payload:
+
+```
+[u32 LE packet_count]
+( [u32 LE packet_size] [packet_size bytes] ){packet_count}
+```
+
+All multi-byte integers are little-endian. Receivers MUST decode each packet independently (one `EncodedAudioChunk` per record fed to `AudioDecoder`) and accumulate the resulting `AudioData` outputs into a single playback buffer for the interval.
+
+**Receiver validation of records.** Receivers MUST drop the entire SMAU frame when:
+
+- `opus_size < 4` (no room for the packet count prefix);
+- `packet_count == 0` or `packet_count > 1024` (a 32 s interval at the spec's 2.5 ms minimum Opus frame would still be ≤ 12,800 packets, so 1024 is a generous defensive ceiling that comfortably covers the v1 interval bands);
+- any `packet_size == 0` or `packet_size > 8192` (the spec's typical Opus packet is well under 1.5 KB; 8 KB is a defensive ceiling against adversarial inputs);
+- the record sequence runs past `40 + opus_size` (truncation).
 
 ### Frame size budget and bounds
 

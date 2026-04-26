@@ -484,82 +484,104 @@ function _audioListenerHandleDecodedAudio(audioData, wrapper) {
         if (wrapper.epoch !== _audioListenerEpoch) return;
         const meta = wrapper.pending.get(audioData.timestamp);
         wrapper.pending.delete(audioData.timestamp);
-        if (!meta) return; // stale or torn down
+        if (!meta || !meta.acc) return; // stale or torn down
+        const acc = meta.acc;
+        if (acc.finalized) return;
+        if (acc.epoch !== _audioListenerEpoch) {
+            // Chart-time was invalidated after the interval was queued
+            // for decode. Drop without scheduling.
+            acc.finalized = true;
+            return;
+        }
 
         const numFrames = audioData.numberOfFrames;
         const channels = audioData.numberOfChannels || 1;
-        if (numFrames <= 0) return;
-        // Defense against a malicious or buggy broadcaster: the
-        // validator already capped header.sampleCount against
-        // ceil(V1_SAMPLE_RATE * duration) + MAX_SLACK_SAMPLES, but
-        // the Opus payload itself is opaque and could decode to a
-        // much longer frame. Recompute the same bound from the
-        // validated chart-time duration and drop oversized output —
-        // that way a peer can't make us allocate / play arbitrarily
-        // long AudioBuffers or drift across interval boundaries.
-        const duration = meta.chartTimeEnd - meta.chartTimeStart;
-        const maxFrames = Math.ceil(SMAU_V1_SAMPLE_RATE * duration) + SMAU_MAX_SLACK_SAMPLES;
-        if (numFrames > maxFrames) {
-            _audioRxRecordDrop('decoded_frame_too_long');
-            return;
-        }
-        // Channel count is also bounded: v1 is mono only and the
-        // decoder is configured for numberOfChannels=1, but a
-        // misconfigured / patched browser could still produce
-        // multi-channel output. Reject anything that doesn't match
-        // the v1 invariant.
+        // Channel count is bounded: v1 is mono only and the decoder
+        // is configured for numberOfChannels=1, but a misconfigured /
+        // patched browser could still produce multi-channel output.
         if (channels !== SMAU_V1_CHANNEL_COUNT) {
             _audioRxRecordDrop('decoded_channel_mismatch');
+            acc.finalized = true;
             return;
         }
 
-        // copyTo() can throw on unsupported conversion formats / internal
-        // decoder quirks. Catch in-place so the exception doesn't bubble
-        // out of this output callback as an unhandled error and
-        // destabilize the decode pipeline. The outer finally still
-        // closes the AudioData. Spotted by Copilot review on PR #7.
-        let buffer;
-        try {
-            buffer = ctx.createBuffer(channels, numFrames, audioData.sampleRate || SMAU_V1_SAMPLE_RATE);
-            for (let ch = 0; ch < channels; ch++) {
-                const out = buffer.getChannelData(ch);
-                audioData.copyTo(out, { planeIndex: ch, format: 'f32-planar' });
+        // Lazy-build the per-interval PCM buffer on the first packet
+        // that contributes samples. Bound it against the validated
+        // chart-time duration + slack so a malicious broadcaster can't
+        // over-allocate by emitting too many or oversize Opus packets.
+        if (!acc.pcmBuffer) {
+            const duration = acc.header.chartTimeEnd - acc.header.chartTimeStart;
+            const maxFrames = Math.ceil(SMAU_V1_SAMPLE_RATE * duration) + SMAU_MAX_SLACK_SAMPLES;
+            acc.pcmBuffer = new Float32Array(maxFrames);
+            acc.maxFrames = maxFrames;
+        }
+
+        if (numFrames > 0) {
+            if (acc.writeOffset + numFrames > acc.maxFrames) {
+                _audioRxRecordDrop('decoded_overflow');
+                acc.finalized = true;
+                return;
             }
-        } catch (_err) {
-            _audioRxRecordDrop('decoded_copy_failed');
+            // copyTo() can throw on unsupported conversion formats /
+            // internal decoder quirks. Catch in-place so the exception
+            // doesn't bubble out of this output callback as an
+            // unhandled error and destabilize the decode pipeline.
+            try {
+                const sub = acc.pcmBuffer.subarray(acc.writeOffset, acc.writeOffset + numFrames);
+                audioData.copyTo(sub, { planeIndex: 0, format: 'f32-planar' });
+            } catch (_err) {
+                _audioRxRecordDrop('decoded_copy_failed');
+                acc.finalized = true;
+                return;
+            }
+            acc.writeOffset += numFrames;
+        }
+        acc.packetsReceived++;
+
+        if (acc.packetsReceived < acc.packetsExpected) return;
+
+        // All packets for this interval decoded. Build AudioBuffer +
+        // schedule a single source against the chart clock.
+        const totalFrames = acc.writeOffset;
+        if (totalFrames === 0) {
+            acc.finalized = true;
             return;
         }
 
         const audio = document.getElementById('audio');
         if (!audio || audio.paused) {
-            // Listener is paused or has no chart audio yet. Drop the
-            // decoded interval — it'd schedule into the past once
-            // playback resumes anyway, and the chart pause hook will
-            // walk pending sources next.
             _audioRxRecordDrop('listener_paused');
+            acc.finalized = true;
             return;
         }
-        // Effective-speed re-check — see _audioListenerHandleFrame for
-        // why we use audio.playbackRate with 0.01 tolerance (covers
-        // drift correction, rejects user-set non-1x speed).
         const speed = audio.playbackRate || 1.0;
         if (Math.abs(speed - 1.0) > 0.01) {
-            // v1 limitation: peer audio assumes both ends at 1.0x.
             _audioRxRecordDrop('listener_speed');
+            acc.finalized = true;
             return;
         }
 
-        const targetChart = meta.chartTimeStart + (meta.chartTimeEnd - meta.chartTimeStart);
+        const meta_h = acc.header;
+        const targetChart = meta_h.chartTimeStart + (meta_h.chartTimeEnd - meta_h.chartTimeStart);
         const chartNow = audio.currentTime;
         const deltaSec = targetChart - chartNow;
         if (deltaSec < -LATE_FRAME_GRACE_SEC) {
             _audioRxFramesLate++;
-            // Also account in the unified drop-reason map so
-            // getAudioRxStats() reports late frames consistently with
-            // other drop reasons. Spotted by Copilot review on PR #7.
             _audioRxRecordDrop('late');
+            acc.finalized = true;
             return;
         }
+
+        let buffer;
+        try {
+            buffer = ctx.createBuffer(SMAU_V1_CHANNEL_COUNT, totalFrames, SMAU_V1_SAMPLE_RATE);
+            buffer.getChannelData(0).set(acc.pcmBuffer.subarray(0, totalFrames));
+        } catch (_err) {
+            _audioRxRecordDrop('decoded_copy_failed');
+            acc.finalized = true;
+            return;
+        }
+        acc.finalized = true;
 
         const startAt = ctx.currentTime + Math.max(0, deltaSec);
         const source = ctx.createBufferSource();
@@ -804,29 +826,97 @@ function _audioListenerHandleFrame(header, opus) {
         return;
     }
 
-    const ts = wrapper.nextTs++;
-    wrapper.pending.set(ts, {
-        chartTimeStart: header.chartTimeStart,
-        chartTimeEnd: header.chartTimeEnd,
-        sampleCount: header.sampleCount,
-        intervalIndex: header.intervalIndex,
-    });
-    try {
-        // Copy opus into a fresh ArrayBuffer because EncodedAudioChunk takes
-        // ownership of its buffer view; the original Uint8Array aliases the
-        // WebSocket message and may be reused. (Also detaches in some
-        // implementations once the chunk is queued.)
-        const data = new Uint8Array(opus.byteLength);
-        data.set(opus);
-        const chunk = new EncodedAudioChunk({
-            type: 'key',
-            timestamp: ts,
-            data: data,
-        });
-        wrapper.dec.decode(chunk);
-    } catch (e) {
-        wrapper.pending.delete(ts);
-        _audioRxRecordDrop('decode_call_failed');
+    // Parse the SMAU opus payload as a length-prefixed sequence of
+    // Opus packet records:
+    //   [u32 LE packet_count]
+    //   ([u32 LE packet_size][packet_size bytes])*
+    //
+    // Opus packets max out at ~120 ms (RFC 6716), so a multi-second
+    // interval requires multiple packets. Each is fed independently
+    // to AudioDecoder; the per-interval accumulator below collects
+    // their outputs into one AudioBuffer that gets scheduled at the
+    // chart-time anchor specified in the SMAU header. PROTOCOL.md
+    // "Audio frame format / Payload" describes this framing.
+    if (opus.byteLength < 4) {
+        _audioRxRecordDrop('opus_payload_too_small');
+        return;
+    }
+    const opusView = new DataView(opus.buffer, opus.byteOffset, opus.byteLength);
+    const packetCount = opusView.getUint32(0, true);
+    if (packetCount === 0 || packetCount > 1024) {
+        // Hard cap: a 32 s interval at the spec's 2.5 ms minimum Opus
+        // packet duration is 12,800 packets — way more than any sane
+        // configuration. 1024 is a defensive ceiling that comfortably
+        // covers all v1 broadcasts (≤ 8 s × 100 packets/s = 800).
+        _audioRxRecordDrop('opus_packet_count_invalid');
+        return;
+    }
+    const packets = [];
+    let parseOff = 4;
+    for (let i = 0; i < packetCount; i++) {
+        if (parseOff + 4 > opus.byteLength) {
+            _audioRxRecordDrop('opus_truncated');
+            return;
+        }
+        const pktLen = opusView.getUint32(parseOff, true);
+        parseOff += 4;
+        if (pktLen === 0 || pktLen > 8192 || parseOff + pktLen > opus.byteLength) {
+            // 8 KB per Opus packet is well above the spec's max ~1275
+            // byte typical packet — a defensive ceiling against
+            // adversarial inputs.
+            _audioRxRecordDrop('opus_packet_invalid');
+            return;
+        }
+        // Subarray view into the source Uint8Array — copy happens per
+        // packet below before handing to EncodedAudioChunk (which
+        // takes ownership).
+        packets.push(new Uint8Array(opus.buffer, opus.byteOffset + parseOff, pktLen));
+        parseOff += pktLen;
+    }
+
+    // Shared accumulator across all packets in this interval. Each
+    // EncodedAudioChunk we feed to the decoder gets a unique
+    // timestamp; pending entries point at the same `acc` so the
+    // output handler can collect every packet's decoded samples
+    // into one AudioBuffer and schedule it once.
+    const acc = {
+        header: {
+            chartTimeStart: header.chartTimeStart,
+            chartTimeEnd: header.chartTimeEnd,
+            sampleCount: header.sampleCount,
+            intervalIndex: header.intervalIndex,
+        },
+        epoch: wrapper.epoch,
+        pcmBuffer: null,
+        maxFrames: 0,
+        writeOffset: 0,
+        packetsExpected: packets.length,
+        packetsReceived: 0,
+        finalized: false,
+    };
+
+    for (const packet of packets) {
+        const ts = wrapper.nextTs++;
+        wrapper.pending.set(ts, { acc });
+        try {
+            // Copy each packet into a fresh ArrayBuffer — EncodedAudioChunk
+            // takes ownership and may detach the source view.
+            const data = new Uint8Array(packet.byteLength);
+            data.set(packet);
+            const chunk = new EncodedAudioChunk({
+                type: 'key',
+                timestamp: ts,
+                data: data,
+            });
+            wrapper.dec.decode(chunk);
+        } catch (e) {
+            wrapper.pending.delete(ts);
+            // Mark accumulator finalized so a partial decode of
+            // earlier packets doesn't schedule with missing audio.
+            acc.finalized = true;
+            _audioRxRecordDrop('decode_call_failed');
+            return;
+        }
     }
 }
 
@@ -1621,6 +1711,13 @@ let _captureAnalyserBuffer = null;
 let _captureLevelTimer = null;
 let _captureEncoder = null;
 let _captureEncoderChunks = [];     // EncodedAudioChunk byte payloads accumulated for the current interval
+// Serialize interval flushes. Without this, fire-and-forget flushes
+// for back-to-back intervals can interleave: interval N+1's encode
+// + flush starts while interval N's flush is still draining, and
+// the SHARED _captureEncoderChunks accumulator gets reset out from
+// under interval N's collector — corrupting the SMAU payload built
+// for interval N. Spotted by Copilot review on PR #8 round 1.
+let _captureFlushQueue = Promise.resolve();
 let _captureIntervalBuffer = null;  // Float32Array for the in-flight interval
 let _captureIntervalSampleCount = 0;
 let _captureIntervalIndex = 0n;     // BigInt — monotonic per session
@@ -1759,29 +1856,40 @@ function _captureOnEncodedChunk(chunk) {
 function _captureOnEncoderError(err) {
     console.error('[MP] AudioEncoder error:', err);
     // Tear down — the next broadcast attempt will rebuild the encoder.
-    _broadcastStop({ silent: true });
+    // Do NOT use silent:true here. If the server already accepted us
+    // as broadcaster, suppressing broadcast_stop would leave its
+    // broadcaster_id stuck on this player until grace expiry, blocking
+    // others. Spotted by Copilot review on PR #8 round 1.
+    _broadcastStop();
     _showError('Audio encoder failed; broadcast stopped.');
 }
 
-async function _captureFlushAndSendInterval() {
-    // Capture the current state so concurrent chunks accumulating into
-    // _captureIntervalBuffer (for the NEXT interval) don't disturb us.
+function _captureFlushAndSendIntervalQueued() {
+    // Capture interval state synchronously here (before queueing) so
+    // each queued task encodes the correct interval even if more
+    // boundaries fire while it's pending.
     const numFrames = _captureIntervalSampleCount;
-    if (numFrames <= 0) return;
     const pcm = _captureIntervalBuffer.slice(0, numFrames);
     const chartTimeStart = _captureChartTimeAtIntervalStart;
     const chartTimeEnd = chartTimeStart + (numFrames / SMAU_V1_SAMPLE_RATE);
     const intervalIndex = _captureIntervalIndex;
 
-    // Roll over to the next interval IMMEDIATELY, before awaiting the
-    // encoder. New PCM chunks arriving while encode/flush is in flight
-    // belong to interval N+1; they go into the freshly-allocated
-    // buffer below.
+    // Roll the interval pointer NOW so subsequent PCM chunks belong
+    // to interval N+1.
     _captureIntervalIndex = _captureIntervalIndex + 1n;
     _captureIntervalSampleCount = 0;
     _captureIntervalBuffer = new Float32Array(_captureIntervalSamplesTarget + CAPTURE_PCM_CHUNK_SAMPLES);
     _captureChartTimeAtIntervalStart = chartTimeEnd;
 
+    _captureFlushQueue = _captureFlushQueue.then(
+        () => _captureFlushAndSendInterval(pcm, numFrames, chartTimeStart, chartTimeEnd, intervalIndex)
+    ).catch((err) => {
+        console.error('[MP] capture flush failed:', err);
+    });
+}
+
+async function _captureFlushAndSendInterval(pcm, numFrames, chartTimeStart, chartTimeEnd, intervalIndex) {
+    if (numFrames <= 0) return;
     const encoder = _captureEncoder;
     if (!encoder) return;
     _captureEncoderChunks = [];
@@ -1828,17 +1936,34 @@ async function _captureFlushAndSendInterval() {
         return;
     }
 
-    // Concatenate the emitted Opus chunks into a single payload.
-    let totalSize = 0;
-    for (const c of _captureEncoderChunks) totalSize += c.byteLength;
-    if (totalSize === 0) return;
-    const opus = new Uint8Array(totalSize);
-    let off = 0;
-    for (const c of _captureEncoderChunks) {
-        opus.set(c, off);
-        off += c.byteLength;
-    }
+    // Build the SMAU opus payload as a length-prefixed sequence of
+    // Opus packet records:
+    //   [u32 LE packet_count]
+    //   ([u32 LE packet_size][packet_size bytes])*
+    //
+    // PROTOCOL.md "Audio frame format / Payload" describes this.
+    // Each Opus packet is at most ~120 ms by spec, so a 2-second
+    // interval typically produces ~10–100 packets. Concatenating
+    // them into one EncodedAudioChunk (the previous behavior) was
+    // not decodable — Opus packets have to be fed independently.
+    // Spotted by Copilot review on PR #8 round 1.
+    const packets = _captureEncoderChunks;
     _captureEncoderChunks = [];
+    if (packets.length === 0) return;
+
+    let totalSize = 4; // packet_count
+    for (const p of packets) totalSize += 4 + p.byteLength;
+
+    const opus = new Uint8Array(totalSize);
+    const view = new DataView(opus.buffer, opus.byteOffset, totalSize);
+    view.setUint32(0, packets.length, true);
+    let off = 4;
+    for (const p of packets) {
+        view.setUint32(off, p.byteLength, true);
+        off += 4;
+        opus.set(p, off);
+        off += p.byteLength;
+    }
 
     // Gate on broadcaster_changed ack and audio WS readiness.
     if (!_captureBroadcasterAcked) return;
@@ -1873,14 +1998,14 @@ function _captureOnPcmChunk(chunk) {
     _captureIntervalBuffer.set(chunk.subarray(0, writable), _captureIntervalSampleCount);
     _captureIntervalSampleCount += writable;
     if (_captureIntervalSampleCount >= _captureIntervalSamplesTarget) {
-        // Boundary crossed — fire-and-forget the encode + send. Any
-        // overflow samples beyond the target get DROPPED; v1 accepts
-        // a tiny per-interval truncation rather than carrying samples
-        // forward, which would drift the chart_time mapping. For the
-        // default 480-sample chunk size (10 ms at 48 kHz), this is at
-        // most ~10 ms truncation per interval, well below the
-        // listener's late-frame tolerance.
-        _captureFlushAndSendInterval().catch(() => { /* logged inside */ });
+        // Boundary crossed. Trim any overflow back to the exact target
+        // so chart_time math stays anchored to a consistent interval
+        // duration. v1 accepts the discarded slack samples (up to one
+        // chunk = ~10 ms) — carrying them forward into the next
+        // interval would drift the chart_time→sample mapping over
+        // time. Spotted by Copilot review on PR #8 round 1.
+        _captureIntervalSampleCount = _captureIntervalSamplesTarget;
+        _captureFlushAndSendIntervalQueued();
     }
 }
 

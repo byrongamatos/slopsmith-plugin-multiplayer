@@ -155,21 +155,20 @@
                         Broadcast your guitar to peers. Route your amp/effects chain into a loopback input
                         (VB-Audio Cable, BlackHole, PipeWire), pick it below, then enable broadcast.
                     </p>
-                    <div class="flex items-center gap-3 mb-3">
-                        <label class="relative inline-flex items-center cursor-pointer">
-                            <input type="checkbox" id="mp-broadcast-toggle" class="sr-only peer" onchange="mpToggleBroadcast()">
-                            <div class="w-9 h-5 bg-dark-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-gray-400 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-red-600 peer-checked:after:bg-white"></div>
-                        </label>
+                    <label class="relative inline-flex items-center gap-3 cursor-pointer mb-3">
+                        <input type="checkbox" id="mp-broadcast-toggle" class="sr-only peer" onchange="mpToggleBroadcast()">
+                        <div class="w-9 h-5 bg-dark-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-gray-400 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-red-600 peer-checked:after:bg-white"></div>
                         <span class="text-sm text-gray-300">Broadcast my sound</span>
-                    </div>
+                    </label>
                     <div class="flex items-center gap-2 mb-2">
+                        <label for="mp-broadcast-device" class="sr-only">Input device</label>
                         <select id="mp-broadcast-device"
                             class="flex-1 bg-dark-800 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-white focus:outline-none focus:border-accent/50">
                             <option value="">Default device</option>
                         </select>
                         <button onclick="mpRefreshBroadcastDevices()"
                             class="px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition flex-shrink-0"
-                            title="Refresh device list">↻</button>
+                            title="Refresh device list" aria-label="Refresh device list">↻</button>
                     </div>
                     <div class="bg-dark-800 rounded h-1.5 overflow-hidden">
                         <div id="mp-broadcast-level-fill" class="h-full bg-accent transition-[width] duration-75" style="width:0%"></div>
