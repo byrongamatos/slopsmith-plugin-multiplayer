@@ -650,6 +650,17 @@ function _audioListenerHandleFrame(header, opus) {
         _audioRxRecordDrop('listener_speed');
         return;
     }
+    // Short-circuit if peer-audio decoding is fundamentally unavailable
+    // in this browser. Without this, _audioListenerEnsureContext would
+    // construct an AudioContext (and install global resume-gesture
+    // listeners) even on browsers that can never decode our frames,
+    // tripping autoplay-policy warnings and wasting resources. Spotted
+    // by Copilot review on PR #7 round 3.
+    if (_audioListenerOpusUnsupported || !_audioListenerHasWebCodecs()) {
+        _audioListenerWarnOnceMissingWebCodecs();
+        _audioRxRecordDrop('webcodecs_unavailable');
+        return;
+    }
     // Build the listener pipeline lazily on first valid frame so
     // listeners-with-no-active-broadcast aren't holding an AudioContext open
     // (Chrome warns about unused autoplay-blocked contexts; some browsers
@@ -2168,10 +2179,15 @@ async function _doLoadSong(queueItem) {
 
     let succeeded = false;
     try {
-        // Call global playSong (await to let the full plugin chain set up)
-        if (typeof playSong === 'function') {
-            await playSong(queueItem.filename, arrIndex);
+        // Call global playSong (await to let the full plugin chain set up).
+        // If playSong isn't installed (slopsmith core not loaded yet, or
+        // some unexpected page state), treat as a load failure so we
+        // don't poison the cache by marking a never-loaded song as
+        // ready. Spotted by Copilot review on PR #7 round 3.
+        if (typeof playSong !== 'function') {
+            return;
         }
+        await playSong(queueItem.filename, arrIndex);
         // Give plugins time to finish async setup (stems, highway _onReady, etc.)
         await new Promise(r => setTimeout(r, 2000));
         succeeded = true;

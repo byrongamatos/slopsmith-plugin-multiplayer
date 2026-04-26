@@ -583,25 +583,28 @@ def test_audio_frame_dropped_during_handoff_in_progress(client, routes_module):
         room = routes_module._rooms[code]
         room["broadcast_handoff_in_progress"] = 1
         try:
-            # Send a valid SMAU frame from the broadcaster. The data
-            # plane gate must drop it because handoff is "in progress".
-            frame = _make_minimal_smau_frame()
-            host_audio.send_bytes(frame)
+            # Send the FIRST frame while the gate is active — this MUST
+            # be dropped server-side, not just delayed.
+            first_frame = _make_minimal_smau_frame()
+            host_audio.send_bytes(first_frame)
 
-            # Confirm Bob received nothing by sending a roundtrip and
-            # checking that no binary frame interrupts it. The simplest
-            # signal: the room's broadcaster_id is unchanged AND we
-            # don't see any binary on Bob's audio WS for a short while.
+            # Control-plane round-trip proves the session is responsive
+            # while the data-plane gate is active.
             host_hw.send_json({
                 "type": "set_arrangement",
                 "arrangement": "Lead",
             })
             _drain_until(bob_hw, lambda m: m.get("type") == "arrangement_changed")
-            # If the frame had been forwarded, bob_audio would have data
-            # in its receive buffer. Calling receive() with no data
-            # available blocks; we instead assert no frame using the
-            # sentinel-message round-trip above as proof the fan-out
-            # path executed (and dropped the frame at the gate).
+
+            # Now clear the gate and send a SECOND, distinct frame.
+            # If the first frame had been buffered rather than dropped,
+            # Bob's first receive_bytes would return that first frame,
+            # not this one — so this assertion proves the drop. Suggested
+            # by Copilot review on PR #7 round 3.
+            room["broadcast_handoff_in_progress"] = 0
+            second_frame = _make_minimal_smau_frame()[:-1] + b"\x01"
+            host_audio.send_bytes(second_frame)
+            assert bob_audio.receive_bytes() == second_frame
         finally:
             room["broadcast_handoff_in_progress"] = 0
 
