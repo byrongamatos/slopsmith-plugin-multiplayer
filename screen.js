@@ -43,6 +43,31 @@ let _audioWs = null;
 let _audioReconnectAttempts = 0;
 let _audioReconnectTimer = null;
 
+// Tracks (filename, arrangement) of the chart most recently loaded via
+// _loadSong. Used by _bootstrapOnConnected to avoid a redundant reload
+// on transient WS reconnects when the local <audio> already has the
+// right song AND arrangement: _loadSong sets _songLoading = true for
+// ~2s, and both _onHeartbeat and _audioListenerHandleFrame drop work
+// during that window. Both fields must match — switching arrangement
+// (Lead ↔ Rhythm ↔ Bass) calls a different playSong() variant, so a
+// filename-only cache would skip a needed reload after a mid-room
+// arrangement change. Reset in _cleanup.
+let _loadedFilename = null;
+let _loadedArrangement = null;
+// Promise of an in-flight _loadSong, or null. _bootstrapOnConnected
+// checks this so a second _loadSong call (e.g. a reconnect arriving
+// mid-song-change) doesn't overlap the first — _loadSong's tail
+// pauses non-host audio, and a stale tail firing after the bootstrap
+// has resumed playback would leave the guest stuck stopped.
+let _loadingPromise = null;
+// Generation counter bumped in _cleanup. _doLoadSong captures it at
+// entry and refuses to persist _loadedFilename / _loadedArrangement
+// if the value has changed — without this, a song load that started
+// in room A could finish after the user joined room B and poison
+// the cache (a later bootstrap into room B would then skip a needed
+// reload thinking room A's song was already loaded).
+let _loadGen = 0;
+
 // Idempotency guard for _onSessionEnded: when a 4408 (grace expired) close
 // fires, BOTH endpoint handlers see it. Resetting session_id twice would
 // produce two different new ids, and the two reconnects would then collide
@@ -254,8 +279,13 @@ let _audioListenerEpoch = 0;
 // with reason 'handoff_suppress'. Server-side worker purge is the
 // primary defense (cancels in-flight sends + drains queues); this is
 // belt-and-suspenders for bytes already in the OS TCP buffer at purge
-// time. 500 ms covers typical home/cellular RTT + buffer drain.
-const HANDOFF_SUPPRESS_MS = 500;
+// time. 200 ms is a tight bound on "TCP-buffered straggler RTT" while
+// short enough to NOT clip the first frame from new broadcasters that
+// use very short intervals (e.g. interval_beats=1 on fast tempos);
+// PROTOCOL.md's selectInterval algorithm only uses 4 / 8 beats so v1
+// broadcasters won't hit this in practice, but we keep the window
+// tight as a forward-compat safety.
+const HANDOFF_SUPPRESS_MS = 200;
 let _audioListenerHandoffSuppressUntil = 0;
 let _audioListenerGain = null;         // GainNode → destination
 const _audioListenerScheduledSources = new Set();
@@ -1005,6 +1035,16 @@ function _cleanup() {
     _highwayAuthedAfterReset = true;
     _audioOpenedAfterReset = true;
     _audioRxResetStats();
+    _loadedFilename = null;
+    _loadedArrangement = null;
+    _loadingPromise = null;
+    // Invalidate any in-flight bootstrap / song load so its post-await
+    // continuations can't apply state to (or cache song markers for)
+    // a NEW room the user has just joined. Each helper captures these
+    // generation counters at entry and bails / aborts persisting if
+    // the captured value is stale.
+    _bootstrapGen++;
+    _loadGen++;
     sessionStorage.removeItem('mp_room');
     sessionStorage.removeItem('mp_player');
     sessionStorage.removeItem(SESSION_STORAGE_KEY);
@@ -1340,22 +1380,62 @@ function _scheduleAudioReconnect() {
 //                                    schedule from before the reconnect.
 //   3. Activate listener pipeline — broadcaster_id from snapshot
 //                                   selects control_set / self / clear.
+//
+// _bootstrapGen guards against stale completions: another `connected`
+// snapshot or `song_changed` can arrive during _loadSong's ~2 s async
+// setup window. Each call captures its own generation; after every
+// await, it bails out if the generation no longer matches (a newer
+// bootstrap has superseded it). Without this, the OLD load can finish
+// and apply chart-time / listener state for a song that's no longer
+// the room's current song.
+
+let _bootstrapGen = 0;
 
 async function _bootstrapOnConnected() {
     if (!_room) return;
-    // Activate the listener pipeline FIRST so inbound /audio frames
-    // arriving during _loadSong's ~2 s wait window aren't dropped as
-    // `no_broadcaster`. The pre-decode listener_paused / _songLoading
-    // gates still drop those frames (correctly — audio is unloaded /
-    // mid-load), but having broadcaster_id set means once the load
-    // completes and play resumes, frames flow without a stale
-    // missed-announce window.
-    if (_room.broadcaster_id && _room.broadcaster_id !== _playerId) {
-        _audioListenerOnControlSet(_room.broadcaster_id, _room.broadcast_params || null);
-    } else if (_room.broadcaster_id === _playerId) {
-        _audioListenerOnSelfBroadcast();
-    } else {
-        _audioListenerOnControlClear();
+    const myGen = ++_bootstrapGen;
+    // Hard-teardown the listener pipeline ONLY if the snapshot
+    // represents a meaningful state change (different broadcaster,
+    // different song, or different arrangement). A bare highway
+    // reconnect that re-issues the same `connected` snapshot
+    // shouldn't interrupt peer audio — its scheduled sources are
+    // still anchored to the right chart timeline, and tearing them
+    // down here would cause an audible dropout for what is otherwise
+    // a transparent control-plane blip. The state-apply step below
+    // will still re-seek if local audio.currentTime has drifted
+    // (which calls _audioListenerOnChartPause itself), so we don't
+    // miss legitimate chart-time invalidations.
+    const sameBroadcaster = _audioListenerBroadcasterId === (_room.broadcaster_id || null);
+    const wantedFilename = (
+        typeof _room.now_playing === 'number'
+        && _room.now_playing >= 0
+        && _room.queue
+        && _room.queue[_room.now_playing]
+    ) ? _room.queue[_room.now_playing].filename : null;
+    const wantedArrangement = (_room.players && _room.players[_playerId])
+        ? _room.players[_playerId].arrangement : 'Lead';
+    const sameSong = wantedFilename === _loadedFilename && wantedArrangement === _loadedArrangement;
+    if (!sameBroadcaster || !sameSong) {
+        // If we previously had a broadcaster and now the snapshot
+        // shows a different one (or none), the audio WS may still
+        // hold buffered packets from the previous broadcaster that
+        // arrive after the snapshot. Arm the handoff suppression
+        // window now — clearing _audioListenerBroadcasterId before
+        // _audioListenerOnControlSet runs at the bottom of bootstrap
+        // would otherwise make that call see a null→new transition
+        // and skip its own suppression arming.
+        if (
+            _audioListenerBroadcasterId !== null
+            && _audioListenerBroadcasterId !== (_room.broadcaster_id || null)
+        ) {
+            _audioListenerHandoffSuppressUntil = (
+                (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now())
+                + HANDOFF_SUPPRESS_MS
+            );
+        }
+        _audioListenerOnChartPause();
+        _audioListenerBroadcasterId = null;
+        _audioListenerBroadcastParams = null;
     }
     if (
         typeof _room.now_playing === 'number'
@@ -1363,12 +1443,41 @@ async function _bootstrapOnConnected() {
         && _room.queue
         && _room.queue[_room.now_playing]
     ) {
-        try {
-            await _loadSong(_room.queue[_room.now_playing]);
-        } catch (e) {
-            // Plugin chain failures shouldn't block the rest of the
-            // recovery — listener pipeline will simply drop frames as
-            // listener_paused until the user reloads.
+        const wantedItem = _room.queue[_room.now_playing];
+        const wantedArr = (_room.players && _room.players[_playerId])
+            ? _room.players[_playerId].arrangement : 'Lead';
+        // Skip the reload if the local <audio> element already has
+        // the right track + arrangement loaded — _loadSong sets
+        // _songLoading = true for ~2 s and both _onHeartbeat and
+        // _audioListenerHandleFrame drop work during that window, so a
+        // transient WS reconnect would otherwise needlessly mute peer
+        // audio + heartbeat corrections. A reload is only needed when
+        // the snapshot's current song or this player's arrangement
+        // differs from what we last loaded.
+        if (
+            wantedItem.filename !== _loadedFilename
+            || wantedArr !== _loadedArrangement
+        ) {
+            let loadFailed = false;
+            try {
+                await _loadSong(wantedItem);
+            } catch (e) {
+                // Fail closed: don't apply chart state or activate the
+                // listener pipeline against whatever stale <audio>
+                // source was previously loaded. The listener will
+                // continue dropping inbound frames as 'listener_paused'
+                // (or 'no_broadcaster', since broadcaster_id is still
+                // null — we cleared it at the top) until the user
+                // intervenes (reload, manual song pick).
+                loadFailed = true;
+            }
+            // A newer connected snapshot or song_changed may have superseded
+            // this bootstrap during the ~2 s _loadSong window. If so, the
+            // newer call has already done (or will do) its own load + state
+            // apply — DON'T touch chart state here against stale _room
+            // values that may still be sitting in scope.
+            if (myGen !== _bootstrapGen) return;
+            if (loadFailed) return;
         }
     }
     // Snapshot may have changed during the await (a 4408 / leave can
@@ -1376,19 +1485,63 @@ async function _bootstrapOnConnected() {
     if (!_room) return;
     if (typeof _room.time === 'number') {
         const audioEl = document.getElementById('audio');
-        if (audioEl && Math.abs((audioEl.currentTime || 0) - _room.time) > 0.5) {
-            _audioListenerOnChartPause();
-            try { audioEl.currentTime = _room.time; } catch (e) { /* */ }
+        if (audioEl) {
+            // Detect whether the snapshot actually requires a state
+            // change to the local <audio>. If everything matches
+            // (transient highway reconnect with no real change),
+            // skip the chartPause so peer-audio scheduling continues
+            // uninterrupted.
+            const drift = Math.abs((audioEl.currentTime || 0) - _room.time);
+            const wantedSpeed = _room.speed || 1.0;
+            const speedDelta = Math.abs((audioEl.playbackRate || 1.0) - wantedSpeed);
+            const wantPaused = _room.state === 'paused' || _room.state === 'stopped';
+            const wantPlaying = _room.state === 'playing';
+            const stateChange = (
+                drift > 0.05
+                || speedDelta > 0.01
+                || (wantPlaying && audioEl.paused)
+                || (wantPaused && !audioEl.paused)
+            );
+            if (stateChange) {
+                // Snapshot-driven state restore is a chart-time-breaking
+                // event from the listener pipeline's perspective: any
+                // sources scheduled before the reconnect were anchored
+                // against the PRE-reconnect chart timeline / speed /
+                // play-pause state. Drop them; new frames will rebuild
+                // a fresh schedule against the synced clock.
+                _audioListenerOnChartPause();
+                // 0.05s threshold (vs the prior 0.5s): _onHeartbeat's
+                // normal drift correction nudges playbackRate by only
+                // ±0.002, which would take many seconds to close a
+                // 50–500 ms post-reconnect drift.
+                if (drift > 0.05) {
+                    try { audioEl.currentTime = _room.time; } catch (e) { /* */ }
+                }
+                if (speedDelta > 0.01) {
+                    audioEl.playbackRate = wantedSpeed;
+                }
+                if (wantPlaying && audioEl.paused) {
+                    _audioListenerMaybeResumeContext();
+                    audioEl.play().catch(() => {});
+                } else if (wantPaused && !audioEl.paused) {
+                    // Both 'paused' (user-pressed pause) and 'stopped'
+                    // (no song loaded / queue finished) imply the
+                    // chart clock should not be running locally.
+                    try { audioEl.pause(); } catch (e) { /* */ }
+                }
+            }
         }
-        if (audioEl && _room.speed) {
-            audioEl.playbackRate = _room.speed;
-        }
-        if (audioEl && _room.state === 'playing' && audioEl.paused) {
-            _audioListenerMaybeResumeContext();
-            audioEl.play().catch(() => {});
-        } else if (audioEl && _room.state === 'paused' && !audioEl.paused) {
-            try { audioEl.pause(); } catch (e) { /* */ }
-        }
+    }
+    // Activate the listener pipeline LAST, against the now-synced
+    // chart clock. Doing this earlier would let frames arriving
+    // during _loadSong / state-apply schedule against the stale
+    // pre-reconnect chart timeline.
+    if (_room.broadcaster_id && _room.broadcaster_id !== _playerId) {
+        _audioListenerOnControlSet(_room.broadcaster_id, _room.broadcast_params || null);
+    } else if (_room.broadcaster_id === _playerId) {
+        _audioListenerOnSelfBroadcast();
+    } else {
+        _audioListenerOnControlClear();
     }
 }
 
@@ -1508,6 +1661,10 @@ function _handleMessage(msg) {
                 // playing on top of the new song; a `playback_state` update
                 // will start the new schedule once the new song is loaded.
                 _audioListenerOnChartPause();
+                // Invalidate any in-flight _bootstrapOnConnected so its
+                // mid-await loadSong-of-the-old-song doesn't proceed to
+                // apply state for the wrong track.
+                _bootstrapGen++;
                 // Host already called _loadSong in mpLoadSong — skip to avoid double-load
                 if (!_isHost && msg.queue_item) _loadSong(msg.queue_item);
             }
@@ -1521,6 +1678,7 @@ function _handleMessage(msg) {
                 _updateNowPlaying();
                 // Chart timeline ended. Same reasoning as song_changed.
                 _audioListenerOnChartPause();
+                _bootstrapGen++;
             }
             break;
 
@@ -1825,6 +1983,10 @@ function mpTogglePlay() {
         // the chart timeline, and the host's own play/pause never goes
         // through _onPlaybackState.
         _audioListenerOnChartPause();
+        // Invalidate any in-flight _bootstrapOnConnected so its mid-
+        // await tail can't re-pause/re-seek us back to the stale
+        // pre-transport snapshot state after we've just acted.
+        _bootstrapGen++;
         _audioListenerMaybeResumeContext();
         audio.play().catch(() => {});
         if (typeof isPlaying !== 'undefined') isPlaying = true;
@@ -1840,6 +2002,7 @@ function mpTogglePlay() {
         _startRecordingNow();
     } else {
         _audioListenerOnChartPause();
+        _bootstrapGen++;
         audio.pause();
         if (typeof isPlaying !== 'undefined') isPlaying = false;
         _ws.send(JSON.stringify({
@@ -1858,8 +2021,11 @@ function mpSeek(delta) {
     const audio = document.getElementById('audio');
     if (!audio || !_ws || !_isHost) return;
     // Hard seek invalidates any peer-audio schedule that was anchored
-    // against the previous chart position.
+    // against the previous chart position. Also bump _bootstrapGen so
+    // an in-flight reconnect bootstrap can't re-seek us back to its
+    // stale snapshot time after this action.
     _audioListenerOnChartPause();
+    _bootstrapGen++;
     audio.currentTime = Math.max(0, audio.currentTime + delta);
     _ws.send(JSON.stringify({
         type: 'seek',
@@ -1872,12 +2038,18 @@ function mpSetSpeed(val) {
     const audio = document.getElementById('audio');
     if (!audio || !_ws || !_isHost) return;
     const speed = parseFloat(val) / 100;
-    // Speed change to non-1.0x invalidates any in-flight peer-audio
-    // schedule (we don't time-stretch in v1; future frames will be
-    // dropped via the listener_speed gate until speed returns to 1.0).
-    if (Math.abs(speed - 1.0) > 0.01) {
-        _audioListenerOnChartPause();
-    }
+    // Any speed change invalidates the peer-audio schedule. We don't
+    // time-stretch in v1, so a non-1.0x setting silences peer audio
+    // (frames dropped via the listener_speed gate). But returning TO
+    // 1.0x also has to flush: sources scheduled at the old non-1.0
+    // chart→AudioContext mapping would otherwise still fire after the
+    // reset. Non-host listeners don't have this gap because their
+    // _onPlaybackState path clears on every echoed set_speed; mirror
+    // that here for the host's local schedule. Also bump
+    // _bootstrapGen so an in-flight reconnect bootstrap can't re-set
+    // playbackRate to its stale snapshot value after this action.
+    _audioListenerOnChartPause();
+    _bootstrapGen++;
     audio.playbackRate = speed;
     _ws.send(JSON.stringify({
         type: 'set_speed',
@@ -1891,7 +2063,65 @@ window.mpSetSpeed = mpSetSpeed;
 // ── Song Loading ───────────────────────────────────────────────────────
 
 async function _loadSong(queueItem) {
+    // Deduplicate concurrent loads. _loadSong has a tail that pauses
+    // non-host audio, so two overlapping invocations can step on each
+    // other: the second's bootstrap resumes playback and then the
+    // first's pause runs after, leaving the guest stuck stopped.
+    // Concurrent calls share the same in-flight promise so callers
+    // see a single completion.
+    //
+    // Loop because two callers waiting on the SAME _loadingPromise
+    // both fall through after it resolves; if the awaited load didn't
+    // produce the file we want, we'd otherwise both kick a new
+    // _doLoadSong (overlapping again). The loop re-checks
+    // _loadingPromise after each wait — the first waiter to fall
+    // through claims the next slot; subsequent waiters await its
+    // promise instead of starting a fresh one.
+    while (_loadingPromise) {
+        const inflight = _loadingPromise;
+        await inflight.catch(() => {});
+        // If the in-flight load already loaded the requested file +
+        // arrangement, don't restart. Reload if either the filename
+        // OR the player's selected arrangement has changed.
+        const wantedArr = (_room && _room.players && _room.players[_playerId])
+            ? _room.players[_playerId].arrangement : 'Lead';
+        if (queueItem
+            && _loadedFilename === queueItem.filename
+            && _loadedArrangement === wantedArr) {
+            return;
+        }
+        // Another caller may have already chained the next load while
+        // we were awaiting — if so, await theirs instead of starting
+        // a fresh overlapping one.
+        if (_loadingPromise && _loadingPromise !== inflight) continue;
+        break;
+    }
+    const myPromise = _doLoadSong(queueItem);
+    _loadingPromise = myPromise;
+    try {
+        await myPromise;
+    } finally {
+        // Only clear the slot if it still points at OUR promise. A
+        // newer caller waiting on us above may have already chained
+        // its own _doLoadSong into _loadingPromise during the await
+        // (the chain pattern in the loop). Clobbering would let yet
+        // another caller think no load is active and start a third
+        // overlapping _doLoadSong, which is the exact race this
+        // helper exists to prevent.
+        if (_loadingPromise === myPromise) {
+            _loadingPromise = null;
+        }
+    }
+}
+
+async function _doLoadSong(queueItem) {
+    const myLoadGen = _loadGen;
     _songLoading = true;
+    // Don't set _loadedFilename yet — _bootstrapOnConnected uses it as
+    // proof that the track is fully ready, not just that loading
+    // started. If playSong throws or the plugin chain aborts mid-setup
+    // we want the next reconnect's bootstrap to retry the load. Set
+    // it only after the awaits below complete successfully.
 
     // Find arrangement index matching this player's chosen arrangement
     const myArrangement = (_room && _room.players[_playerId])
@@ -1911,6 +2141,16 @@ async function _loadSong(queueItem) {
     // Give plugins time to finish async setup (stems, highway _onReady, etc.)
     await new Promise(r => setTimeout(r, 2000));
     _songLoading = false;
+    // Only persist the cache markers if this load is still authoritative.
+    // _cleanup() bumps _loadGen to invalidate stale loads — a load that
+    // started in room A and completed after the user joined room B
+    // would otherwise mark room A's song as "already loaded" in the
+    // cache shared with room B, making a subsequent bootstrap skip a
+    // needed reload.
+    if (_loadGen === myLoadGen) {
+        _loadedFilename = queueItem ? queueItem.filename : null;
+        _loadedArrangement = myArrangement;
+    }
 
     if (!_isHost) {
         const audio = document.getElementById('audio');
@@ -1939,7 +2179,13 @@ window.mpLoadSong = function (index) {
         // mirror its _audioListenerOnChartPause() call here so a
         // host listening to another player's broadcast doesn't keep
         // hearing the previous chart's peer audio over the new song.
+        // Also bump _bootstrapGen so an in-flight reconnect bootstrap
+        // (which can be mid-_loadSong of the OLD now_playing for ~2 s)
+        // doesn't run its post-await tail against the now-stale
+        // snapshot, e.g. by re-pause/seek/listener-set against the
+        // previous song.
         _audioListenerOnChartPause();
+        _bootstrapGen++;
         _loadSong(_room.queue[index]);
     }
 };

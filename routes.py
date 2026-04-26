@@ -743,14 +743,39 @@ async def _purge_audio_for_handoff(room, except_player_id=None):
                 timeout=_PURGE_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
-            # Slow peer's send_bytes is wedged. Force-close the captured
-            # ws WITHOUT waiting for the stuck worker to exit (using
-            # _close_audio_after_worker would just block on the same
-            # stuck send_bytes the cleanup did). Skip if the listener
-            # has since reattached a replacement socket — closing the
-            # replacement would mute their fresh connection.
-            if sess.get("audio_ws") is old_audio_ws:
-                asyncio.create_task(_force_close_stale_audio_ws(old_audio_ws))
+            # Slow peer's send_bytes is wedged. Force-close the
+            # CAPTURED ws WITHOUT waiting for the stuck worker to
+            # exit (using _close_audio_after_worker would just block
+            # on the same stuck send_bytes the cleanup did). The
+            # captured `old_audio_ws` reference is the stuck socket
+            # specifically — even if the listener has since reattached
+            # a replacement (sess["audio_ws"] != old_audio_ws), the
+            # OLD ws still needs to be closed: a same-session
+            # reattach in _take_session_slot already scheduled a
+            # _close_audio_after_worker(old_audio_ws, prev_worker,
+            # 4410) that's blocked on the same stuck send, so the
+            # old ws/worker would be leaked indefinitely. Closing
+            # `old_audio_ws` here unblocks that path. We never
+            # touch sess["audio_ws"] (which may be a fresh
+            # replacement we'd corrupt by closing).
+            asyncio.create_task(_force_close_stale_audio_ws(old_audio_ws))
+            # Also rebuild the queue + worker if the session slot still
+            # owns this ws. _cleanup_audio_worker's cancel-propagation
+            # branch nulled audio_send_queue, so without a fresh
+            # _setup_audio_worker the peer would never receive another
+            # frame even if their socket eventually unblocks (or if
+            # ws.close raced and didn't actually close). The new
+            # worker may also block on send_bytes if the socket really
+            # is dead — that's fine: the peer will time out client-side
+            # and reconnect, at which point _take_session_slot replaces
+            # both ws and worker. Skip when sess has reattached to a
+            # different ws (the new ws already has its own worker via
+            # _take_session_slot).
+            if (
+                sess.get("audio_ws") is old_audio_ws
+                and sess.get("audio_send_queue") is None
+            ):
+                _setup_audio_worker(sess)
             return
         # Re-verify that this session is still the authoritative one
         # for `pid` before restarting. Between cleanup awaits, a
@@ -1930,15 +1955,102 @@ def setup(app, context):
                     # broadcaster frames pile into the OLD listener
                     # workers (then get dropped on cancel), clipping
                     # the start of the new broadcast.
-                    if current != player_id:
-                        await _purge_audio_for_handoff(room, except_player_id=player_id)
-                    room["broadcaster_id"] = player_id
-                    room["broadcast_params"] = params_or_err
-                    await _broadcast(room, {
-                        "type": "broadcaster_changed",
-                        "broadcaster_id": player_id,
-                        **params_or_err,
-                    })
+                    # ORDER MATTERS — codex multi-round:
+                    # 1. Atomically claim the broadcaster slot BEFORE
+                    #    awaiting anything. The check + assignment is
+                    #    synchronous (no await between them), so two
+                    #    concurrent broadcast_start handlers that both
+                    #    saw current == None will resolve here: only
+                    #    one wins; the other's re-check fails and it
+                    #    bails with broadcaster_busy. This prevents the
+                    #    loser from running _purge_audio_for_handoff
+                    #    against the winner's listener workers and
+                    #    clipping the winner's first intervals.
+                    # 2. THEN purge old listener workers (drains
+                    #    leftover queue entries and cancels in-flight
+                    #    sends from the previous broadcaster). Skipped
+                    #    when the same broadcaster is re-issuing
+                    #    broadcast_start (reconnect / param refresh).
+                    # 3. Emit broadcaster_changed so listeners know to
+                    #    treat subsequent /audio frames as belonging
+                    #    to the new broadcaster. PROTOCOL.md requires
+                    #    the broadcaster to wait for this ack before
+                    #    sending frames, so frames the listener
+                    #    receives AFTER this event are guaranteed to
+                    #    come from the new broadcaster.
+                    pre_claim = room.get("broadcaster_id")
+                    if pre_claim is not None and pre_claim != player_id:
+                        # Lost an idle-race (concurrent broadcast_start
+                        # already claimed the slot during our message
+                        # processing).
+                        if ws is not None:
+                            try:
+                                await ws.send_json({
+                                    "type": "error",
+                                    "message": "broadcaster_busy",
+                                })
+                            except Exception:
+                                pass
+                    elif (
+                        pre_claim == player_id
+                        and room.get("broadcast_handoff_in_progress", 0) > 0
+                    ):
+                        # A SAME-player rapid retry of broadcast_start
+                        # (reconnect / param refresh) is still inside
+                        # _purge_audio_for_handoff. Without this guard,
+                        # this re-entrant request would emit
+                        # broadcaster_changed early — letting the
+                        # broadcaster send frames before the original
+                        # handler's purge completes, so the first
+                        # intervals get clipped against the not-yet-
+                        # cancelled stale workers. Drop silently: the
+                        # original broadcast_start will emit the ack
+                        # when its purge finishes.
+                        # Different-player broadcast_starts are NOT
+                        # blocked here — if pre_claim is None (the
+                        # provisional broadcaster left mid-purge), a
+                        # new player's start should still succeed
+                        # rather than be silently discarded.
+                        # Counter-not-bool semantics: overlapping
+                        # purges (A leaves mid-purge, B starts) are
+                        # tracked independently — A's exit decrements
+                        # without zeroing B's counter.
+                        pass
+                    else:
+                        room["broadcaster_id"] = player_id
+                        room["broadcast_params"] = params_or_err
+                        if current != player_id:
+                            # Counter (not boolean) so overlapping
+                            # purges don't clobber each other's
+                            # active state. A's `finally` decrements
+                            # to whatever B's still-running purge
+                            # incremented to; the in-progress check
+                            # reads `> 0` so the flag stays "true"
+                            # until ALL active purges have completed.
+                            room["broadcast_handoff_in_progress"] = (
+                                room.get("broadcast_handoff_in_progress", 0) + 1
+                            )
+                            try:
+                                await _purge_audio_for_handoff(room, except_player_id=player_id)
+                            finally:
+                                room["broadcast_handoff_in_progress"] = (
+                                    room.get("broadcast_handoff_in_progress", 1) - 1
+                                )
+                        # Re-check ownership before announcing. While
+                        # we awaited the purge, any of broadcast_stop /
+                        # leave_room / grace expiry / takeover could
+                        # have cleared broadcaster_id (or set it to a
+                        # different player). Without this, we'd emit
+                        # a stale broadcaster_changed against a slot
+                        # that's no longer ours, telling listeners a
+                        # broadcast is active when the room state
+                        # disagrees.
+                        if room.get("broadcaster_id") == player_id:
+                            await _broadcast(room, {
+                                "type": "broadcaster_changed",
+                                "broadcaster_id": player_id,
+                                **params_or_err,
+                            })
 
         elif msg_type == "broadcast_stop":
             # Only the active broadcaster can stop their own broadcast.
