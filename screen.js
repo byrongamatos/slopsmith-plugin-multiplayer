@@ -359,8 +359,8 @@ function _audioGetRxStats() {
 // listener_speed, song_loading, context_suspended, no_broadcaster,
 // handoff_suppress) are excluded — they don't represent quality
 // problems the broadcaster can do anything about, and bundling them
-// in would systematically overstate issues. `intervals_late` keeps
-// its own counter; we subtract `late` here to avoid double-counting.
+// in would systematically overstate issues. `late` is excluded from
+// the dropped tally and tracked separately in `intervals_late`.
 
 const AUDIO_QUALITY_REPORT_PERIOD_MS = 30000;
 // Drop-reason keys that count as a real decoder/validation failure.
@@ -421,7 +421,6 @@ function _audioQualityDecoderUnderruns() {
 }
 
 function _audioQualitySendReport() {
-    if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
     const broadcasterId = _audioListenerBroadcasterId;
     if (!broadcasterId || broadcasterId === _playerId) {
         // No remote broadcaster — reset snapshot so the next active
@@ -457,8 +456,10 @@ function _audioQualitySendReport() {
     const intervalsLate = cur.late - _audioQualitySnapshot.late;
     const decoderUnderruns = cur.decoderUnderruns - _audioQualitySnapshot.decoderUnderruns;
     // Roll snapshot forward UNCONDITIONALLY before any early return,
-    // so a quiet window doesn't pile up into the next non-empty one.
-    // Spotted by codex review on Phase 2e.
+    // so a quiet window (or a window during a transient WS disconnect)
+    // doesn't pile up into the next non-empty one. The WS send below
+    // is the only thing gated on readyState. Spotted by codex review
+    // on Phase 2e and Copilot review on PR #10.
     _audioQualitySnapshot = cur;
     // Skip the WS send when nothing changed — saves bandwidth without
     // affecting the snapshot rollover.
@@ -468,6 +469,7 @@ function _audioQualitySendReport() {
         && intervalsLate === 0
         && decoderUnderruns === 0
     ) return;
+    if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
     try {
         _ws.send(JSON.stringify({
             type: 'audio_quality',
@@ -522,6 +524,17 @@ function _audioQualityOnTick() {
 const AUDIO_QUALITY_LISTENER_TTL_MS = AUDIO_QUALITY_REPORT_PERIOD_MS * 3;
 const _audioQualityRxByListener = new Map();
 
+// Coerce a peer-supplied counter to a non-negative safe integer.
+// `| 0` would force into a signed 32-bit range so values >2^31-1
+// wrap negative; explicit Number() + clamp keeps both NaN/non-numeric
+// inputs and oversized values from poisoning the aggregator. Spotted
+// by Copilot review on PR #10.
+function _audioQualitySanitizeCount(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.min(Math.floor(n), Number.MAX_SAFE_INTEGER);
+}
+
 function _audioQualityRxOnReport(msg) {
     const fromId = msg.from_player_id;
     if (!fromId) return;
@@ -530,11 +543,11 @@ function _audioQualityRxOnReport(msg) {
     if (msg.broadcaster_id && msg.broadcaster_id !== _playerId) return;
     _audioQualityRxByListener.set(fromId, {
         receivedAt: Date.now(),
-        intervalsReceived: msg.intervals_received | 0,
-        intervalsLate: msg.intervals_late | 0,
-        intervalsDropped: msg.intervals_dropped | 0,
-        decoderUnderruns: msg.decoder_underruns | 0,
-        reportPeriodMs: msg.report_period_ms | 0,
+        intervalsReceived: _audioQualitySanitizeCount(msg.intervals_received),
+        intervalsLate: _audioQualitySanitizeCount(msg.intervals_late),
+        intervalsDropped: _audioQualitySanitizeCount(msg.intervals_dropped),
+        decoderUnderruns: _audioQualitySanitizeCount(msg.decoder_underruns),
+        reportPeriodMs: _audioQualitySanitizeCount(msg.report_period_ms),
     });
     _audioQualityRxRender();
 }
@@ -571,14 +584,21 @@ function _audioQualityRxRender() {
         totalUnderruns += entry.decoderUnderruns;
     }
     const n = _audioQualityRxByListener.size;
-    const issues = totalLate + totalDropped + totalUnderruns;
+    // `decoder_underruns` is a SUBSET of `intervals_dropped` (per
+    // PROTOCOL.md). Show the rest of dropped (non-decoder) and the
+    // decoder count side-by-side so the broadcaster can distinguish
+    // "stream is malformed" from "listener can't keep up", without
+    // double-counting them in the issue total. Spotted by Copilot
+    // review on PR #10.
+    const totalDroppedNonDecoder = Math.max(0, totalDropped - totalUnderruns);
+    const issues = totalLate + totalDropped;
     let txt = `${n} listener${n === 1 ? '' : 's'}`;
     if (issues === 0) {
         txt += ' — no issues';
     } else {
         const parts = [];
         if (totalLate > 0) parts.push(`${totalLate} late`);
-        if (totalDropped > 0) parts.push(`${totalDropped} dropped`);
+        if (totalDroppedNonDecoder > 0) parts.push(`${totalDroppedNonDecoder} dropped`);
         if (totalUnderruns > 0) parts.push(`${totalUnderruns} decoder`);
         txt += ` — ${parts.join(', ')}`;
     }
