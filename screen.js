@@ -1222,13 +1222,20 @@ function _onSessionEnded() {
         }
         _captureChartTimeAtIntervalStart = _captureChartTime();
     }
-    // Bump the capture generation so any in-flight queued flush
-    // tasks from the previous session bail out at their gate
-    // before touching the post-recovery encoder / WS. Deliberately
-    // do NOT reset _captureFlushQueue here — if a flush is mid-
-    // execution it would race with the new chain via the shared
-    // _captureEncoderChunks accumulator. Spotted by codex on PR #8.
-    _captureGen++;
+    // Deliberately do NOT bump _captureGen here. _broadcastStart()
+    // snapshots that generation before its awaits and treats any
+    // mismatch as supersede; bumping it on session reset would
+    // strand a concurrently-running start with _captureCtx
+    // assigned but not fully initialized (the second
+    // cancellation branch only stops the local stream).
+    // Queued flush tasks from the active broadcast carry pre-
+    // recovery chart times — they'll be marked late and dropped
+    // by the listener-side drift guard, which is acceptable for
+    // v1. Deliberately also do NOT reset _captureFlushQueue
+    // here — if a flush is mid-execution it would race with the
+    // new chain via the shared _captureEncoderChunks accumulator.
+    // Spotted by codex on PR #8 (queue) and Copilot review on
+    // PR #9 round 6 (gen).
     // Deliberately do NOT force _lastBootstrapSucceeded = false on
     // session reset. If the previous (pre-4408) bootstrap was
     // successful and a non-bootstrap path (host transport, song
