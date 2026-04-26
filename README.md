@@ -30,7 +30,7 @@ A [Slopsmith](https://github.com/byrongamatos/slopsmith) plugin that lets multip
 
 ### Live Audio (Peer Broadcast)
 
-Hear another player's instrument **while playing the same chart**, locked to the chart's beat grid. Open the multiplayer panel, pick your loopback input from the device dropdown, flip on **Broadcast my sound**, and every other player in the room will hear your sound through their browser one measure later.
+Hear another player's instrument **while playing the same chart**, locked to the chart's beat grid. Open the multiplayer panel, pick your loopback input from the device dropdown, flip on **Broadcast my sound**, and every other player in the room will hear your sound through their browser one interval later (typically one measure; very fast or very slow tempos use 8 or 2 beats per interval).
 
 #### How it sounds — the honest description
 

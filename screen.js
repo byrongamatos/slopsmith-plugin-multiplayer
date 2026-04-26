@@ -388,6 +388,7 @@ const AUDIO_QUALITY_REAL_DROP_REASONS = new Set([
     'decoded_overflow',
     'decoded_copy_failed',
     'opus_unsupported',
+    'decoder_unavailable',
     'webcodecs_unavailable',
     'opus_payload_too_small',
     'opus_packet_count_invalid',
@@ -445,11 +446,29 @@ function _audioQualitySendReport() {
         decoderUnderruns: _audioQualityDecoderUnderruns(),
         broadcasterId: broadcasterId,
     };
-    // If broadcaster changed since our last snapshot, reset baseline
-    // so deltas measure THIS broadcast only — no report this tick.
+    // Two transition cases when the snapshot's broadcasterId differs:
+    //   null → broadcasterId: first time we've bound to ANY broadcaster
+    //     since the snapshot reset. The cumulative counters were zero
+    //     at bind time, so we can baseline at zero and the first
+    //     report (this tick or next) will cover everything since the
+    //     bind — no lost first window. Spotted by Copilot review on
+    //     PR #10 round 2.
+    //   A → B: a direct switch to a different broadcaster. The
+    //     cumulative counters carry frames from the previous broadcast
+    //     that we don't want to attribute to B, so reseed at `cur`
+    //     and skip this tick.
     if (_audioQualitySnapshot.broadcasterId !== broadcasterId) {
-        _audioQualitySnapshot = cur;
-        return;
+        if (_audioQualitySnapshot.broadcasterId !== null) {
+            _audioQualitySnapshot = cur;
+            return;
+        }
+        _audioQualitySnapshot = {
+            scheduled: 0,
+            dropped: 0,
+            late: 0,
+            decoderUnderruns: 0,
+            broadcasterId: broadcasterId,
+        };
     }
     const intervalsReceived = cur.scheduled - _audioQualitySnapshot.scheduled;
     const intervalsDropped = cur.dropped - _audioQualitySnapshot.dropped;
@@ -2254,7 +2273,7 @@ function _captureBeatsSnapshot() {
     } catch (_e) { return null; }
 }
 
-function _captureTempoChangesAtBoundary(boundaryTime) {
+function _captureTempoChangeAtBoundary(boundaryTime) {
     const beats = _captureBeatsSnapshot();
     if (!beats || beats.length < 4) return false;
     // Find the index of the first beat at or after the boundary.
@@ -2543,7 +2562,7 @@ async function _captureFlushAndSendInterval(pcm, numFrames, chartTimeStart, char
     // arrives (which is exactly when the misalignment will be most
     // audible). v1 doesn't time-stretch around the boundary — the
     // flag is purely informational.
-    const tempoChange = _captureTempoChangesAtBoundary(chartTimeEnd);
+    const tempoChange = _captureTempoChangeAtBoundary(chartTimeEnd);
     if (tempoChange) _captureNotifyTempoChangeUi();
 
     let frame;
