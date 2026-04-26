@@ -420,10 +420,21 @@ function _audioListenerHandleDecodedAudio(audioData, wrapper) {
             return;
         }
 
-        const buffer = ctx.createBuffer(channels, numFrames, audioData.sampleRate || SMAU_V1_SAMPLE_RATE);
-        for (let ch = 0; ch < channels; ch++) {
-            const out = buffer.getChannelData(ch);
-            audioData.copyTo(out, { planeIndex: ch, format: 'f32-planar' });
+        // copyTo() can throw on unsupported conversion formats / internal
+        // decoder quirks. Catch in-place so the exception doesn't bubble
+        // out of this output callback as an unhandled error and
+        // destabilize the decode pipeline. The outer finally still
+        // closes the AudioData. Spotted by Copilot review on PR #7.
+        let buffer;
+        try {
+            buffer = ctx.createBuffer(channels, numFrames, audioData.sampleRate || SMAU_V1_SAMPLE_RATE);
+            for (let ch = 0; ch < channels; ch++) {
+                const out = buffer.getChannelData(ch);
+                audioData.copyTo(out, { planeIndex: ch, format: 'f32-planar' });
+            }
+        } catch (_err) {
+            _audioRxRecordDrop('decoded_copy_failed');
+            return;
         }
 
         const audio = document.getElementById('audio');
@@ -450,6 +461,10 @@ function _audioListenerHandleDecodedAudio(audioData, wrapper) {
         const deltaSec = targetChart - chartNow;
         if (deltaSec < -LATE_FRAME_GRACE_SEC) {
             _audioRxFramesLate++;
+            // Also account in the unified drop-reason map so
+            // getAudioRxStats() reports late frames consistently with
+            // other drop reasons. Spotted by Copilot review on PR #7.
+            _audioRxRecordDrop('late');
             return;
         }
 
@@ -2117,12 +2132,6 @@ async function _loadSong(queueItem) {
 async function _doLoadSong(queueItem) {
     const myLoadGen = _loadGen;
     _songLoading = true;
-    // Don't set _loadedFilename yet — _bootstrapOnConnected uses it as
-    // proof that the track is fully ready, not just that loading
-    // started. If playSong throws or the plugin chain aborts mid-setup
-    // we want the next reconnect's bootstrap to retry the load. Set
-    // it only after the awaits below complete successfully.
-
     // Find arrangement index matching this player's chosen arrangement
     const myArrangement = (_room && _room.players[_playerId])
         ? _room.players[_playerId].arrangement : 'Lead';
@@ -2133,23 +2142,35 @@ async function _doLoadSong(queueItem) {
     );
     if (idx >= 0) arrIndex = idx;
 
-    // Call global playSong (await to let the full plugin chain set up)
-    if (typeof playSong === 'function') {
-        await playSong(queueItem.filename, arrIndex);
-    }
-
-    // Give plugins time to finish async setup (stems, highway _onReady, etc.)
-    await new Promise(r => setTimeout(r, 2000));
-    _songLoading = false;
-    // Only persist the cache markers if this load is still authoritative.
-    // _cleanup() bumps _loadGen to invalidate stale loads — a load that
-    // started in room A and completed after the user joined room B
-    // would otherwise mark room A's song as "already loaded" in the
-    // cache shared with room B, making a subsequent bootstrap skip a
-    // needed reload.
-    if (_loadGen === myLoadGen) {
-        _loadedFilename = queueItem ? queueItem.filename : null;
-        _loadedArrangement = myArrangement;
+    let succeeded = false;
+    try {
+        // Call global playSong (await to let the full plugin chain set up)
+        if (typeof playSong === 'function') {
+            await playSong(queueItem.filename, arrIndex);
+        }
+        // Give plugins time to finish async setup (stems, highway _onReady, etc.)
+        await new Promise(r => setTimeout(r, 2000));
+        succeeded = true;
+    } finally {
+        // Always clear _songLoading so heartbeats and the listener
+        // pipeline stop dropping under 'song_loading' even if playSong
+        // or the plugin chain throws — otherwise a single failed load
+        // would gate them for the rest of the session.
+        _songLoading = false;
+        // Only persist the cache markers on a SUCCESSFUL load that's
+        // still authoritative. Two reasons:
+        //   1. If the load throws, _bootstrapOnConnected uses the
+        //      markers as proof of readiness; we want a retry on the
+        //      next reconnect.
+        //   2. _cleanup() bumps _loadGen to invalidate stale loads —
+        //      a load that started in room A and completed after the
+        //      user joined room B would otherwise mark room A's song
+        //      as "already loaded", making a subsequent bootstrap
+        //      skip a needed reload.
+        if (succeeded && _loadGen === myLoadGen) {
+            _loadedFilename = queueItem ? queueItem.filename : null;
+            _loadedArrangement = myArrangement;
+        }
     }
 
     if (!_isHost) {

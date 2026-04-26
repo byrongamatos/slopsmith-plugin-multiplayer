@@ -759,23 +759,19 @@ async def _purge_audio_for_handoff(room, except_player_id=None):
             # touch sess["audio_ws"] (which may be a fresh
             # replacement we'd corrupt by closing).
             asyncio.create_task(_force_close_stale_audio_ws(old_audio_ws))
-            # Also rebuild the queue + worker if the session slot still
-            # owns this ws. _cleanup_audio_worker's cancel-propagation
-            # branch nulled audio_send_queue, so without a fresh
-            # _setup_audio_worker the peer would never receive another
-            # frame even if their socket eventually unblocks (or if
-            # ws.close raced and didn't actually close). The new
-            # worker may also block on send_bytes if the socket really
-            # is dead — that's fine: the peer will time out client-side
-            # and reconnect, at which point _take_session_slot replaces
-            # both ws and worker. Skip when sess has reattached to a
-            # different ws (the new ws already has its own worker via
-            # _take_session_slot).
-            if (
-                sess.get("audio_ws") is old_audio_ws
-                and sess.get("audio_send_queue") is None
-            ):
-                _setup_audio_worker(sess)
+            # If this session slot still points at the stale ws, detach
+            # it instead of spawning a replacement worker on the same
+            # socket. wait_for() only cancelled cleanup; it did NOT
+            # prove the old worker exited (send_bytes is the thing
+            # blocking it). Restarting here could create two concurrent
+            # senders on one WebSocket — an ASGI single-sender
+            # violation. With audio_ws cleared the fan-out skips this
+            # peer cleanly; the peer recovers via reconnect (the
+            # _force_close_stale_audio_ws task will deliver the close
+            # event whenever the stuck send finally yields). Spotted
+            # by Copilot review on PR #7.
+            if sess.get("audio_ws") is old_audio_ws:
+                sess["audio_ws"] = None
             return
         # Re-verify that this session is still the authoritative one
         # for `pid` before restarting. Between cleanup awaits, a
