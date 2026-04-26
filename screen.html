@@ -145,6 +145,37 @@
                     <div id="mp-player-list" class="space-y-2"></div>
                 </div>
 
+                <!-- Live audio (Phase 2d) -->
+                <div class="bg-dark-700/50 rounded-xl p-5 border border-gray-800/50">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-white font-semibold text-sm">Live audio</h3>
+                        <span id="mp-broadcast-pill" class="hidden text-xs px-2 py-0.5 rounded-full bg-red-900/40 border border-red-700/50 text-red-300"></span>
+                    </div>
+                    <p class="text-xs text-gray-500 mb-3">
+                        Broadcast your guitar to peers. Route your amp/effects chain into a loopback input
+                        (VB-Audio Cable, BlackHole, PipeWire), pick it below, then enable broadcast.
+                    </p>
+                    <div class="flex items-center gap-3 mb-3">
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" id="mp-broadcast-toggle" class="sr-only peer" onchange="mpToggleBroadcast()">
+                            <div class="w-9 h-5 bg-dark-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-gray-400 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-red-600 peer-checked:after:bg-white"></div>
+                        </label>
+                        <span class="text-sm text-gray-300">Broadcast my sound</span>
+                    </div>
+                    <div class="flex items-center gap-2 mb-2">
+                        <select id="mp-broadcast-device"
+                            class="flex-1 bg-dark-800 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-white focus:outline-none focus:border-accent/50">
+                            <option value="">Default device</option>
+                        </select>
+                        <button onclick="mpRefreshBroadcastDevices()"
+                            class="px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition flex-shrink-0"
+                            title="Refresh device list">↻</button>
+                    </div>
+                    <div class="bg-dark-800 rounded h-1.5 overflow-hidden">
+                        <div id="mp-broadcast-level-fill" class="h-full bg-accent transition-[width] duration-75" style="width:0%"></div>
+                    </div>
+                </div>
+
                 <!-- Recording (host only) -->
                 <div id="mp-recording-section" class="hidden bg-dark-700/50 rounded-xl p-5 border border-gray-800/50">
                     <h3 class="text-white font-semibold text-sm mb-3">Recording</h3>
