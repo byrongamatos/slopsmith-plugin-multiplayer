@@ -59,27 +59,34 @@ class CaptureProcessor extends AudioWorkletProcessor {
         if (numChannels === 1) {
             src = input[0];
         } else {
-            // Count valid channels (non-null, matching length) so the
-            // average normalizes by what we actually summed. Without
-            // this, missing channels would attenuate the mix.
-            let validChannels = 0;
+            // Build a list of valid channels ONCE per process() call
+            // instead of re-checking validity in the per-sample inner
+            // loop. process() runs every render quantum on the realtime
+            // audio thread, so reducing that loop's work matters. If
+            // exactly one channel is valid, fall back to the zero-copy
+            // path (saves the scratch buffer + sum/divide work).
+            const validChannelsArr = [];
             for (let c = 0; c < numChannels; c++) {
                 const ch = input[c];
-                if (ch && ch.length === numSamples) validChannels++;
+                if (ch && ch.length === numSamples) validChannelsArr.push(ch);
             }
-            if (validChannels === 0) return true;
-            if (!this._mixScratch || this._mixScratch.length !== numSamples) {
-                this._mixScratch = new Float32Array(numSamples);
-            }
-            src = this._mixScratch;
-            const inv = 1 / validChannels;
-            for (let s = 0; s < numSamples; s++) {
-                let sum = 0;
-                for (let c = 0; c < numChannels; c++) {
-                    const ch = input[c];
-                    if (ch && ch.length === numSamples) sum += ch[s];
+            if (validChannelsArr.length === 0) return true;
+            if (validChannelsArr.length === 1) {
+                src = validChannelsArr[0];
+            } else {
+                if (!this._mixScratch || this._mixScratch.length !== numSamples) {
+                    this._mixScratch = new Float32Array(numSamples);
                 }
-                src[s] = sum * inv;
+                src = this._mixScratch;
+                const inv = 1 / validChannelsArr.length;
+                const nValid = validChannelsArr.length;
+                for (let s = 0; s < numSamples; s++) {
+                    let sum = 0;
+                    for (let c = 0; c < nValid; c++) {
+                        sum += validChannelsArr[c][s];
+                    }
+                    src[s] = sum * inv;
+                }
             }
         }
         let srcPos = 0;

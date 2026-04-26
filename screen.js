@@ -75,6 +75,15 @@ let _loadGen = 0;
 // while a newer is still in-flight, the counter only hits 0 when
 // the LAST bootstrap finishes.
 let _bootstrapInFlight = 0;
+// Set true by _onSessionEnded when capture is up — the server
+// has cleared our broadcaster_id slot during 4408 recovery and we
+// need to re-claim it. _maybeReissueBroadcastAfterRecovery only
+// fires the actual re-send when this is true, so resends DON'T
+// happen for unrelated paths (e.g. user toggling broadcast on
+// during the initial connected bootstrap, where the standard
+// _broadcastStart path already sends broadcast_start). Cleared
+// after a successful re-send. Spotted by Copilot review on PR #9.
+let _captureNeedsReissueAfterReset = false;
 // Result of the most recently COMPLETED bootstrap (only written
 // when _bootstrapInFlight returns to 0 AND the inner returned a
 // definitive true/false — supersede returns null and preserves
@@ -1186,6 +1195,14 @@ function _onSessionEnded() {
     // reconnect doesn't require the user to manually toggle off /
     // on. Spotted by codex review on PR #8.
     _captureBroadcasterAcked = false;
+    // Mark that we owe a broadcast_start re-issue to the server.
+    // Only set when capture was actually up (otherwise there's
+    // nothing to re-claim). Cleared after _maybeReissueBroadcastAfterRecovery
+    // successfully fires, or in _broadcastStop when capture is
+    // torn down explicitly.
+    if (_captureCtx && _captureRequested) {
+        _captureNeedsReissueAfterReset = true;
+    }
     // Reset the in-flight interval state so the resumed broadcast
     // doesn't send a frame containing pre-reconnect PCM stamped
     // with stale chart_time. _captureChartTimeAtIntervalStart
@@ -1393,6 +1410,12 @@ function _cleanup() {
     // the captured value is stale.
     _bootstrapGen++;
     _loadGen++;
+    // Reset bootstrap-recovery state so a failed bootstrap in room A
+    // can't block automatic broadcast recovery in room B. Spotted
+    // by Copilot review on PR #9.
+    _bootstrapInFlight = 0;
+    _lastBootstrapSucceeded = true;
+    _captureNeedsReissueAfterReset = false;
     sessionStorage.removeItem('mp_room');
     sessionStorage.removeItem('mp_player');
     sessionStorage.removeItem(SESSION_STORAGE_KEY);
@@ -1762,24 +1785,31 @@ class CaptureProcessor extends AudioWorkletProcessor {
         if (numChannels === 1) {
             src = input[0];
         } else {
-            let validChannels = 0;
+            // Precompute valid channels list to avoid per-sample
+            // validity checks on the realtime thread. See worklet
+            // source-of-truth file for full rationale.
+            const validChannelsArr = [];
             for (let c = 0; c < numChannels; c++) {
                 const ch = input[c];
-                if (ch && ch.length === numSamples) validChannels++;
+                if (ch && ch.length === numSamples) validChannelsArr.push(ch);
             }
-            if (validChannels === 0) return true;
-            if (!this._mixScratch || this._mixScratch.length !== numSamples) {
-                this._mixScratch = new Float32Array(numSamples);
-            }
-            src = this._mixScratch;
-            const inv = 1 / validChannels;
-            for (let s = 0; s < numSamples; s++) {
-                let sum = 0;
-                for (let c = 0; c < numChannels; c++) {
-                    const ch = input[c];
-                    if (ch && ch.length === numSamples) sum += ch[s];
+            if (validChannelsArr.length === 0) return true;
+            if (validChannelsArr.length === 1) {
+                src = validChannelsArr[0];
+            } else {
+                if (!this._mixScratch || this._mixScratch.length !== numSamples) {
+                    this._mixScratch = new Float32Array(numSamples);
                 }
-                src[s] = sum * inv;
+                src = this._mixScratch;
+                const inv = 1 / validChannelsArr.length;
+                const nValid = validChannelsArr.length;
+                for (let s = 0; s < numSamples; s++) {
+                    let sum = 0;
+                    for (let c = 0; c < nValid; c++) {
+                        sum += validChannelsArr[c][s];
+                    }
+                    src[s] = sum * inv;
+                }
             }
         }
         let srcPos = 0;
@@ -2457,6 +2487,7 @@ function _broadcastStop(opts) {
     const wasRequested = _captureRequested;
     _captureRequested = false;
     _captureBroadcasterAcked = false;
+    _captureNeedsReissueAfterReset = false;
     // Bump the generation token so any queued flush tasks from this
     // session bail out at their gate before touching the next
     // session's encoder / WS. Reset the queue too — no point keeping
@@ -2868,6 +2899,13 @@ async function _bootstrapOnConnectedInner(myGen) {
 // after the highway one if audio reconnects last). Spotted by
 // codex review on PR #8.
 function _maybeReissueBroadcastAfterRecovery() {
+    // Only fires after a 4408 reset that left an active broadcast
+    // owing the server a re-issue. Without this explicit flag, the
+    // helper would also fire when the user toggles broadcast on
+    // during the initial connected bootstrap — duplicate
+    // broadcast_start traffic and harder-to-reason behavior.
+    // Spotted by Copilot review on PR #9.
+    if (!_captureNeedsReissueAfterReset) return;
     if (
         !_captureRequested
         || !_captureCtx
@@ -2910,6 +2948,12 @@ function _maybeReissueBroadcastAfterRecovery() {
             codec: 'opus',
             bitrate: 96000,
         }));
+        // Clear the flag so subsequent calls (from the OTHER
+        // gating path that didn't fire first) don't re-send.
+        // The server's broadcaster_changed ack will flip
+        // _captureBroadcasterAcked which is the longer-term
+        // guard.
+        _captureNeedsReissueAfterReset = false;
     } catch (_err) {
         // WS could close between the readyState check and send;
         // tear down the capture rather than leaving the encoder
