@@ -677,7 +677,17 @@ function _audioListenerHandleFrame(header, opus) {
         return;
     }
     const wrapper = _audioListenerEnsureDecoder();
-    if (!wrapper) return;
+    if (!wrapper) {
+        // Account the drop with a specific reason rather than failing
+        // silently — distinguishes "this browser can't decode Opus
+        // (sticky)" from "transient configure failure that may retry
+        // next frame", which matters when triaging dropped-frame
+        // reports. Spotted by Copilot review on PR #7 round 5.
+        _audioRxRecordDrop(
+            _audioListenerOpusUnsupported ? 'opus_unsupported' : 'decoder_unavailable'
+        );
+        return;
+    }
 
     const ts = wrapper.nextTs++;
     wrapper.pending.set(ts, {
