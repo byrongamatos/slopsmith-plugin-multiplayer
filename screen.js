@@ -504,6 +504,18 @@ function _audioListenerHandleDecodedAudio(audioData, wrapper) {
             acc.finalized = true;
             return;
         }
+        // Sample rate is also bounded: the AudioBuffer we build below
+        // hard-codes SMAU_V1_SAMPLE_RATE, so any mismatch from the
+        // decoder (in principle should never happen — we configure
+        // the decoder for 48k — but a future codec/config or a
+        // patched browser could disagree) would play at the wrong
+        // pitch. Spotted by Copilot review on PR #8 round 8.
+        const dataSampleRate = audioData.sampleRate || SMAU_V1_SAMPLE_RATE;
+        if (dataSampleRate !== SMAU_V1_SAMPLE_RATE) {
+            _audioRxRecordDrop('decoded_sample_rate_mismatch');
+            acc.finalized = true;
+            return;
+        }
 
         // Lazy-build the per-interval PCM buffer on the first packet
         // that contributes samples. Bound it against the validated
@@ -1900,16 +1912,48 @@ function _captureFlushAndSendIntervalQueued() {
     const numFrames = _captureIntervalSampleCount;
     const pcm = _captureIntervalBuffer.slice(0, numFrames);
     const chartTimeStart = _captureChartTimeAtIntervalStart;
+    const chartTimeNow = _captureChartTime();
     const chartTimeEnd = chartTimeStart + (numFrames / SMAU_V1_SAMPLE_RATE);
     const intervalIndex = _captureIntervalIndex;
     const gen = _captureGen;
 
-    // Roll the interval pointer NOW so subsequent PCM chunks belong
-    // to interval N+1.
-    _captureIntervalIndex = _captureIntervalIndex + 1n;
+    // Roll the interval pointer + buffer NOW so subsequent PCM
+    // chunks belong to interval N+1.
     _captureIntervalSampleCount = 0;
     _captureIntervalBuffer = new Float32Array(_captureIntervalSamplesTarget + CAPTURE_PCM_CHUNK_SAMPLES);
-    _captureChartTimeAtIntervalStart = chartTimeEnd;
+
+    // Re-anchor _captureChartTimeAtIntervalStart to the current
+    // chart clock for the NEXT interval, instead of just continuing
+    // the chartTimeEnd of THIS interval. The previous "compute end
+    // from start + sample count" approach would drift indefinitely
+    // when chart time differs from real time (chart paused, host
+    // seeked, host adjusted speed). Re-anchoring per interval
+    // bounds the drift to one interval at most. Spotted by Copilot
+    // review on PR #8 round 8.
+    _captureChartTimeAtIntervalStart = chartTimeNow;
+
+    // Skip the send if chart isn't currently advancing or if our
+    // computed chartTimeEnd has drifted significantly past the
+    // actual chart clock — sending in those cases would emit
+    // SMAU frames whose chart-time metadata listeners can't
+    // schedule correctly. The drop is silent (the next interval
+    // will re-anchor and resume sending). NOTE: this check uses
+    // the synchronously-known audio.paused state at boundary
+    // time; rapid pause/play during the interval might still
+    // produce one slightly-off interval, which is the v1 design
+    // accepted in PROTOCOL.md "tempo / pause boundary cases".
+    const audio = document.getElementById('audio');
+    const chartPlaying = audio && !audio.paused;
+    const driftAhead = chartTimeEnd - chartTimeNow;
+    if (!chartPlaying || driftAhead > 0.5) {
+        // Drop this interval. Bump the interval index so listeners
+        // never see a duplicate interval_index (in case some
+        // intervals were sent for this generation already).
+        _captureIntervalIndex = _captureIntervalIndex + 1n;
+        return;
+    }
+
+    _captureIntervalIndex = _captureIntervalIndex + 1n;
 
     _captureFlushQueue = _captureFlushQueue.then(() => {
         // Generation gate: a stop+start cycle bumps _captureGen, so a
