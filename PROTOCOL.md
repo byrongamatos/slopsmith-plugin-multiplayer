@@ -236,7 +236,7 @@ All multi-byte integers are little-endian. Receivers MUST decode each packet ind
 **Receiver validation of records.** Receivers MUST drop the entire SMAU frame when:
 
 - `opus_size < 4` (no room for the packet count prefix);
-- `packet_count == 0` or `packet_count > 1024` (a 32 s interval at the spec's 2.5 ms minimum Opus frame would still be ≤ 12,800 packets, so 1024 is a generous defensive ceiling that comfortably covers the v1 interval bands);
+- `packet_count == 0` or `packet_count > 4096` (a 32 s interval at typical 20 ms Opus packetization is ~1,600 packets; even 32 s at 5 ms packetization is ~6,400 — but Opus emits 5 ms frames only when explicitly configured, and v1 broadcasters use the default 20 ms. 4096 is a defensive ceiling that comfortably covers v1 interval bands without conflicting with `MAX_INTERVAL_SEC`);
 - any `packet_size == 0` or `packet_size > 8192` (the spec's typical Opus packet is well under 1.5 KB; 8 KB is a defensive ceiling against adversarial inputs);
 - the record sequence runs past `40 + opus_size` (truncation).
 

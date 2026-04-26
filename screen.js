@@ -843,11 +843,12 @@ function _audioListenerHandleFrame(header, opus) {
     }
     const opusView = new DataView(opus.buffer, opus.byteOffset, opus.byteLength);
     const packetCount = opusView.getUint32(0, true);
-    if (packetCount === 0 || packetCount > 1024) {
-        // Hard cap: a 32 s interval at the spec's 2.5 ms minimum Opus
-        // packet duration is 12,800 packets — way more than any sane
-        // configuration. 1024 is a defensive ceiling that comfortably
-        // covers all v1 broadcasts (≤ 8 s × 100 packets/s = 800).
+    if (packetCount === 0 || packetCount > 4096) {
+        // Hard cap. v1 broadcasters use Opus's default 20 ms frames
+        // and don't configure shorter ones; 4096 covers every
+        // legitimate interval up to MAX_INTERVAL_SEC = 32 even if a
+        // sender used 8 ms frames. Spotted by Copilot review on PR
+        // #8 round 2.
         _audioRxRecordDrop('opus_packet_count_invalid');
         return;
     }
@@ -872,6 +873,14 @@ function _audioListenerHandleFrame(header, opus) {
         // takes ownership).
         packets.push(new Uint8Array(opus.buffer, opus.byteOffset + parseOff, pktLen));
         parseOff += pktLen;
+    }
+    if (parseOff !== opus.byteLength) {
+        // Trailing bytes after the last record indicate a malformed
+        // frame — drop with a distinct reason instead of silently
+        // accepting partial-interval decode. Spotted by Copilot
+        // review on PR #8 round 2.
+        _audioRxRecordDrop('opus_trailing_bytes');
+        return;
     }
 
     // Shared accumulator across all packets in this interval. Each
@@ -1771,7 +1780,16 @@ function _captureCurrentChartBpm() {
 }
 
 function _captureSetIntervalParams(bpm) {
-    const safeBpm = (bpm && Number.isFinite(bpm) && bpm > 0) ? bpm : 120;
+    let safeBpm = (bpm && Number.isFinite(bpm) && bpm > 0) ? bpm : 120;
+    // Clamp to a minimum so very slow tempos don't blow past the
+    // listener's defensive packet_count cap (4096). 30 BPM × 4
+    // beats = 8 s interval ≈ 400 packets at 20 ms — well within
+    // the cap. Lower than 30 BPM is rare in practice and clamping
+    // up means the broadcaster's interval boundaries don't align
+    // perfectly with their chart's beat grid, but Phase 2d's
+    // initial-BPM-only design already accepts that for tempo-
+    // change cases. Spotted by Copilot review on PR #8 round 2.
+    if (safeBpm < 30) safeBpm = 30;
     _captureIntervalBeats = _selectIntervalBeats(safeBpm);
     _captureIntervalLengthSec = (60 / safeBpm) * _captureIntervalBeats;
     _captureIntervalSamplesTarget = Math.round(_captureIntervalLengthSec * SMAU_V1_SAMPLE_RATE);
@@ -1991,21 +2009,35 @@ async function _captureFlushAndSendInterval(pcm, numFrames, chartTimeStart, char
 }
 
 function _captureOnPcmChunk(chunk) {
-    if (!_captureIntervalBuffer) return;
-    const need = _captureIntervalSamplesTarget - _captureIntervalSampleCount;
-    const writable = Math.min(chunk.length, _captureIntervalBuffer.length - _captureIntervalSampleCount);
-    if (writable <= 0) return;
-    _captureIntervalBuffer.set(chunk.subarray(0, writable), _captureIntervalSampleCount);
-    _captureIntervalSampleCount += writable;
-    if (_captureIntervalSampleCount >= _captureIntervalSamplesTarget) {
-        // Boundary crossed. Trim any overflow back to the exact target
-        // so chart_time math stays anchored to a consistent interval
-        // duration. v1 accepts the discarded slack samples (up to one
-        // chunk = ~10 ms) — carrying them forward into the next
-        // interval would drift the chart_time→sample mapping over
-        // time. Spotted by Copilot review on PR #8 round 1.
-        _captureIntervalSampleCount = _captureIntervalSamplesTarget;
-        _captureFlushAndSendIntervalQueued();
+    // Loop because a single PCM chunk (10 ms = 480 samples) can
+    // straddle an interval boundary: write the prefix into the
+    // current interval, fire its flush, then write the remainder
+    // into the freshly-allocated next-interval buffer. Without this
+    // split-and-carry, the post-boundary tail would either be
+    // dropped (drift vs chart_time over long sessions) or merged
+    // into the wrong interval. Spotted by Copilot review on PR #8
+    // round 2.
+    let offset = 0;
+    while (offset < chunk.length && _captureIntervalBuffer) {
+        const need = _captureIntervalSamplesTarget - _captureIntervalSampleCount;
+        const capacity = _captureIntervalBuffer.length - _captureIntervalSampleCount;
+        const writable = Math.min(need, capacity, chunk.length - offset);
+        if (writable <= 0) return;
+        _captureIntervalBuffer.set(
+            chunk.subarray(offset, offset + writable),
+            _captureIntervalSampleCount
+        );
+        _captureIntervalSampleCount += writable;
+        offset += writable;
+        if (_captureIntervalSampleCount === _captureIntervalSamplesTarget) {
+            // Boundary crossed — fire the flush. _captureFlushAndSendIntervalQueued
+            // synchronously snapshots interval state and rolls
+            // _captureIntervalBuffer / _captureIntervalSampleCount /
+            // _captureChartTimeAtIntervalStart over to the next
+            // interval, so the loop continues writing into the
+            // FRESH buffer.
+            _captureFlushAndSendIntervalQueued();
+        }
     }
 }
 
@@ -2044,6 +2076,14 @@ async function _broadcastStart(deviceId) {
         _showError('Microphone access denied or unavailable: ' + (e && e.message || e));
         return;
     }
+    // Cancellation check: the user may have toggled broadcast off
+    // while the permission prompt was open. Stop the just-acquired
+    // tracks and bail without bringing up the rest of the pipeline.
+    // Spotted by Copilot review on PR #8 round 2.
+    if (!_captureRequested) {
+        try { stream.getTracks().forEach((t) => t.stop()); } catch (_) { /* */ }
+        return;
+    }
     _captureStream = stream;
 
     const Ctor = window.AudioContext || window.webkitAudioContext;
@@ -2068,6 +2108,12 @@ async function _broadcastStart(deviceId) {
         return;
     }
     URL.revokeObjectURL(url);
+    // Second cancellation check — addModule is async, and the user
+    // may have toggled off during it.
+    if (!_captureRequested) {
+        _broadcastStop({ silent: true });
+        return;
+    }
 
     _captureSourceNode = _captureCtx.createMediaStreamSource(stream);
     _captureAnalyser = _captureCtx.createAnalyser();
@@ -2166,7 +2212,16 @@ function _broadcastStop(opts) {
         _captureStream = null;
     }
     if (_captureCtx) {
-        try { _captureCtx.close(); } catch (_) { /* */ }
+        // AudioContext.close() returns a Promise — async rejections
+        // would otherwise surface as unhandled-rejection warnings
+        // during teardown races. Match the resume() handling.
+        // Spotted by Copilot review on PR #8 round 2.
+        try {
+            const closePromise = _captureCtx.close();
+            if (closePromise && typeof closePromise.catch === 'function') {
+                closePromise.catch(() => {});
+            }
+        } catch (_) { /* */ }
         _captureCtx = null;
     }
     _captureIntervalBuffer = null;
@@ -2659,6 +2714,26 @@ function _handleMessage(msg) {
 
         case 'error':
             console.error('[MP] Server error:', msg.message);
+            // Capture-side rejection of broadcast_start: if the user
+            // toggled broadcast on but the server refused (another
+            // broadcaster is active, or our /audio WS isn't attached),
+            // tear our local capture pipeline down and surface a
+            // user-facing message. Without this the pill sits at
+            // "Connecting…" forever and the encoder keeps producing
+            // intervals that frame-send drops on the broadcaster_acked
+            // gate. Spotted by Copilot review (suppressed) on PR #8
+            // round 2.
+            if (
+                (_captureRequested || _captureCtx)
+                && (msg.message === 'broadcaster_busy' || msg.message === 'audio_ws_not_open')
+            ) {
+                _broadcastStop({ silent: true });
+                _showError(
+                    msg.message === 'broadcaster_busy'
+                        ? 'Another player is already broadcasting.'
+                        : 'Audio connection not ready. Please try again.'
+                );
+            }
             break;
     }
 }
