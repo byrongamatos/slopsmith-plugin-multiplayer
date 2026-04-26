@@ -2261,6 +2261,11 @@ function _captureCurrentChartBpm() {
 // internally bias their schedule (Phase 2c already wires the
 // `tempo_change_at_end` boolean through to header decode for future
 // use).
+//
+// Mirror of `detectTempoChangeAtBoundary` in audio/tempo-change.js
+// (see that file's tests for the algorithm contract — node audio/
+// tempo-change.test.js). Kept inline here because the slopsmith
+// plugin loader serves only screen.js — keep the two in sync.
 const CAPTURE_TEMPO_CHANGE_THRESHOLD = 0.05; // 5% spacing delta
 
 function _captureBeatsSnapshot() {
@@ -2275,13 +2280,14 @@ function _captureBeatsSnapshot() {
 function _captureTempoChangeAtBoundary(boundaryTime) {
     const beats = _captureBeatsSnapshot();
     if (!beats || beats.length < 4) return false;
+    if (typeof boundaryTime !== 'number' || !Number.isFinite(boundaryTime)) return false;
     // Find the index of the first beat at or after the boundary.
     // Linear scan is fine — beats arrays are typically a few hundred
     // entries and this runs once per interval (~once per 2 s).
     let nextIdx = -1;
     for (let i = 0; i < beats.length; i++) {
         const t = beats[i] && beats[i].time;
-        if (typeof t === 'number' && t >= boundaryTime) {
+        if (typeof t === 'number' && Number.isFinite(t) && t >= boundaryTime) {
             nextIdx = i;
             break;
         }
@@ -2294,8 +2300,10 @@ function _captureTempoChangeAtBoundary(boundaryTime) {
     const tNext = beats[nextIdx] && beats[nextIdx].time;
     const tNextNext = beats[nextIdx + 1] && beats[nextIdx + 1].time;
     if (
-        typeof tPrevPrev !== 'number' || typeof tPrev !== 'number'
-        || typeof tNext !== 'number' || typeof tNextNext !== 'number'
+        typeof tPrevPrev !== 'number' || !Number.isFinite(tPrevPrev)
+        || typeof tPrev !== 'number' || !Number.isFinite(tPrev)
+        || typeof tNext !== 'number' || !Number.isFinite(tNext)
+        || typeof tNextNext !== 'number' || !Number.isFinite(tNextNext)
     ) return false;
     const spacingBefore = tPrev - tPrevPrev;
     const spacingAfter = tNextNext - tNext;
