@@ -42,6 +42,12 @@ class CaptureProcessor extends AudioWorkletProcessor {
         // the scratch buffer lazily on size mismatch (rare —
         // render quantum is fixed within a session).
         this._mixScratch = null;
+        // Pre-allocated array reused across process() calls to hold
+        // references to the current quantum's valid input channels.
+        // Avoids per-quantum [] allocation on the realtime audio
+        // thread. Length is reset each call via the .length = 0
+        // pattern (which doesn't reallocate).
+        this._validChannelsScratch = [];
     }
 
     process(inputs) {
@@ -65,7 +71,12 @@ class CaptureProcessor extends AudioWorkletProcessor {
             // audio thread, so reducing that loop's work matters. If
             // exactly one channel is valid, fall back to the zero-copy
             // path (saves the scratch buffer + sum/divide work).
-            const validChannelsArr = [];
+            //
+            // The list itself is a pre-allocated array on `this` —
+            // .length = 0 truncates without reallocation, and .push
+            // grows in place. No per-quantum allocation.
+            const validChannelsArr = this._validChannelsScratch;
+            validChannelsArr.length = 0;
             for (let c = 0; c < numChannels; c++) {
                 const ch = input[c];
                 if (ch && ch.length === numSamples) validChannelsArr.push(ch);

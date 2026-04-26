@@ -1411,9 +1411,13 @@ function _cleanup() {
     _bootstrapGen++;
     _loadGen++;
     // Reset bootstrap-recovery state so a failed bootstrap in room A
-    // can't block automatic broadcast recovery in room B. Spotted
-    // by Copilot review on PR #9.
-    _bootstrapInFlight = 0;
+    // can't block automatic broadcast recovery in room B.
+    // Deliberately do NOT zero _bootstrapInFlight here — a previously
+    // started _bootstrapOnConnected may still be in its await window,
+    // and its finally would later decrement an already-zeroed
+    // counter to negative (breaking the in-flight gate forever).
+    // The finally clamps with Math.max(0, ...) instead.
+    // Spotted by Copilot review on PR #9.
     _lastBootstrapSucceeded = true;
     _captureNeedsReissueAfterReset = false;
     sessionStorage.removeItem('mp_room');
@@ -1771,6 +1775,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
         this._chunk = new Float32Array(this._chunkSize);
         this._chunkPos = 0;
         this._mixScratch = null;
+        this._validChannelsScratch = [];
     }
     process(inputs) {
         const input = inputs[0];
@@ -1786,9 +1791,12 @@ class CaptureProcessor extends AudioWorkletProcessor {
             src = input[0];
         } else {
             // Precompute valid channels list to avoid per-sample
-            // validity checks on the realtime thread. See worklet
-            // source-of-truth file for full rationale.
-            const validChannelsArr = [];
+            // validity checks on the realtime thread. The list
+            // itself is a pre-allocated array on the processor
+            // instance so there is no per-quantum allocation. See
+            // worklet source-of-truth file for full rationale.
+            const validChannelsArr = this._validChannelsScratch;
+            validChannelsArr.length = 0;
             for (let c = 0; c < numChannels; c++) {
                 const ch = input[c];
                 if (ch && ch.length === numSamples) validChannelsArr.push(ch);
@@ -2703,7 +2711,12 @@ async function _bootstrapOnConnected() {
         const myGen = ++_bootstrapGen;
         bootstrapResult = await _bootstrapOnConnectedInner(myGen);
     } finally {
-        _bootstrapInFlight--;
+        // Clamp at 0 so if _cleanup ran during our await (which used
+        // to zero the counter — now doesn't), or any future path
+        // resets it independently, this decrement can't drive the
+        // counter negative and permanently break the in-flight
+        // gate. Spotted by Copilot review on PR #9.
+        _bootstrapInFlight = Math.max(0, _bootstrapInFlight - 1);
         // Only write _lastBootstrapSucceeded when:
         //   1. No other bootstrap is still in flight (counter 0), AND
         //   2. We have a definitive result (not superseded).
