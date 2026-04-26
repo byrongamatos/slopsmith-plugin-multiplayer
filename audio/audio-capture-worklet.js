@@ -59,11 +59,20 @@ class CaptureProcessor extends AudioWorkletProcessor {
         if (numChannels === 1) {
             src = input[0];
         } else {
+            // Count valid channels (non-null, matching length) so the
+            // average normalizes by what we actually summed. Without
+            // this, missing channels would attenuate the mix.
+            let validChannels = 0;
+            for (let c = 0; c < numChannels; c++) {
+                const ch = input[c];
+                if (ch && ch.length === numSamples) validChannels++;
+            }
+            if (validChannels === 0) return true;
             if (!this._mixScratch || this._mixScratch.length !== numSamples) {
                 this._mixScratch = new Float32Array(numSamples);
             }
             src = this._mixScratch;
-            const inv = 1 / numChannels;
+            const inv = 1 / validChannels;
             for (let s = 0; s < numSamples; s++) {
                 let sum = 0;
                 for (let c = 0; c < numChannels; c++) {

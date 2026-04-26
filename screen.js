@@ -75,28 +75,15 @@ let _loadGen = 0;
 // while a newer is still in-flight, the counter only hits 0 when
 // the LAST bootstrap finishes.
 let _bootstrapInFlight = 0;
-// Bootstrap-only generation counter, separate from _bootstrapGen.
-// _bootstrapGen is bumped by both bootstrap entries AND non-
-// bootstrap paths (song_changed, host transport) to invalidate
-// in-flight _loadSong promises. _bootstrapEntryGen is bumped ONLY
-// by bootstrap entries, so the inner can distinguish:
-//   - "another bootstrap superseded me"  (_bootstrapEntryGen
-//     changed → return null, don't write _lastBootstrapSucceeded)
-//   - "non-bootstrap path invalidated my load" (_bootstrapGen
-//     changed but _bootstrapEntryGen didn't → also return null)
-//   - "I genuinely failed" (e.g. _loadSong threw → return false)
-// This split avoids the codex case where non-bootstrap gen bumps
-// would otherwise force the inner to return false and latch
-// _lastBootstrapSucceeded permanently false.
-let _bootstrapEntryGen = 0;
 // Result of the most recently COMPLETED bootstrap (only written
-// when _bootstrapInFlight returns to 0). Initially true so a
-// fresh non-recovery toggle of broadcast doesn't gate on a
-// recovery that never ran. Reset to false in _onSessionEnded.
-// Codex multi-round on PR #8: a previous gen-keyed design could
-// latch false when non-bootstrap paths (song_changed, host
-// transport) bumped _bootstrapGen mid-await; the counter design
-// avoids that.
+// when _bootstrapInFlight returns to 0 AND the inner returned a
+// definitive true/false — supersede returns null and preserves
+// the previous value). Initially true so a fresh non-recovery
+// toggle of broadcast doesn't gate on a recovery that never ran.
+// Preserved across _onSessionEnded — only completed bootstrap
+// attempts update this flag, so a non-bootstrap supersede during
+// 4408 recovery doesn't latch the gate to false. Codex multi-
+// round on PR #8 / PR #9.
 let _lastBootstrapSucceeded = true;
 
 // Idempotency guard for _onSessionEnded: when a 4408 (grace expired) close
@@ -1206,6 +1193,7 @@ function _onSessionEnded() {
     // resumes; the buffer + interval index re-init from zero.
     if (_captureCtx) {
         _captureIntervalSampleCount = 0;
+        _captureIntervalIndex = 0n;
         if (_captureIntervalBuffer) {
             _captureIntervalBuffer = new Float32Array(_captureIntervalSamplesTarget + CAPTURE_PCM_CHUNK_SAMPLES);
         }
@@ -1774,11 +1762,17 @@ class CaptureProcessor extends AudioWorkletProcessor {
         if (numChannels === 1) {
             src = input[0];
         } else {
+            let validChannels = 0;
+            for (let c = 0; c < numChannels; c++) {
+                const ch = input[c];
+                if (ch && ch.length === numSamples) validChannels++;
+            }
+            if (validChannels === 0) return true;
             if (!this._mixScratch || this._mixScratch.length !== numSamples) {
                 this._mixScratch = new Float32Array(numSamples);
             }
             src = this._mixScratch;
-            const inv = 1 / numChannels;
+            const inv = 1 / validChannels;
             for (let s = 0; s < numSamples; s++) {
                 let sum = 0;
                 for (let c = 0; c < numChannels; c++) {
@@ -2676,8 +2670,7 @@ async function _bootstrapOnConnected() {
     let bootstrapResult = null;
     try {
         const myGen = ++_bootstrapGen;
-        const myEntryGen = ++_bootstrapEntryGen;
-        bootstrapResult = await _bootstrapOnConnectedInner(myGen, myEntryGen);
+        bootstrapResult = await _bootstrapOnConnectedInner(myGen);
     } finally {
         _bootstrapInFlight--;
         // Only write _lastBootstrapSucceeded when:
@@ -2698,7 +2691,7 @@ async function _bootstrapOnConnected() {
     }
 }
 
-async function _bootstrapOnConnectedInner(myGen, myEntryGen) {
+async function _bootstrapOnConnectedInner(myGen) {
     if (!_room) return null;
     // Hard-teardown the listener pipeline ONLY if the snapshot
     // represents a meaningful state change (different broadcaster,
@@ -2856,15 +2849,12 @@ async function _bootstrapOnConnectedInner(myGen, myEntryGen) {
     } else {
         _audioListenerOnControlClear();
     }
-    // Capture-side recovery: if we WERE broadcasting before this
-    // (re)connect, the server may have cleared our broadcaster slot
-    // during the 4408 grace window. The actual re-issue is gated
-    // on BOTH highway and /audio being attached (a server-side
-    // 'audio_ws_not_open' rejection would tear our capture down
-    // for good); see _maybeReissueBroadcastAfterRecovery. The outer
-    // _bootstrapOnConnected wrapper also retries from its finally
-    // block once we return true here.
-    _maybeReissueBroadcastAfterRecovery();
+    // Capture-side recovery is handled by the OUTER wrapper's
+    // finally block (after _bootstrapInFlight decrements to 0)
+    // and by the audio WS onopen handler if /audio attaches
+    // last. Calling _maybeReissueBroadcastAfterRecovery here
+    // would always early-return because _bootstrapInFlight is
+    // still > 0. Spotted by Copilot review on PR #9.
     return true;
 }
 
