@@ -1679,7 +1679,7 @@ def setup(app, context):
         except WebSocketDisconnect:
             pass
         except Exception as e:
-            _log.warning("WS error for %s: %s", player_id, e)
+            _log.warning("WS error for %s: %s", player_id, e, exc_info=True)
         finally:
             await _on_endpoint_disconnect(websocket, room, player_id, _HIGHWAY)
 
@@ -1822,7 +1822,7 @@ def setup(app, context):
         except WebSocketDisconnect:
             pass
         except Exception as e:
-            _log.warning("Audio WS error for %s: %s", player_id, e)
+            _log.warning("Audio WS error for %s: %s", player_id, e, exc_info=True)
         finally:
             await _on_endpoint_disconnect(websocket, room, player_id, _AUDIO)
 
