@@ -21,7 +21,7 @@ _cleanup_tasks = {}   # code -> asyncio.Task
 _MP_DIR = None        # set by setup(); used by module-level _cleanup_after_grace
 
 # Session lifecycle constants — see PROTOCOL.md "v1 server policy".
-_log = logging.getLogger(__name__)
+_log = logging.getLogger("slopsmith.plugin.multiplayer")
 
 SESSION_GRACE_SEC = 5.0
 # Cap per-peer cleanup time during a broadcaster handoff. A backpressured
@@ -905,7 +905,7 @@ async def _cleanup_after_grace(code, seconds=60):
             room_dir = _MP_DIR / code
             if room_dir.exists():
                 shutil.rmtree(str(room_dir), ignore_errors=True)
-        print(f"[Multiplayer] Room {code} destroyed after grace period")
+        _log.info("Room %s destroyed after grace period", code)
     _cleanup_tasks.pop(code, None)
 
 
@@ -1267,12 +1267,12 @@ def setup(app, context):
             )
             if result.returncode == 0 and wav_path.exists():
                 raw_path.unlink(missing_ok=True)
-                print(f"[Multiplayer] Converted recording for {player_id}: {wav_path}")
+                _log.debug("Converted recording for %s: %s", player_id, wav_path)
             else:
-                print(f"[Multiplayer] WAV conversion failed: {result.stderr[-300:]}")
+                _log.warning("WAV conversion failed: %s", result.stderr[-300:])
                 wav_path = raw_path
         except Exception as e:
-            print(f"[Multiplayer] WAV conversion error: {e}")
+            _log.warning("WAV conversion error: %s", e)
             wav_path = raw_path
 
         room["recordings"][player_id] = {
@@ -1429,10 +1429,10 @@ def setup(app, context):
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
-                print(f"[Multiplayer] Mixdown failed: {result.stderr[-500:]}")
+                _log.warning("Mixdown failed: %s", result.stderr[-500:])
                 return JSONResponse({"error": "Mixdown failed"}, 500)
         except Exception as e:
-            print(f"[Multiplayer] Mixdown error: {e}")
+            _log.warning("Mixdown error: %s", e)
             return JSONResponse({"error": str(e)}, 500)
 
         room["mixdown_path"] = str(output_path)
@@ -1679,7 +1679,7 @@ def setup(app, context):
         except WebSocketDisconnect:
             pass
         except Exception as e:
-            print(f"[Multiplayer] WS error for {player_id}: {e}")
+            _log.warning("WS error for %s: %s", player_id, e)
         finally:
             await _on_endpoint_disconnect(websocket, room, player_id, _HIGHWAY)
 
@@ -1822,7 +1822,7 @@ def setup(app, context):
         except WebSocketDisconnect:
             pass
         except Exception as e:
-            print(f"[Multiplayer] Audio WS error for {player_id}: {e}")
+            _log.warning("Audio WS error for %s: %s", player_id, e)
         finally:
             await _on_endpoint_disconnect(websocket, room, player_id, _AUDIO)
 
