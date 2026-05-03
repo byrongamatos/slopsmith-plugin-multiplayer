@@ -20,8 +20,9 @@ _rooms = {}           # code -> room dict
 _cleanup_tasks = {}   # code -> asyncio.Task
 _MP_DIR = None        # set by setup(); used by module-level _cleanup_after_grace
 
-# Session lifecycle constants — see PROTOCOL.md "v1 server policy".
 _log = logging.getLogger("slopsmith.plugin.multiplayer")
+
+# Session lifecycle constants — see PROTOCOL.md "v1 server policy".
 
 SESSION_GRACE_SEC = 5.0
 # Cap per-peer cleanup time during a broadcaster handoff. A backpressured

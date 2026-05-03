@@ -40,26 +40,25 @@ def test_module_logger_emits_records_with_canonical_name(routes_module, caplog):
 
 
 def test_routes_has_no_bare_print_calls():
-    """routes.py must not contain bare print() calls.
+    """routes.py must not contain any print() calls.
 
-    Uses the AST to detect ``print(...)`` call expressions (not comments or
-    string literals), so a future reintroduction of bare print() in routes.py
-    will fail the suite immediately regardless of what it prints.
+    Uses the AST to detect every ``print(...)`` call expression (not comments
+    or string literals), regardless of context — standalone expression
+    statement, return value, assignment RHS, etc. — so a future reintroduction
+    of print() in routes.py fails the suite immediately.
     """
     source = _ROUTES_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(_ROUTES_PATH))
 
-    violations = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "print"
-        ):
-            violations.append(node.lineno)
+    violations = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "print"
+    ]
 
     assert not violations, (
-        f"Found bare print() calls in routes.py at line(s): "
+        f"Found print() calls in routes.py at line(s): "
         f"{violations}. Use _log.<level>() instead."
     )
